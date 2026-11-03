@@ -5,7 +5,7 @@ Diario del Ricercatore - versione browser (nessuna libreria da installare)
 - Allegati ChemDraw (.cdx, .cdxml, .cd) e qualsiasi altro file
 - Assistente AI (Claude) per stilare / correggere / tradurre il testo
 Dati in ~/DiarioRicercatore (stesso archivio della versione con finestra nativa).
-Il server ascolta solo su 127.0.0.1 (il tuo Mac), non e' raggiungibile da altri.
+Il server ascolta solo su 127.0.0.1 (il tuo computer), non e' raggiungibile da altri.
 """
 import os
 import sys
@@ -26,6 +26,16 @@ import urllib.parse
 import mimetypes
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+
+# Su Windows il terminale puo' non supportare le emoji: non deve mai bloccare l'avvio
+for _st in (sys.stdout, sys.stderr):
+    try:
+        _st.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -97,7 +107,7 @@ def check_key_chars(key):
 
 
 def curl_json(url, headers, body=None, timeout=150, who="il servizio AI"):
-    """Chiamata HTTP con curl (gia' presente su macOS, usa i certificati di sistema).
+    """Chiamata HTTP con curl (gia' presente su macOS e su Windows 10/11, usa i certificati di sistema).
     La chiave e i dati non finiscono mai nella riga di comando."""
     for v in [url] + list(headers.values()):
         if any(c in v for c in '"\\\n\r'):
@@ -110,11 +120,11 @@ def curl_json(url, headers, body=None, timeout=150, who="il servizio AI"):
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
                 tf.write(json.dumps(body))
                 tmp = tf.name
-            lines.append('data-binary = "@%s"' % tmp)
+            lines.append('data-binary = "@%s"' % tmp.replace("\\", "/"))
         p = subprocess.run(["curl", "-K", "-"], input="\n".join(lines), capture_output=True,
-                           text=True, timeout=timeout + 20)
+                           text=True, encoding="utf-8", errors="replace", timeout=timeout + 20)
     except FileNotFoundError:
-        raise RuntimeError("curl non trovato sul sistema.")
+        raise RuntimeError("curl non trovato sul sistema (su Windows serve Windows 10 o 11 aggiornato).")
     except subprocess.TimeoutExpired:
         raise RuntimeError("Timeout: %s non ha risposto in tempo." % who)
     finally:
@@ -495,13 +505,33 @@ def att_path(att_id):
     return real
 
 
+def open_path(path):
+    """Apre un file o un'app con il programma predefinito (macOS, Windows, Linux)."""
+    if IS_WIN:
+        os.startfile(path)
+    elif IS_MAC:
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+def reveal_path(path):
+    """Mostra il file nella sua cartella (Finder / Esplora risorse)."""
+    if IS_WIN:
+        subprocess.Popen(["explorer", "/select," + os.path.normpath(path)])
+    elif IS_MAC:
+        subprocess.Popen(["open", "-R", path])
+    else:
+        subprocess.Popen(["xdg-open", os.path.dirname(path)])
+
+
 def api_att_open(d):
-    subprocess.Popen(["open", att_path(d["id"])])
+    open_path(att_path(d["id"]))
     return {}
 
 
 def api_att_reveal(d):
-    subprocess.Popen(["open", "-R", att_path(d["id"])])
+    reveal_path(att_path(d["id"]))
     return {}
 
 
@@ -802,41 +832,65 @@ def api_export(d):
         except OSError:
             drive = False
     try:
-        subprocess.Popen(["open", path])
+        open_path(path)
     except OSError:
         pass
-    return {"file": os.path.basename(path), "folder": "~/DiarioRicercatore/esportazioni", "drive": drive}
+    return {"file": os.path.basename(path), "folder": os.path.join("~", "DiarioRicercatore", "esportazioni"), "drive": drive}
 
 
 def find_chemdraw():
-    """Cerca l'app ChemDraw sul Mac (anche dentro cartelle tipo «ChemDraw 23.1» o «ChemOffice»)."""
+    """Cerca ChemDraw (macOS: ChemDraw*.app; Windows: ChemDraw.exe sotto Program Files)."""
     found = []
+    if IS_WIN:
+        roots = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")]
 
-    def scan(base, depth):
-        try:
-            entries = os.listdir(base)
-        except OSError:
-            return
-        for name in entries:
-            full, low = os.path.join(base, name), name.lower()
-            if low.endswith(".app") and low.startswith("chemdraw"):
-                found.append(full)
-            elif (depth > 0 and not low.endswith(".app") and os.path.isdir(full)
-                  and re.match(r"(chemdraw|chemoffice|perkinelmer|revvity|cambridgesoft)", low)):
-                scan(full, depth - 1)
+        def scan_win(base, depth):
+            try:
+                entries = os.listdir(base)
+            except OSError:
+                return
+            for name in entries:
+                full, low = os.path.join(base, name), name.lower()
+                if low == "chemdraw.exe":
+                    found.append(full)
+                elif (depth > 0 and os.path.isdir(full)
+                      and re.match(r"(chemdraw|chemoffice|perkinelmer|revvity|cambridgesoft)", low)):
+                    scan_win(full, depth - 1)
 
-    for base in ("/Applications", os.path.expanduser("~/Applications")):
-        scan(base, 2)
-    if not found:
-        try:
-            p = subprocess.run(["mdfind", "kMDItemKind == 'Application' && kMDItemFSName == 'ChemDraw*'"],
-                               capture_output=True, text=True, timeout=8)
-            found = [ln for ln in p.stdout.splitlines() if ln.endswith(".app")]
-        except (OSError, subprocess.SubprocessError):
-            pass
+        for base in roots:
+            if base:
+                scan_win(base, 4)
+    else:
+        def scan(base, depth):
+            try:
+                entries = os.listdir(base)
+            except OSError:
+                return
+            for name in entries:
+                full, low = os.path.join(base, name), name.lower()
+                if low.endswith(".app") and low.startswith("chemdraw"):
+                    found.append(full)
+                elif (depth > 0 and not low.endswith(".app") and os.path.isdir(full)
+                      and re.match(r"(chemdraw|chemoffice|perkinelmer|revvity|cambridgesoft)", low)):
+                    scan(full, depth - 1)
+
+        for base in ("/Applications", os.path.expanduser("~/Applications")):
+            scan(base, 2)
+        if not found and IS_MAC:
+            try:
+                p = subprocess.run(["mdfind", "kMDItemKind == 'Application' && kMDItemFSName == 'ChemDraw*'"],
+                                   capture_output=True, text=True, timeout=8)
+                found = [ln for ln in p.stdout.splitlines() if ln.endswith(".app")]
+            except (OSError, subprocess.SubprocessError):
+                pass
     if not found:
         return None
-    found.sort(key=lambda p: ([int(x) for x in re.findall(r"\d+", p)], p))
+    if IS_WIN:   # i nomi delle cartelle (ChemOffice2020, 23.1…) non sono confrontabili: vale l'installazione piu' recente
+        found.sort(key=lambda p: (os.path.getmtime(p), p))
+    else:
+        found.sort(key=lambda p: ([int(x) for x in re.findall(r"\d+", p)], p))
     return found[-1]
 
 
@@ -844,18 +898,30 @@ def api_chemdraw_open(d):
     target = s(load_cfg().get("chemdraw_app")).strip() or find_chemdraw()
     if not target:
         raise RuntimeError("NOCHEMDRAW")
-    cmd = ["open", target] if (os.sep in target or target.endswith(".app")) else ["open", "-a", target]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        if IS_WIN:
+            if os.path.exists(target):
+                os.startfile(target)
+            else:   # solo il nome del programma
+                p = subprocess.run(["cmd", "/c", "start", "", target], capture_output=True, timeout=25)
+                if p.returncode != 0:
+                    raise RuntimeError("NOCHEMDRAW")
+        elif IS_MAC:
+            cmd = ["open", target] if (os.sep in target or target.endswith(".app")) else ["open", "-a", target]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+            if p.returncode != 0:
+                raise RuntimeError("NOCHEMDRAW")
+        else:
+            raise RuntimeError("NOCHEMDRAW")
     except (OSError, subprocess.SubprocessError):
-        raise RuntimeError("NOCHEMDRAW")
-    if p.returncode != 0:
         raise RuntimeError("NOCHEMDRAW")
     return {"app": os.path.basename(target)}
 
 
 def api_chemdraw_set(d):
-    v = s(d.get("app")).strip().strip("'\"").replace("\\ ", " ")
+    v = s(d.get("app")).strip().strip("'\"")
+    if not IS_WIN:
+        v = v.replace("\\ ", " ")
     cfg = load_cfg()
     if v:
         cfg["chemdraw_app"] = v
@@ -872,7 +938,7 @@ _sync_state = {"time": "", "error": "", "last_ts": 0.0}
 
 
 def drive_candidates():
-    """Cartelle di Google Drive per desktop trovate sul Mac (le propone, non le sceglie da sole)."""
+    """Cartelle di Google Drive per desktop trovate sul computer (le propone, non le sceglie da sole)."""
     home = os.path.expanduser("~")
     out = []
     base = os.path.join(home, "Library", "CloudStorage")
@@ -889,6 +955,12 @@ def drive_candidates():
         full = os.path.join(home, extra)
         if os.path.isdir(full) and full not in out:
             out.append(full)
+    if IS_WIN:   # Google Drive per desktop monta un'unita' (di solito G:) con «Il mio Drive» o «My Drive»
+        for letter in "GHIJKLMNOPQRSTUVWXYZDEF":
+            for sub in ("Il mio Drive", "My Drive", "Mio Drive"):
+                full = "%s:\\%s" % (letter, sub)
+                if os.path.isdir(full) and full not in out:
+                    out.append(full)
     return out
 
 
@@ -901,9 +973,12 @@ def sync_base():
 
 
 def check_sync_dir(v):
-    v = os.path.expanduser(s(v).strip().strip("'\"").replace("\\ ", " "))
+    v = s(v).strip().strip("'\"")
+    if not IS_WIN:
+        v = v.replace("\\ ", " ")
+    v = os.path.expanduser(v)
     if not os.path.isdir(v):
-        raise RuntimeError("Quella cartella non esiste. Controlla il percorso (in Finder: seleziona la cartella e premi ⌥⌘C).")
+        raise RuntimeError("Quella cartella non esiste. Controlla il percorso (Mac: Finder, seleziona la cartella e premi ⌥⌘C · Windows: tasto destro sulla cartella → Copia come percorso).")
     real = os.path.realpath(v)
     app_real = os.path.realpath(APP_DIR)
     if real == app_real or real.startswith(app_real + os.sep):
@@ -1708,7 +1783,7 @@ function renderAtt(list) {
       h("span", { class: "nm" }, a.filename,
         noImg ? h("div", { class: "warn" }, "⚠️ Nessuna immagine associata: nel Word comparirà solo il nome. Incolla lo schema da ChemDraw (⌘C → ⌘V qui) o aggiungi un PNG con lo stesso nome.") : null),
       h("button", { class: "btn violet small", onclick: () => api("att_open", { id: a.id }).catch(fail) }, "Apri"),
-      h("button", { class: "btn blue small", onclick: () => api("att_reveal", { id: a.id }).catch(fail) }, "Finder"),
+      h("button", { class: "btn blue small", onclick: () => api("att_reveal", { id: a.id }).catch(fail) }, "Cartella"),
       h("button", { class: "btn red small", onclick: () => delAtt(a.id) }, "✕")));
   });
 }
@@ -1813,14 +1888,14 @@ async function openKey(hint) {
   gm.value = st.gemini_model || "";
   const chem = h("input", { type: "text", autocomplete: "off", placeholder: "lascia vuoto: ricerca automatica" });
   chem.value = st.chemdraw || "";
-  const drv = h("input", { type: "text", autocomplete: "off", placeholder: "es. ~/Library/CloudStorage/GoogleDrive-…/Il mio Drive" });
+  const drv = h("input", { type: "text", autocomplete: "off", placeholder: "es. ~/Library/CloudStorage/GoogleDrive-…/Il mio Drive  oppure  G:\\Il mio Drive" });
   drv.value = st.sync_dir || "";
   const drvFound = h("div", { class: "hint" }, "");
   const findDrive = async () => {
     try {
       const r = await api("drive_find");
       drvFound.innerHTML = "";
-      if (!r.found.length) { drvFound.textContent = "Non ho trovato Google Drive per desktop su questo Mac: installalo da google.com/drive/download oppure scrivi tu il percorso della cartella."; return; }
+      if (!r.found.length) { drvFound.textContent = "Non ho trovato Google Drive per desktop su questo computer: installalo da google.com/drive/download oppure scrivi tu il percorso della cartella."; return; }
       drvFound.append("Trovata: ");
       r.found.forEach(p => drvFound.append(h("a", { href: "#", onclick: ev => { ev.preventDefault(); drv.value = p; } }, p), " "));
       drvFound.append(" (clicca per usarla)");
@@ -1853,7 +1928,7 @@ async function openKey(hint) {
       st.sync_last ? h("span", { class: "hint" }, "Ultima sincronizzazione: " + st.sync_last.replace("T", " ")) : null),
     drvFound,
     st.sync_error ? h("div", { class: "warn", style: "font-size:13px" }, "Ultimo errore di sincronizzazione: " + st.sync_error) : null,
-    h("div", { class: "hint" }, "Le chiavi vengono salvate solo sul tuo Mac, in ~/DiarioRicercatore/config.json."),
+    h("div", { class: "hint" }, "Le chiavi vengono salvate solo sul tuo computer, in ~/DiarioRicercatore/config.json."),
     h("div", { class: "btns" },
       h("button", { class: "btn green", onclick: async () => {
         try {
@@ -1876,7 +1951,7 @@ async function openChemDraw() {
   } catch (e) {
     status("");
     if (e.message !== "NOCHEMDRAW") return fail(e);
-    const v = prompt("Non ho trovato ChemDraw tra le applicazioni.\nScrivi il nome dell'app (es. ChemDraw 23.1) oppure incolla il suo percorso completo (in Finder: seleziona l'app e premi ⌥⌘C).");
+    const v = prompt("Non ho trovato ChemDraw tra le applicazioni.\nScrivi il nome dell'app (es. ChemDraw 23.1) oppure incolla il suo percorso completo (Mac: Finder, seleziona l'app e premi ⌥⌘C · Windows: il percorso di ChemDraw.exe).");
     if (!v || !v.trim()) return;
     await api("chemdraw_set", { app: v });
     try {

@@ -1,0 +1,2137 @@
+#!/usr/bin/env python3
+"""
+Diario del Ricercatore - versione browser (nessuna libreria da installare)
+- Esperimenti con nome, data, progetto e sezioni di testo
+- Allegati ChemDraw (.cdx, .cdxml, .cd) e qualsiasi altro file
+- Assistente AI (Claude) per stilare / correggere / tradurre il testo
+Dati in ~/DiarioRicercatore (stesso archivio della versione con finestra nativa).
+Il server ascolta solo su 127.0.0.1 (il tuo Mac), non e' raggiungibile da altri.
+"""
+import os
+import sys
+import json
+import shutil
+import sqlite3
+import secrets
+import tempfile
+import threading
+import subprocess
+import datetime
+import webbrowser
+import re
+import io
+import struct
+import zipfile
+import urllib.parse
+import mimetypes
+import time
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+APP_DIR = os.path.expanduser("~/DiarioRicercatore")
+ATT_DIR = os.path.join(APP_DIR, "allegati")
+DB_PATH = os.path.join(APP_DIR, "diario.db")
+CFG_PATH = os.path.join(APP_DIR, "config.json")
+MODEL = "claude-sonnet-5-5"
+TOKEN = secrets.token_urlsafe(24)
+
+os.makedirs(ATT_DIR, exist_ok=True)
+
+# ---------------- AI ----------------
+BASE_RULES = (
+    "Sei un assistente per chimici di laboratorio che scrivono il quaderno di laboratorio. "
+    "Non inventare MAI dati: conserva esattamente quantita', unita', rese, temperature, tempi, "
+    "nomi di reagenti/solventi, numeri di composto e sigle (es. NG012, FM03). "
+    "Se manca un'informazione importante, segnalala tra parentesi quadre come [da completare: ...]. "
+    "Rispondi SOLO con il testo risultante, senza commenti, senza virgolette, senza markdown."
+)
+MODES = {
+    "stila": (
+        "Riscrivi il testo come sezione sperimentale professionale in stile articolo scientifico "
+        "(ACS): forma impersonale/passato, frasi chiare, ordine cronologico, quantita' con unita' "
+        "e mmol/equivalenti se presenti nel testo, work-up e purificazione ben distinti. "
+        "Mantieni la lingua del testo originale."
+    ),
+    "correggi": (
+        "Correggi solo ortografia, grammatica e punteggiatura, senza cambiare lo stile ne' il "
+        "contenuto. Mantieni la lingua del testo originale."
+    ),
+    "inglese": "Traduci in inglese scientifico, stile sezione sperimentale (past tense, impersonal).",
+    "titolo": (
+        "Proponi UN titolo breve e descrittivo (max 10 parole) per questo esperimento, "
+        "nella lingua del testo. Solo il titolo."
+    ),
+}
+
+
+def load_cfg():
+    try:
+        with open(CFG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cfg(cfg):
+    with open(CFG_PATH, "w") as f:
+        json.dump(cfg, f)
+    os.chmod(CFG_PATH, 0o600)
+
+
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_gemini_model_cache = {}
+
+
+def get_api_key():
+    return (os.environ.get("ANTHROPIC_API_KEY") or load_cfg().get("api_key", "")).strip()
+
+
+def get_gemini_key():
+    return (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            or load_cfg().get("gemini_key", "")).strip()
+
+
+def check_key_chars(key):
+    if any(c in key for c in '"\\\n\r \t'):
+        raise RuntimeError("La chiave API contiene caratteri non validi (spazi o a capo): reinseriscila.")
+
+
+def curl_json(url, headers, body=None, timeout=150, who="il servizio AI"):
+    """Chiamata HTTP con curl (gia' presente su macOS, usa i certificati di sistema).
+    La chiave e i dati non finiscono mai nella riga di comando."""
+    for v in [url] + list(headers.values()):
+        if any(c in v for c in '"\\\n\r'):
+            raise RuntimeError("Valore non valido nella richiesta (caratteri speciali nella chiave?).")
+    tmp = None
+    try:
+        lines = ['url = "%s"' % url] + ['header = "%s: %s"' % kv for kv in headers.items()]
+        lines += ["silent", "show-error", "max-time = %d" % timeout]
+        if body is not None:
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
+                tf.write(json.dumps(body))
+                tmp = tf.name
+            lines.append('data-binary = "@%s"' % tmp)
+        p = subprocess.run(["curl", "-K", "-"], input="\n".join(lines), capture_output=True,
+                           text=True, timeout=timeout + 20)
+    except FileNotFoundError:
+        raise RuntimeError("curl non trovato sul sistema.")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Timeout: %s non ha risposto in tempo." % who)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+    if p.returncode != 0:
+        raise RuntimeError("Connessione a %s fallita: %s" % (who, p.stderr.strip() or "errore di rete"))
+    try:
+        return json.loads(p.stdout)
+    except Exception:
+        raise RuntimeError("Risposta non valida da %s: %s" % (who, p.stdout[:200]))
+
+
+def ask_claude(system, user):
+    key = get_api_key()
+    if not key:
+        raise RuntimeError("NOKEY:claude")
+    check_key_chars(key)
+    out = curl_json(
+        ANTHROPIC_URL,
+        {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        {"model": MODEL, "max_tokens": 3000, "system": system,
+         "messages": [{"role": "user", "content": user}]},
+        who="Claude")
+    if out.get("type") == "error":
+        raise RuntimeError("Errore API Claude: " + (out.get("error") or {}).get("message", "errore API"))
+    text = "".join(b.get("text", "") for b in out.get("content", []) if isinstance(b, dict)).strip()
+    if not text:
+        raise RuntimeError("Claude ha restituito una risposta vuota.")
+    return text
+
+
+def gemini_pick_model(names):
+    """Sceglie il modello Gemini di testo piu' adatto fra quelli disponibili per la chiave:
+    preferisce i modelli stabili, poi la famiglia 'flash' (veloce, di solito inclusa nel piano gratuito),
+    poi la versione piu' recente."""
+    best, best_key = None, None
+    for n in names:
+        m = re.match(r"^models/(gemini-(\d+(?:\.\d+)*)-(flash-lite|flash|pro)(?:-(.+))?)$", n)
+        if not m:
+            continue
+        full, ver, kind, rest = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+        if re.search(r"image|tts|live|audio|embed|vision|computer|robot|native|customtools|thinking|learnlm", rest):
+            continue
+        stable = 0 if re.search(r"preview|exp", rest) else 1
+        key = (stable, {"flash": 3, "flash-lite": 2, "pro": 1}[kind],
+               tuple(int(x) for x in ver.split(".")), -len(rest))
+        if best_key is None or key > best_key:
+            best, best_key = full, key
+    return best
+
+
+def gemini_error(out, key):
+    err = out.get("error") or {}
+    msg = s(err.get("message")) or "errore sconosciuto"
+    code, status = err.get("code"), s(err.get("status"))
+    blob = json.dumps(err)
+    if (code in (401, 403) or status in ("UNAUTHENTICATED", "PERMISSION_DENIED")
+            or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in blob or "API key not valid" in msg):
+        hint = "Google ha rifiutato la chiave. "
+        if key.startswith("AQ."):
+            hint += ("Le chiavi che iniziano con «AQ.» (il nuovo formato di AI Studio) non sono ancora accettate "
+                     "da tutte le connessioni. Prova a creare una chiave classica (inizia con «AIza») da Google Cloud "
+                     "Console → API e servizi → Credenziali → Crea credenziali → Chiave API, con l'API "
+                     "«Generative Language» abilitata; oppure usa Claude. ")
+        else:
+            hint += "Controlla di averla copiata per intero e che l'API Gemini sia abilitata per il progetto. "
+        return RuntimeError(hint + "(Dettaglio Google: " + msg + ")")
+    if code == 429 or status == "RESOURCE_EXHAUSTED":
+        return RuntimeError("Gemini: limite di richieste o quota esaurita. Riprova fra poco. (" + msg + ")")
+    return RuntimeError("Errore Gemini: " + msg)
+
+
+def gemini_model(key):
+    fixed = s(load_cfg().get("gemini_model")).strip()
+    if fixed:
+        return fixed
+    if _gemini_model_cache.get("m"):
+        return _gemini_model_cache["m"]
+    out = curl_json(GEMINI_BASE + "/models?pageSize=200", {"x-goog-api-key": key}, who="Gemini")
+    if out.get("error"):
+        raise gemini_error(out, key)
+    names = [m.get("name", "") for m in out.get("models", [])
+             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    pick = gemini_pick_model(names)
+    if not pick:
+        raise RuntimeError("Nessun modello Gemini di testo disponibile per questa chiave. "
+                           "Puoi scrivere a mano il nome del modello in «Chiavi API e impostazioni».")
+    _gemini_model_cache["m"] = pick
+    return pick
+
+
+def ask_gemini(system, user):
+    key = get_gemini_key()
+    if not key:
+        raise RuntimeError("NOKEY:gemini")
+    check_key_chars(key)
+    model = gemini_model(key)
+    out = curl_json(
+        "%s/models/%s:generateContent" % (GEMINI_BASE, model),
+        {"x-goog-api-key": key, "content-type": "application/json"},
+        {"systemInstruction": {"parts": [{"text": system}]},
+         "contents": [{"role": "user", "parts": [{"text": user}]}],
+         "generationConfig": {"temperature": 0.3}},
+        who="Gemini")
+    if out.get("error"):
+        if (out["error"].get("code") == 404 or out["error"].get("status") == "NOT_FOUND"):
+            _gemini_model_cache.clear()   # il modello scelto automaticamente non esiste piu': si riscegliera'
+        raise gemini_error(out, key)
+    blocked = (out.get("promptFeedback") or {}).get("blockReason")
+    if blocked:
+        raise RuntimeError("Gemini ha bloccato la richiesta (%s). Riprova con un testo diverso o usa Claude." % blocked)
+    cands = out.get("candidates") or []
+    parts = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought")).strip()
+    if not text:
+        fr = cands[0].get("finishReason") if cands else ""
+        raise RuntimeError("Gemini ha restituito una risposta vuota" + (" (%s)" % fr if fr else "") + ".")
+    return text
+
+
+# ---------------- DB ----------------
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    con = db()
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS experiments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT, date TEXT, project TEXT,
+            obiettivo TEXT DEFAULT '', procedura TEXT DEFAULT '',
+            risultati TEXT DEFAULT '', note TEXT DEFAULT '',
+            updated TEXT
+        );
+        CREATE TABLE IF NOT EXISTS attachments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exp_id INTEGER, filename TEXT, path TEXT
+        );
+        CREATE TABLE IF NOT EXISTS exp_groups(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT, parent_id INTEGER, color TEXT,
+            collapsed INTEGER DEFAULT 0, archived INTEGER DEFAULT 0
+        );
+        """
+    )
+    # migrazione: i database creati dalle versioni precedenti non hanno la colonna group_id
+    cols = [r["name"] for r in con.execute("PRAGMA table_info(experiments)")]
+    if "group_id" not in cols:
+        con.execute("ALTER TABLE experiments ADD COLUMN group_id INTEGER")
+    con.commit()
+    con.close()
+
+
+def now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def s(v):
+    return "" if v is None else str(v)
+
+
+# ---------------- API ----------------
+def api_list(d):
+    q = "%" + s(d.get("q")).strip() + "%"
+    con = db()
+    rows = con.execute(
+        "SELECT id,name,date,project FROM experiments "
+        "WHERE name LIKE ? OR project LIKE ? OR obiettivo LIKE ? OR procedura LIKE ? "
+        "ORDER BY updated DESC, id DESC",
+        (q, q, q, q),
+    ).fetchall()
+    con.close()
+    return {"items": [dict(r) for r in rows]}
+
+
+def api_get(d):
+    con = db()
+    row = con.execute("SELECT * FROM experiments WHERE id=?", (int(d["id"]),)).fetchone()
+    if not row:
+        con.close()
+        raise RuntimeError("Esperimento non trovato.")
+    atts = con.execute("SELECT id,filename FROM attachments WHERE exp_id=? ORDER BY id", (row["id"],)).fetchall()
+    con.close()
+    return {"exp": dict(row), "attachments": [dict(a) for a in atts]}
+
+
+def api_new(d):
+    con = db()
+    gid = d.get("group_id")
+    if gid is not None:
+        gid = int(gid)
+        if not con.execute("SELECT 1 FROM exp_groups WHERE id=?", (gid,)).fetchone():
+            gid = None
+        else:
+            con.execute("UPDATE exp_groups SET collapsed=0 WHERE id=?", (gid,))
+    cur = con.execute(
+        "INSERT INTO experiments(name,date,project,updated,group_id) VALUES(?,?,?,?,?)",
+        ("Nuovo esperimento", datetime.date.today().strftime("%d/%m/%Y"), "", now(), gid),
+    )
+    con.commit()
+    new_id = cur.lastrowid
+    con.close()
+    return {"id": new_id}
+
+
+def api_save(d):
+    con = db()
+    con.execute(
+        "UPDATE experiments SET name=?,date=?,project=?,obiettivo=?,procedura=?,risultati=?,note=?,updated=? WHERE id=?",
+        (s(d.get("name")).strip(), s(d.get("date")).strip(), s(d.get("project")).strip(),
+         s(d.get("obiettivo")), s(d.get("procedura")), s(d.get("risultati")), s(d.get("note")),
+         now(), int(d["id"])),
+    )
+    con.commit()
+    con.close()
+    return {}
+
+
+def api_delete(d):
+    exp_id = int(d["id"])
+    con = db()
+    con.execute("DELETE FROM attachments WHERE exp_id=?", (exp_id,))
+    con.execute("DELETE FROM experiments WHERE id=?", (exp_id,))
+    con.commit()
+    nxt = con.execute("SELECT id FROM experiments ORDER BY updated DESC, id DESC LIMIT 1").fetchone()
+    con.close()
+    shutil.rmtree(os.path.join(ATT_DIR, str(exp_id)), ignore_errors=True)
+    return {"next": nxt["id"] if nxt else None}
+
+
+PALETTE = ["#EC4899", "#EA580C", "#B45309", "#059669", "#2563EB", "#0D9488", "#DC2626", "#64748B"]
+
+
+def api_tree(d):
+    q = s(d.get("q")).strip()
+    con = db()
+    groups = [dict(r) for r in con.execute(
+        "SELECT id,name,parent_id,color,collapsed,archived FROM exp_groups ORDER BY id")]
+    cols = "id,name,date,project,group_id"
+    if q:
+        like = "%" + q + "%"
+        rows = con.execute(
+            "SELECT " + cols + " FROM experiments WHERE name LIKE ? OR project LIKE ? OR obiettivo LIKE ? "
+            "OR procedura LIKE ? OR risultati LIKE ? OR note LIKE ? ORDER BY id DESC", (like,) * 6).fetchall()
+    else:
+        rows = con.execute("SELECT " + cols + " FROM experiments ORDER BY id DESC").fetchall()
+    con.close()
+    return {"groups": groups, "exps": [dict(r) for r in rows]}
+
+
+def group_descendants(con, gid):
+    out, stack = set(), [gid]
+    while stack:
+        cur = stack.pop()
+        for r in con.execute("SELECT id FROM exp_groups WHERE parent_id=?", (cur,)):
+            if r["id"] not in out:
+                out.add(r["id"])
+                stack.append(r["id"])
+    return out
+
+
+def group_exists(con, gid):
+    return con.execute("SELECT 1 FROM exp_groups WHERE id=?", (gid,)).fetchone() is not None
+
+
+def api_group_new(d):
+    name = s(d.get("name")).strip()[:80] or "Nuovo gruppo"
+    parent = d.get("parent_id")
+    con = db()
+    if parent is not None:
+        parent = int(parent)
+        if not group_exists(con, parent):
+            con.close()
+            raise RuntimeError("Gruppo superiore non trovato.")
+        con.execute("UPDATE exp_groups SET collapsed=0 WHERE id=?", (parent,))
+    n = con.execute("SELECT COUNT(*) AS c FROM exp_groups").fetchone()["c"]
+    cur = con.execute("INSERT INTO exp_groups(name,parent_id,color,collapsed,archived) VALUES(?,?,?,0,0)",
+                      (name, parent, PALETTE[n % len(PALETTE)]))
+    con.commit()
+    new_id = cur.lastrowid
+    con.close()
+    return {"id": new_id}
+
+
+def api_group_update(d):
+    gid = int(d["id"])
+    sets, vals = [], []
+    if "name" in d:
+        name = s(d["name"]).strip()
+        if not name:
+            raise RuntimeError("Il nome del gruppo non puo' essere vuoto.")
+        sets.append("name=?")
+        vals.append(name[:80])
+    if "color" in d:
+        c = s(d["color"])
+        if not re.match(r"^#[0-9A-Fa-f]{6}$", c):
+            raise RuntimeError("Colore non valido.")
+        sets.append("color=?")
+        vals.append(c)
+    if "collapsed" in d:
+        sets.append("collapsed=?")
+        vals.append(1 if d["collapsed"] else 0)
+    if "archived" in d:
+        sets.append("archived=?")
+        vals.append(1 if d["archived"] else 0)
+    if not sets:
+        return {}
+    con = db()
+    con.execute("UPDATE exp_groups SET " + ",".join(sets) + " WHERE id=?", vals + [gid])
+    con.commit()
+    con.close()
+    return {}
+
+
+def api_group_move(d):
+    gid = int(d["id"])
+    parent = d.get("parent_id")
+    con = db()
+    if parent is not None:
+        parent = int(parent)
+        if not group_exists(con, parent):
+            con.close()
+            raise RuntimeError("Gruppo di destinazione non trovato.")
+        if parent == gid or parent in group_descendants(con, gid):
+            con.close()
+            raise RuntimeError("Non puoi spostare un gruppo dentro se stesso o in un suo sottogruppo.")
+    con.execute("UPDATE exp_groups SET parent_id=? WHERE id=?", (parent, gid))
+    con.commit()
+    con.close()
+    return {}
+
+
+def api_group_delete(d):
+    """Elimina solo il contenitore: sottogruppi ed esperimenti passano al gruppo superiore."""
+    gid = int(d["id"])
+    con = db()
+    row = con.execute("SELECT parent_id FROM exp_groups WHERE id=?", (gid,)).fetchone()
+    if row:
+        parent = row["parent_id"]
+        con.execute("UPDATE exp_groups SET parent_id=? WHERE parent_id=?", (parent, gid))
+        con.execute("UPDATE experiments SET group_id=? WHERE group_id=?", (parent, gid))
+        con.execute("DELETE FROM exp_groups WHERE id=?", (gid,))
+        con.commit()
+    con.close()
+    return {}
+
+
+def api_exp_move(d):
+    gid = d.get("group_id")
+    con = db()
+    if gid is not None:
+        gid = int(gid)
+        if not group_exists(con, gid):
+            con.close()
+            raise RuntimeError("Gruppo non trovato.")
+    con.execute("UPDATE experiments SET group_id=? WHERE id=?", (gid, int(d["id"])))
+    con.commit()
+    con.close()
+    return {}
+
+
+def att_path(att_id):
+    con = db()
+    row = con.execute("SELECT path FROM attachments WHERE id=?", (int(att_id),)).fetchone()
+    con.close()
+    if not row:
+        raise RuntimeError("Allegato non trovato.")
+    real = os.path.realpath(row["path"])
+    if not real.startswith(os.path.realpath(ATT_DIR) + os.sep):
+        raise RuntimeError("Percorso non valido.")
+    if not os.path.exists(real):
+        raise RuntimeError("Il file non esiste piu' sul disco.")
+    return real
+
+
+def api_att_open(d):
+    subprocess.Popen(["open", att_path(d["id"])])
+    return {}
+
+
+def api_att_reveal(d):
+    subprocess.Popen(["open", "-R", att_path(d["id"])])
+    return {}
+
+
+def api_att_delete(d):
+    con = db()
+    row = con.execute("SELECT path FROM attachments WHERE id=?", (int(d["id"]),)).fetchone()
+    con.execute("DELETE FROM attachments WHERE id=?", (int(d["id"]),))
+    con.commit()
+    con.close()
+    if row:
+        try:
+            os.remove(row["path"])
+        except OSError:
+            pass
+    return {}
+
+
+def api_ai(d):
+    mode = s(d.get("mode"))
+    text = s(d.get("text"))
+    if not text.strip():
+        raise RuntimeError("Testo vuoto.")
+    if mode == "libera":
+        instr = s(d.get("instr")).strip()
+        if not instr:
+            raise RuntimeError("Istruzione mancante.")
+        system = BASE_RULES + " Istruzione dell'utente: " + instr
+    elif mode in MODES:
+        system = BASE_RULES + " " + MODES[mode]
+    else:
+        raise RuntimeError("Modalita' sconosciuta.")
+    engine = s(d.get("engine") or "claude")
+    fn = {"claude": ask_claude, "gemini": ask_gemini}.get(engine)
+    if not fn:
+        raise RuntimeError("Motore AI sconosciuto.")
+    return {"result": fn(system, text), "engine": engine}
+
+
+EXPORT_DIR = os.path.join(APP_DIR, "esportazioni")
+SEC_TITLES = [
+    ("obiettivo", "Obiettivo"),
+    ("procedura", "Procedura sperimentale"),
+    ("risultati", "Risultati e osservazioni"),
+    ("note", "Note e prossimi passi"),
+]
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def xml_esc(t):
+    t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", t).replace("\t", "    ")
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def w_par(text="", style=None, italic=False, color=None, size=None):
+    ppr = '<w:pPr><w:pStyle w:val="%s"/></w:pPr>' % style if style else ""
+    rpr = ""
+    if italic:
+        rpr += "<w:i/>"
+    if color:
+        rpr += '<w:color w:val="%s"/>' % color
+    if size:
+        rpr += '<w:sz w:val="%d"/>' % size
+    if rpr:
+        rpr = "<w:rPr>%s</w:rPr>" % rpr
+    if text == "":
+        return "<w:p>%s</w:p>" % ppr
+    return '<w:p>%s<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>' % (ppr, rpr, xml_esc(text))
+
+
+IMG_EXT = {".png": ("png", "image/png"), ".jpg": ("jpeg", "image/jpeg"), ".jpeg": ("jpeg", "image/jpeg")}
+CHEM_EXT = (".cdx", ".cdxml", ".cd", ".c3xml")
+
+
+def is_image(name):
+    return os.path.splitext(name.lower())[1] in IMG_EXT
+
+
+def img_info(data):
+    """Ritorna (larghezza_px, altezza_px, dpi o None) per PNG/JPEG, altrimenti None."""
+    try:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", data[16:24])
+            dpi, pos = None, 8
+            while pos + 8 <= len(data):
+                length, ctype = struct.unpack(">I4s", data[pos:pos + 8])
+                if ctype == b"pHYs":
+                    ppux, _ppuy, unit = struct.unpack(">IIB", data[pos + 8:pos + 17])
+                    if unit == 1 and ppux:
+                        dpi = ppux * 0.0254
+                    break
+                if ctype in (b"IDAT", b"IEND"):
+                    break
+                pos += 12 + length
+            return w, h, dpi
+        if data[:2] == b"\xff\xd8":
+            pos, dpi = 2, None
+            while pos + 4 <= len(data):
+                if data[pos] != 0xFF:
+                    pos += 1
+                    continue
+                marker = data[pos + 1]
+                if marker == 0xFF:
+                    pos += 1
+                    continue
+                pos += 2
+                if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                    continue
+                seglen = struct.unpack(">H", data[pos:pos + 2])[0]
+                if marker == 0xE0 and data[pos + 2:pos + 7] == b"JFIF\x00":
+                    units = data[pos + 9]
+                    xd = struct.unpack(">H", data[pos + 10:pos + 12])[0]
+                    if units == 1 and xd:
+                        dpi = float(xd)
+                    elif units == 2 and xd:
+                        dpi = xd * 2.54
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h, w = struct.unpack(">HH", data[pos + 3:pos + 7])
+                    return w, h, dpi
+                pos += seglen
+    except Exception:
+        return None
+    return None
+
+
+def fit_cm(w, h, dpi, max_w=16.5, max_h=20.0):
+    """Dimensione in cm: grandezza naturale, ridotta se supera la larghezza utile della pagina A4."""
+    d = dpi if dpi and 30 <= dpi <= 1200 else 96.0
+    cw, ch = w / d * 2.54, h / d * 2.54
+    k = min(1.0, max_w / cw, max_h / ch)
+    return cw * k, ch * k
+
+
+def w_image(rid, idx, cx, cy, descr):
+    d = xml_esc(descr).replace('"', "&quot;")
+    return (
+        '<w:p><w:pPr><w:keepNext/><w:jc w:val="center"/></w:pPr><w:r><w:drawing>'
+        '<wp:inline distT="0" distB="0" distL="0" distR="0">'
+        '<wp:extent cx="%d" cy="%d"/><wp:docPr id="%d" name="Immagine %d" descr="%s"/>'
+        '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
+        '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+        '<pic:pic><pic:nvPicPr><pic:cNvPr id="%d" name="%s"/><pic:cNvPicPr/></pic:nvPicPr>'
+        '<pic:blipFill><a:blip r:embed="%s"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
+        '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="%d" cy="%d"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>'
+        "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+    ) % (cx, cy, idx, idx, d, idx, d, rid, cx, cy)
+
+
+def make_docx(exp, atts):
+    """Crea un file .docx (Word) con la sola libreria standard."""
+    body = [w_par(exp.get("name") or "Esperimento senza nome", style="Title")]
+    media, media_rels, images = [], [], []
+    for a in atts:
+        if not (is_image(a["filename"]) and a.get("path") and os.path.exists(a["path"])):
+            continue
+        try:
+            with open(a["path"], "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        info = img_info(data)
+        if info:
+            images.append({"att": a, "data": data, "info": info,
+                           "ext": IMG_EXT[os.path.splitext(a["filename"].lower())[1]][0]})
+    meta = []
+    if s(exp.get("date")).strip():
+        meta.append("Data: " + s(exp["date"]).strip())
+    if s(exp.get("project")).strip():
+        meta.append("Progetto: " + s(exp["project"]).strip())
+    if meta:
+        body.append(w_par("   ·   ".join(meta), color="6B7280"))
+    for key, title in SEC_TITLES:
+        if key == "procedura" and images:
+            body.append(w_par("Schema di reazione e strutture", style="Heading1"))
+            for im in images:
+                n = len(media) + 1
+                name = "image%d.%s" % (n, im["ext"])
+                media.append((name, im["data"]))
+                media_rels.append(
+                    '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/%s"/>'
+                    % (n + 1, name))
+                cw, ch = fit_cm(*im["info"])
+                fname = im["att"]["filename"]
+                body.append(w_image("rId%d" % (n + 1), n, int(cw * 360000), int(ch * 360000), fname))
+                base = os.path.splitext(fname)[0]
+                if not base.startswith("incollata-"):
+                    body.append(
+                        '<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:color w:val="6B7280"/>'
+                        '<w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % xml_esc(base))
+        txt = s(exp.get(key)).strip()
+        if not txt:
+            continue
+        body.append(w_par(title, style="Heading1"))
+        for line in txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            body.append(w_par(line))
+    if atts:
+        body.append(w_par("Allegati", style="Heading1"))
+        in_doc = set(im["att"]["filename"] for im in images)
+        img_stems = set(os.path.splitext(f)[0].lower() for f in in_doc)
+        for a in atts:
+            fn = a["filename"]
+            note = ""
+            if fn in in_doc:
+                note = "  (immagine inserita nel documento)"
+            elif fn.lower().endswith(CHEM_EXT):
+                if os.path.splitext(fn)[0].lower() in img_stems:
+                    note = "  (originale ChemDraw, schema inserito nel documento)"
+                else:
+                    note = "  (originale ChemDraw: nessuna immagine associata, non visibile nel documento)"
+            body.append(w_par("•  " + fn + note))
+    body.append(w_par(""))
+    body.append(w_par("Esportato dal Diario del Ricercatore il " +
+                      datetime.datetime.now().strftime("%d/%m/%Y %H:%M"),
+                      italic=True, color="9CA3AF", size=18))
+
+    head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    document = (
+        head + '<w:document xmlns:w="%s" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>' % W_NS + "".join(body) +
+        '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+        '<w:pgMar w:top="1417" w:right="1134" w:bottom="1134" w:left="1134" '
+        'w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>'
+    )
+    styles = (
+        head + '<w:styles xmlns:w="%s">' % W_NS +
+        '<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>'
+        '<w:sz w:val="22"/><w:lang w:val="it-IT"/></w:rPr></w:rPrDefault>'
+        '<w:pPrDefault><w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>'
+        '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/>'
+        '<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:spacing w:after="80"/></w:pPr>'
+        '<w:rPr><w:b/><w:color w:val="5B21B6"/><w:sz w:val="44"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>'
+        '<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="280" w:after="100"/>'
+        '<w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:color w:val="7C3AED"/><w:sz w:val="28"/></w:rPr></w:style>'
+        "</w:styles>"
+    )
+    content_types = (
+        head + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Default Extension="jpeg" ContentType="image/jpeg"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+        "</Types>"
+    )
+    rels = (
+        head + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+        "</Relationships>"
+    )
+    doc_rels = (
+        head + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        "@@MEDIA@@</Relationships>"
+    )
+    doc_rels = doc_rels.replace("@@MEDIA@@", "".join(media_rels))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("word/document.xml", document)
+        z.writestr("word/styles.xml", styles)
+        z.writestr("word/_rels/document.xml.rels", doc_rels)
+        for name, data in media:
+            z.writestr("word/media/" + name, data)
+    return buf.getvalue()
+
+
+def safe_name(t):
+    t = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", s(t)).strip().strip(".")
+    return t[:80] or "esperimento"
+
+
+def api_export(d):
+    exp_id = int(d["id"])
+    con = db()
+    row = con.execute("SELECT * FROM experiments WHERE id=?", (exp_id,)).fetchone()
+    atts = con.execute("SELECT filename,path FROM attachments WHERE exp_id=? ORDER BY id", (exp_id,)).fetchall()
+    con.close()
+    if not row:
+        raise RuntimeError("Esperimento non trovato.")
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    path = os.path.join(EXPORT_DIR, "%s (n.%d).docx" % (safe_name(row["name"]), exp_id))
+    with open(path, "wb") as f:
+        f.write(make_docx(dict(row), [dict(a) for a in atts]))
+    drive = False
+    base = sync_base()
+    if base:
+        try:
+            dest = os.path.join(base, DRIVE_SUBDIR, "Esperimenti")
+            os.makedirs(dest, exist_ok=True)
+            shutil.copy2(path, os.path.join(dest, os.path.basename(path)))
+            drive = True
+        except OSError:
+            drive = False
+    try:
+        subprocess.Popen(["open", path])
+    except OSError:
+        pass
+    return {"file": os.path.basename(path), "folder": "~/DiarioRicercatore/esportazioni", "drive": drive}
+
+
+def find_chemdraw():
+    """Cerca l'app ChemDraw sul Mac (anche dentro cartelle tipo «ChemDraw 23.1» o «ChemOffice»)."""
+    found = []
+
+    def scan(base, depth):
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            return
+        for name in entries:
+            full, low = os.path.join(base, name), name.lower()
+            if low.endswith(".app") and low.startswith("chemdraw"):
+                found.append(full)
+            elif (depth > 0 and not low.endswith(".app") and os.path.isdir(full)
+                  and re.match(r"(chemdraw|chemoffice|perkinelmer|revvity|cambridgesoft)", low)):
+                scan(full, depth - 1)
+
+    for base in ("/Applications", os.path.expanduser("~/Applications")):
+        scan(base, 2)
+    if not found:
+        try:
+            p = subprocess.run(["mdfind", "kMDItemKind == 'Application' && kMDItemFSName == 'ChemDraw*'"],
+                               capture_output=True, text=True, timeout=8)
+            found = [ln for ln in p.stdout.splitlines() if ln.endswith(".app")]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not found:
+        return None
+    found.sort(key=lambda p: ([int(x) for x in re.findall(r"\d+", p)], p))
+    return found[-1]
+
+
+def api_chemdraw_open(d):
+    target = s(load_cfg().get("chemdraw_app")).strip() or find_chemdraw()
+    if not target:
+        raise RuntimeError("NOCHEMDRAW")
+    cmd = ["open", target] if (os.sep in target or target.endswith(".app")) else ["open", "-a", target]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError("NOCHEMDRAW")
+    if p.returncode != 0:
+        raise RuntimeError("NOCHEMDRAW")
+    return {"app": os.path.basename(target)}
+
+
+def api_chemdraw_set(d):
+    v = s(d.get("app")).strip().strip("'\"").replace("\\ ", " ")
+    cfg = load_cfg()
+    if v:
+        cfg["chemdraw_app"] = v
+    else:
+        cfg.pop("chemdraw_app", None)
+    save_cfg(cfg)
+    return {}
+
+
+# ---------------- Cartella Google Drive (sincronizzazione e backup) ----------------
+DRIVE_SUBDIR = "Diario del Ricercatore"
+_sync_lock = threading.Lock()
+_sync_state = {"time": "", "error": "", "last_ts": 0.0}
+
+
+def drive_candidates():
+    """Cartelle di Google Drive per desktop trovate sul Mac (le propone, non le sceglie da sole)."""
+    home = os.path.expanduser("~")
+    out = []
+    base = os.path.join(home, "Library", "CloudStorage")
+    try:
+        for name in sorted(os.listdir(base)):
+            if name.startswith("GoogleDrive"):
+                acc = os.path.join(base, name)
+                for sub in ("Il mio Drive", "My Drive", "Mio Drive"):
+                    if os.path.isdir(os.path.join(acc, sub)):
+                        out.append(os.path.join(acc, sub))
+    except OSError:
+        pass
+    for extra in ("Google Drive/Il mio Drive", "Google Drive/My Drive", "Google Drive", "My Drive"):
+        full = os.path.join(home, extra)
+        if os.path.isdir(full) and full not in out:
+            out.append(full)
+    return out
+
+
+def sync_base():
+    v = s(load_cfg().get("sync_dir")).strip()
+    if not v:
+        return None
+    v = os.path.expanduser(v)
+    return v if os.path.isdir(v) else None
+
+
+def check_sync_dir(v):
+    v = os.path.expanduser(s(v).strip().strip("'\"").replace("\\ ", " "))
+    if not os.path.isdir(v):
+        raise RuntimeError("Quella cartella non esiste. Controlla il percorso (in Finder: seleziona la cartella e premi ⌥⌘C).")
+    real = os.path.realpath(v)
+    app_real = os.path.realpath(APP_DIR)
+    if real == app_real or real.startswith(app_real + os.sep):
+        raise RuntimeError("Scegli una cartella diversa da quella dei dati del Diario.")
+    probe = os.path.join(v, ".diario_prova_%d" % os.getpid())
+    try:
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+    except OSError:
+        raise RuntimeError("Non riesco a scrivere in quella cartella: controlla i permessi.")
+    return v
+
+
+def api_drive_find(d):
+    return {"found": drive_candidates(), "current": s(load_cfg().get("sync_dir"))}
+
+
+def api_drive_set(d):
+    cfg = load_cfg()
+    v = s(d.get("path")).strip()
+    if v:
+        cfg["sync_dir"] = check_sync_dir(v)
+    else:
+        cfg.pop("sync_dir", None)
+    save_cfg(cfg)
+    return {"sync_dir": s(cfg.get("sync_dir"))}
+
+
+def _copy_if_changed(src, dst):
+    try:
+        st = os.stat(src)
+        if os.path.exists(dst):
+            dt = os.stat(dst)
+            if dt.st_size == st.st_size and dt.st_mtime >= st.st_mtime:
+                return False
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        return True
+    except OSError:
+        return False
+
+
+def sync_to_drive():
+    """Copia nella cartella Drive: un Word per ogni esperimento + copia di sicurezza di database e allegati."""
+    base = sync_base()
+    if not base:
+        raise RuntimeError("NODRIVE")
+    if not _sync_lock.acquire(blocking=False):
+        raise RuntimeError("Una sincronizzazione e' gia' in corso.")
+    try:
+        root = os.path.join(base, DRIVE_SUBDIR)
+        dir_exp = os.path.join(root, "Esperimenti")
+        dir_bak = os.path.join(root, "Backup")
+        os.makedirs(dir_exp, exist_ok=True)
+        os.makedirs(dir_bak, exist_ok=True)
+        # 1) copia coerente del database (anche mentre il Diario e' in uso)
+        tmp = os.path.join(dir_bak, "diario.db.tmp")
+        src = db()
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        os.replace(tmp, os.path.join(dir_bak, "diario.db"))
+        # 2) allegati
+        n_att = 0
+        for r, _dirs, files in os.walk(ATT_DIR):
+            for fn in files:
+                sp = os.path.join(r, fn)
+                if _copy_if_changed(sp, os.path.join(dir_bak, "allegati", os.path.relpath(sp, ATT_DIR))):
+                    n_att += 1
+        # 3) un Word per esperimento (solo quelli nuovi o modificati)
+        n_doc = 0
+        con = db()
+        rows = con.execute("SELECT * FROM experiments ORDER BY id").fetchall()
+        for row in rows:
+            atts = con.execute("SELECT filename,path FROM attachments WHERE exp_id=? ORDER BY id", (row["id"],)).fetchall()
+            path = os.path.join(dir_exp, "%s (n.%d).docx" % (safe_name(row["name"]), row["id"]))
+            try:
+                upd = datetime.datetime.fromisoformat(s(row["updated"])).timestamp()
+            except ValueError:
+                upd = time.time()
+            for a in atts:
+                try:
+                    upd = max(upd, os.path.getmtime(a["path"]))
+                except OSError:
+                    pass
+            if os.path.exists(path) and os.path.getmtime(path) >= upd:
+                continue
+            with open(path, "wb") as f:
+                f.write(make_docx(dict(row), [dict(a) for a in atts]))
+            n_doc += 1
+        con.close()
+        _sync_state.update({"time": now(), "error": "", "last_ts": time.time()})
+        return {"documenti": n_doc, "allegati": n_att, "esperimenti": len(rows), "cartella": root}
+    except Exception as ex:
+        _sync_state["error"] = str(ex)
+        raise
+    finally:
+        _sync_lock.release()
+
+
+def api_drive_sync(d):
+    try:
+        return sync_to_drive()
+    except RuntimeError as ex:
+        raise
+    except OSError as ex:
+        raise RuntimeError("Sincronizzazione non riuscita: %s" % ex)
+
+
+def auto_sync_loop():
+    """Ogni 5 minuti, se la cartella Drive e' impostata e ci sono modifiche, sincronizza da sola."""
+    while True:
+        time.sleep(300)
+        try:
+            if sync_base() and os.path.getmtime(DB_PATH) > _sync_state["last_ts"]:
+                sync_to_drive()
+        except Exception:
+            pass
+
+
+# ---------------- Editor di strutture (JSME) ----------------
+JSME_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jsme")
+JSME_CDN = "https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"
+
+
+def jsme_url():
+    """Se accanto a diario_web.py c'e' la cartella «jsme» (scaricata), l'editor funziona anche senza internet."""
+    if os.path.isfile(os.path.join(JSME_DIR, "jsme.nocache.js")):
+        return "/jsme/jsme.nocache.js"
+    return JSME_CDN
+
+
+def api_key_status(d):
+    cfg = load_cfg()
+    return {"claude": bool(get_api_key()), "gemini": bool(get_gemini_key()),
+            "gemini_model": s(cfg.get("gemini_model")), "chemdraw": s(cfg.get("chemdraw_app")),
+            "sync_dir": s(cfg.get("sync_dir")), "sync_last": _sync_state["time"], "sync_error": _sync_state["error"]}
+
+
+def api_set_keys(d):
+    cfg = load_cfg()
+    for field, cfg_key in (("claude", "api_key"), ("gemini", "gemini_key")):
+        v = s(d.get(field)).strip()
+        if v:                       # campo vuoto = non cambiare la chiave gia' salvata
+            check_key_chars(v)
+            cfg[cfg_key] = v
+    for who in (d.get("remove") or []):
+        if who == "claude":
+            cfg.pop("api_key", None)
+        elif who == "gemini":
+            cfg.pop("gemini_key", None)
+    if "gemini_model" in d:
+        m = s(d["gemini_model"]).strip()
+        if m.startswith("models/"):
+            m = m[len("models/"):]
+        if m and not re.match(r"^[A-Za-z0-9._-]+$", m):
+            raise RuntimeError("Nome del modello non valido.")
+        if m:
+            cfg["gemini_model"] = m
+        else:
+            cfg.pop("gemini_model", None)
+    save_cfg(cfg)
+    _gemini_model_cache.clear()
+    return {}
+
+
+ROUTES = {
+    "/api/list": api_list, "/api/get": api_get, "/api/new": api_new, "/api/save": api_save,
+    "/api/delete": api_delete, "/api/att_open": api_att_open, "/api/att_reveal": api_att_reveal,
+    "/api/att_delete": api_att_delete, "/api/ai": api_ai, "/api/key_status": api_key_status,
+    "/api/set_keys": api_set_keys, "/api/export": api_export,
+    "/api/chemdraw_open": api_chemdraw_open, "/api/chemdraw_set": api_chemdraw_set,
+    "/api/drive_find": api_drive_find, "/api/drive_set": api_drive_set, "/api/drive_sync": api_drive_sync,
+    "/api/tree": api_tree, "/api/group_new": api_group_new, "/api/group_update": api_group_update,
+    "/api/group_move": api_group_move, "/api/group_delete": api_group_delete, "/api/exp_move": api_exp_move,
+}
+
+
+# ---------------- HTTP ----------------
+class Handler(BaseHTTPRequestHandler):
+    server_version = "Diario/1.0"
+
+    def log_message(self, *a):
+        pass
+
+    def host_ok(self):
+        host = self.headers.get("Host") or ""
+        port = self.server.server_port
+        return host in ("127.0.0.1:%d" % port, "localhost:%d" % port)
+
+    def send_json(self, obj, code=200):
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if not self.host_ok():
+            return self.send_error(403)
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == "/att":
+            return self.serve_attachment(parsed.query)
+        if path.startswith("/jsme/"):
+            return self.serve_jsme(path[len("/jsme/"):])
+        if path != "/":
+            return self.send_error(404)
+        data = PAGE.replace("__TOKEN__", TOKEN).replace("__JSME__", jsme_url()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_jsme(self, rel):
+        """File dell'editor JSME scaricato in locale (solo dalla cartella «jsme»)."""
+        real = os.path.realpath(os.path.join(JSME_DIR, urllib.parse.unquote(rel)))
+        if not real.startswith(os.path.realpath(JSME_DIR) + os.sep) or not os.path.isfile(real):
+            return self.send_error(404)
+        ctype = mimetypes.guess_type(real)[0] or "application/octet-stream"
+        if real.endswith(".js"):
+            ctype = "application/javascript"
+        with open(real, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_attachment(self, query):
+        """Serve un'immagine allegata (solo PNG/JPG) per le anteprime nella pagina."""
+        qs = urllib.parse.parse_qs(query)
+        tok = (qs.get("t") or [""])[0]
+        if not secrets.compare_digest(tok.encode("utf-8"), TOKEN.encode("utf-8")):
+            return self.send_error(403)
+        try:
+            p = att_path(int((qs.get("id") or ["0"])[0]))
+        except Exception:
+            return self.send_error(404)
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in IMG_EXT:
+            return self.send_error(404)
+        with open(p, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", IMG_EXT[ext][1])
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def handle_upload(self, query, n):
+        qs = urllib.parse.parse_qs(query)
+        exp_id = int(qs["exp"][0])
+        name = os.path.basename(qs.get("name", ["file"])[0]).strip() or "file"
+        dest_dir = os.path.join(ATT_DIR, str(exp_id))
+        os.makedirs(dest_dir, exist_ok=True)
+        base, ext = os.path.splitext(name)
+        dest = os.path.join(dest_dir, name)
+        k = 1
+        while os.path.exists(dest):
+            dest = os.path.join(dest_dir, "%s_%d%s" % (base, k, ext))
+            k += 1
+        remaining = n
+        with open(dest, "wb") as f:
+            while remaining > 0:
+                chunk = self.rfile.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+        con = db()
+        con.execute("INSERT INTO attachments(exp_id,filename,path) VALUES(?,?,?)",
+                    (exp_id, os.path.basename(dest), dest))
+        con.commit()
+        con.close()
+        return {}
+
+    def do_POST(self):
+        if not self.host_ok() or not secrets.compare_digest(self.headers.get("X-Token") or "", TOKEN):
+            return self.send_json({"error": "non autorizzato"}, 403)
+        parsed = urllib.parse.urlparse(self.path)
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            if parsed.path == "/api/upload":
+                res = self.handle_upload(parsed.query, n)
+            else:
+                fn = ROUTES.get(parsed.path)
+                raw = self.rfile.read(n) if n else b"{}"
+                if not fn:
+                    return self.send_json({"error": "rotta sconosciuta"}, 404)
+                res = fn(json.loads(raw.decode("utf-8") or "{}"))
+            self.send_json(res)
+        except RuntimeError as ex:
+            self.send_json({"error": str(ex)}, 400)
+        except Exception as ex:
+            self.send_json({"error": "Errore interno: %s" % ex}, 500)
+
+
+# ---------------- Pagina ----------------
+PAGE = r"""<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>🔬 Diario del Ricercatore</title>
+<style>
+:root{--v:#7C3AED;--vd:#5B21B6;--vl:#EDE9FE;--g:#10B981;--b:#3B82F6;--o:#F59E0B;--r:#EC4899;--bg:#F8F7FF}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;background:var(--bg);color:#1F2937}
+.app{display:flex;height:100vh}
+aside{width:300px;flex:none;background:linear-gradient(180deg,#7C3AED,#5B21B6);color:#fff;padding:20px 16px;display:flex;flex-direction:column;gap:10px}
+.logo{font-size:26px;font-weight:800;line-height:1.1;margin:4px 4px 8px}
+#search{width:100%;border:0;border-radius:10px;padding:10px 12px;font:inherit;outline:none}
+#list{flex:1;overflow:auto;background:rgba(0,0,0,.18);border-radius:14px;padding:6px}
+.item{display:flex;flex-direction:column;width:100%;text-align:left;background:transparent;color:#fff;border:0;border-radius:10px;padding:9px 12px;margin-bottom:3px;cursor:pointer;font:inherit}
+.item:hover{background:rgba(255,255,255,.14)}
+.item.sel{background:var(--vl);color:var(--vd)}
+.it-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.it-date{font-size:12px;opacity:.75;padding-left:22px}
+main{flex:1;overflow:auto;padding:22px 26px 60px}
+.card{background:#fff;border-radius:16px;box-shadow:0 2px 10px rgba(91,33,182,.08);padding:16px 18px;margin-bottom:14px;border:2px solid transparent}
+.card.active{border-color:#C4B5FD}
+input,textarea{font:inherit;color:inherit}
+input.title{width:100%;font-size:24px;font-weight:700;border:0;background:var(--vl);border-radius:12px;padding:12px 14px;outline:none}
+.row{display:flex;gap:8px;margin-top:10px;align-items:center}
+.row input{border:1px solid #DDD6FE;border-radius:10px;padding:9px 12px;outline:none}
+#date{width:130px;flex:none}
+#project{flex:1;min-width:120px}
+.row{flex-wrap:wrap}
+.row .btn{white-space:nowrap;flex:none}
+textarea{width:100%;border:1px solid #DDD6FE;border-radius:12px;padding:11px 13px;background:#FAFAFF;resize:vertical;line-height:1.5;outline:none;min-height:70px;font-size:15px}
+textarea:focus,.row input:focus{border-color:var(--v)}
+.btn{border:0;border-radius:10px;padding:9px 14px;color:#fff;font:inherit;font-weight:600;cursor:pointer}
+.btn:hover{filter:brightness(.92)}
+.btn:disabled{opacity:.5;cursor:wait}
+.violet{background:var(--v)}.green{background:var(--g)}.blue{background:var(--b)}.orange{background:var(--o)}.pink{background:var(--r)}.red{background:#EF4444}.grey{background:#9CA3AF}
+.ghost{background:transparent;border:1px solid rgba(255,255,255,.75)}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.ailabel{font-weight:700;color:var(--v);margin-right:6px}
+.keyrow{display:flex;justify-content:space-between;align-items:center;margin-top:6px}
+.modal .hint{font-size:13px;color:#6B7280}
+#status{color:#6B7280;margin-left:auto;font-size:14px}
+.h2{font-weight:700;color:var(--vd);font-size:17px;margin:0 0 8px}
+.att{display:flex;align-items:center;gap:8px;background:var(--vl);border-radius:10px;padding:7px 12px;margin-top:6px}
+.att .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.small{padding:5px 11px;font-size:13px}
+select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px;background:#fff;max-width:420px;outline:none}
+.sbrow{display:flex;gap:8px}
+.sbrow .btn{padding:9px 8px;white-space:nowrap;font-size:14px;min-width:0}
+.sbnote{color:rgba(255,255,255,.85);font-size:13px;padding:8px 10px}
+.grp{margin-bottom:5px}
+.ghead{position:relative;display:flex;align-items:center;gap:6px;border-radius:9px;padding:6px 8px;color:#fff;cursor:pointer;user-select:none;-webkit-user-select:none;text-shadow:0 1px 1px rgba(0,0,0,.25)}
+.ghead.dropover{outline:3px solid #fff}
+.garrow{width:14px;text-align:center;font-size:12px}
+.gname{flex:1;min-width:0;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gcount{font-size:12px;background:rgba(0,0,0,.22);border-radius:10px;padding:1px 8px}
+.gmore{border:0;background:rgba(255,255,255,.3);color:#fff;border-radius:6px;padding:0 8px;cursor:pointer;font-size:16px;font-weight:700;line-height:20px}
+.gmore:hover{background:rgba(255,255,255,.55)}
+.gmenu{position:fixed;z-index:30;background:#fff;color:#1F2937;border-radius:12px;box-shadow:0 8px 28px rgba(30,20,60,.35);padding:6px;min-width:250px;display:flex;flex-direction:column}
+.gmenu button{border:0;background:transparent;text-align:left;padding:9px 12px;border-radius:8px;font:inherit;cursor:pointer}
+.gmenu button:hover{background:var(--vl)}
+.gmenu button.danger{color:#DC2626}
+.gcolors{display:flex;gap:6px;padding:8px 12px 6px;align-items:center}
+.gcolors span{font-size:13px;color:#6B7280;margin-right:4px}
+.gcolors .sw{width:20px;height:20px;border-radius:50%;padding:0;border:2px solid #fff;box-shadow:0 0 0 1px #D1D5DB}
+.gcolors .sw.cur{box-shadow:0 0 0 2px #1F2937}
+.gbody{margin:3px 0 0 9px;padding-left:6px;border-left:3px solid}
+.thumb{max-height:110px;max-width:260px;border-radius:8px;background:#fff;border:1px solid #DDD6FE}
+.warn{color:#B45309;font-size:12px;white-space:normal;margin-top:2px}
+.muted{color:#9CA3AF}
+.drop{border:2px dashed #C4B5FD;border-radius:12px;padding:12px;margin-top:8px}
+.drop.over{background:var(--vl)}
+.topline{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(30,20,60,.45);display:flex;align-items:center;justify-content:center;z-index:10}
+.modal{background:#fff;border-radius:18px;padding:20px;width:min(760px,92vw);max-height:90vh;display:flex;flex-direction:column;gap:10px}
+.modal textarea{min-height:300px}
+.modal input{border:1px solid #DDD6FE;border-radius:10px;padding:10px 12px;outline:none}
+.modal .btns{display:flex;gap:8px;justify-content:flex-end}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="logo">🔬 Diario del<br>Ricercatore</div>
+    <div class="sbrow">
+      <button class="btn orange" id="btnNew" style="flex:1.25" title="Nuovo esperimento">＋ Esperimento</button>
+      <button class="btn ghost" id="btnNewGroup" style="flex:1" title="Crea un gruppo per raggruppare gli esperimenti">📁＋ Gruppo</button>
+    </div>
+    <input id="search" placeholder="🔍 Cerca esperimento…">
+    <div id="list"></div>
+    <button class="btn ghost" id="btnArchive">📦 Archivio</button>
+    <button class="btn ghost" id="btnSync" title="Salva Word e copia di sicurezza nella cartella di Google Drive">☁️ Sincronizza con Drive</button>
+    <button class="btn ghost" id="btnKey">🔑 Chiavi API e impostazioni</button>
+  </aside>
+  <main>
+    <div class="card">
+      <input id="name" class="title" placeholder="Nome dell'esperimento (es. NG012 – step 3)">
+      <div class="row">
+        <input id="date" placeholder="Data">
+        <input id="project" placeholder="Progetto / molecola target">
+        <button class="btn green" id="btnSave">💾 Salva</button>
+        <button class="btn orange" id="btnChem" title="Apre l'app ChemDraw">⚗️ ChemDraw</button>
+        <button class="btn blue" id="btnExport" title="Crea un documento Word di questo esperimento">📄 Esporta in Word</button>
+        <button class="btn red" id="btnDel" title="Elimina esperimento">🗑</button>
+      </div>
+      <div class="row">
+        <span class="muted">📁 Gruppo:</span>
+        <select id="groupsel"></select>
+      </div>
+    </div>
+    <div class="card bar" id="aibar"><span class="ailabel" id="ailabel"></span>
+      <select id="engine" title="Quale intelligenza artificiale usare">
+        <option value="claude">🟣 Claude</option>
+        <option value="gemini">🔵 Gemini</option>
+      </select>
+    </div>
+    <div id="sections"></div>
+    <div class="card">
+      <div class="topline">
+        <div class="h2" style="margin:0">📎 Allegati (ChemDraw e altri file)</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn violet" id="btnDraw" title="Disegna una molecola o uno schema e allegalo all'esperimento">🧪 Disegna molecola</button>
+          <button class="btn blue" id="btnAdd">＋ Aggiungi file</button>
+        </div>
+      </div>
+      <input type="file" id="filepick" multiple style="display:none">
+      <div class="drop" id="drop">
+        <div id="attlist"></div>
+        <div class="muted" style="margin-top:8px;font-size:13px">💡 <b>Per vedere gli schemi nel Word:</b> in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.</div>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+const TOKEN = "__TOKEN__";
+const JSME_URL = "__JSME__";
+const SECTIONS = [
+  ["obiettivo", "🎯 Obiettivo", "Qual è lo scopo dell'esperimento?", 3],
+  ["procedura", "🧪 Procedura sperimentale", "Scrivi qui appunti e procedura, anche in modo disordinato: l'AI li metterà in forma.", 10],
+  ["risultati", "📊 Risultati e osservazioni", "Rese, aspetto, TLC, NMR, osservazioni…", 5],
+  ["note", "📝 Note e prossimi passi", "", 4]
+];
+const AIBTNS = [
+  ["✨ Stila", "violet", "stila"],
+  ["🔤 Correggi", "green", "correggi"],
+  ["🌍 In inglese", "blue", "inglese"],
+  ["💡 Suggerisci titolo", "orange", "titolo"],
+  ["🪄 Istruzione libera", "pink", "libera"]
+];
+let curId = null, active = "procedura", saveTimer = null, dirty = false, searchTimer = null;
+let TREE = { groups: [], exps: [] }, archiveMode = false, curGroup = null;
+const PALETTE = ["#EC4899", "#EA580C", "#B45309", "#059669", "#2563EB", "#0D9488", "#DC2626", "#64748B"];
+const $ = id => document.getElementById(id);
+
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in (props || {})) {
+    if (k === "class") e.className = props[k];
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), props[k]);
+    else e.setAttribute(k, props[k]);
+  }
+  for (const c of kids.flat()) {
+    if (c == null) continue;
+    e.append(c);
+  }
+  return e;
+}
+
+async function api(route, body) {
+  const r = await fetch("/api/" + route, {
+    method: "POST",
+    headers: { "X-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify(body || {})
+  });
+  let data = {};
+  try { data = await r.json(); } catch (e) {}
+  if (r.status === 403) throw new Error("Sessione scaduta: chiudi questa scheda e riapri il Diario dal file «Avvia Diario.command».");
+  if (!r.ok || data.error) throw new Error(data.error || ("Errore " + r.status));
+  return data;
+}
+
+let statusTimer = null;
+function status(msg, ms) {
+  $("status") && ($("status").textContent = msg);
+  clearTimeout(statusTimer);
+  if (ms) statusTimer = setTimeout(() => { $("status").textContent = ""; }, ms);
+}
+function fail(e) { status(""); alert(e.message || String(e)); }
+
+function autosize(t) {
+  t.style.height = "auto";
+  t.style.height = Math.max(t.scrollHeight + 2, 70) + "px";
+}
+
+function collect() {
+  const o = { id: curId, name: $("name").value, date: $("date").value, project: $("project").value };
+  SECTIONS.forEach(s => { o[s[0]] = $("sec_" + s[0]).value; });
+  return o;
+}
+
+async function saveNow() {
+  clearTimeout(saveTimer);
+  if (curId == null) return;
+  await api("save", collect());
+  dirty = false;
+  status("✅ Salvato", 2000);
+  await loadList();
+}
+
+function scheduleSave() {
+  dirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => saveNow().catch(() => {}), 1500);
+}
+
+// ---------- gruppi (stile tracce di gruppo di Ableton) ----------
+const gById = id => TREE.groups.find(g => g.id === id);
+function inArchive(gid) {            // vero se il gruppo o un suo antenato è archiviato
+  let g = gid == null ? null : gById(gid), n = 0;
+  while (g && n++ < 100) { if (g.archived) return true; g = g.parent_id == null ? null : gById(g.parent_id); }
+  return false;
+}
+function isUnder(gid, ancestorId) {  // vero se gid è dentro ancestorId (a qualsiasi livello)
+  let g = gid == null ? null : gById(gid), n = 0;
+  while (g && n++ < 100) { if (g.id === ancestorId) return true; g = g.parent_id == null ? null : gById(g.parent_id); }
+  return false;
+}
+function groupPath(gid) {
+  const p = []; let g = gid == null ? null : gById(gid), n = 0;
+  while (g && n++ < 100) { p.unshift(g.name); g = g.parent_id == null ? null : gById(g.parent_id); }
+  return p.join(" › ");
+}
+function countExps(gid) {
+  let n = TREE.exps.filter(e => e.group_id === gid).length;
+  TREE.groups.filter(g => g.parent_id === gid).forEach(g => { n += countExps(g.id); });
+  return n;
+}
+const isArchiveRoot = g => g.archived && (g.parent_id == null || !inArchive(g.parent_id));
+function orderedGroups(parent, depth, out) {
+  TREE.groups.filter(g => g.parent_id === parent).forEach(g => { out.push([g, depth]); orderedGroups(g.id, depth + 1, out); });
+  return out;
+}
+
+async function loadList() {
+  const d = await api("tree", { q: $("search").value.trim() });
+  TREE = { groups: d.groups, exps: d.exps };
+  const ids = new Set(TREE.groups.map(g => g.id));
+  TREE.groups.forEach(g => { if (g.parent_id != null && !ids.has(g.parent_id)) g.parent_id = null; });
+  TREE.exps.forEach(e => { if (e.group_id != null && !ids.has(e.group_id)) e.group_id = null; });
+  renderList();
+  fillGroupSelect();
+}
+
+function fillGroupSelect() {
+  const sel = $("groupsel");
+  sel.innerHTML = "";
+  sel.append(h("option", { value: "" }, "— nessun gruppo —"));
+  orderedGroups(null, 0, []).forEach(([g, depth]) => {
+    if (inArchive(g.id) && g.id !== curGroup) return;
+    sel.append(h("option", { value: String(g.id) },
+      "  ".repeat(depth) + "📁 " + g.name + (inArchive(g.id) ? " (archiviato)" : "")));
+  });
+  sel.value = curGroup == null ? "" : String(curGroup);
+}
+
+function renderExp(e, showPath, draggable) {
+  const el = h("div", { class: "item" + (e.id === curId ? " sel" : ""), onclick: () => switchTo(e.id).catch(fail) },
+    h("span", { class: "it-name" }, "🧪 " + (e.name || "Senza nome")),
+    h("span", { class: "it-date" }, (showPath && e.group_id != null ? groupPath(e.group_id) + " · " : "") + (e.date || "")));
+  if (draggable) {
+    el.setAttribute("draggable", "true");
+    el.addEventListener("dragstart", ev => {
+      ev.stopPropagation();
+      ev.dataTransfer.setData("text/plain", "exp:" + e.id);
+      ev.dataTransfer.effectAllowed = "move";
+    });
+  }
+  return el;
+}
+
+function renderGroup(g, arch) {
+  const wrap = h("div", { class: "grp" });
+  const ctl = h("span", { class: "gctl" });
+  let items = null;
+  if (!arch) {
+    items = [
+      ["🧪  Nuovo esperimento in questo gruppo", () => newExp(g.id)],
+      ["📁  Nuovo sottogruppo", () => newGroup(g.id)],
+      ["✎  Rinomina", () => renameGroup(g)],
+      ["📦  Archivia (scompare dall'elenco)", () => archiveGroup(g)],
+      ["🗑  Elimina il gruppo…", () => deleteGroup(g), true]];
+  } else if (isArchiveRoot(g)) {
+    items = [
+      ["↩  Ripristina nell'elenco", () => restoreGroup(g)],
+      ["🗑  Elimina il gruppo…", () => deleteGroup(g), true]];
+  }
+  if (items) ctl.append(h("button", { class: "gmore", title: "Azioni del gruppo", onclick: ev => openGroupMenu(ev, items, arch ? null : g) }, "⋯"));
+  const head = h("div", { class: "ghead", style: "background:" + g.color, onclick: () => toggleGroup(g) },
+    h("span", { class: "garrow" }, g.collapsed ? "▸" : "▾"),
+    h("span", { class: "gname", title: g.name }, "📁 " + g.name),
+    h("span", { class: "gcount" }, String(countExps(g.id))),
+    ctl);
+  wrap.append(head);
+  if (!g.collapsed) {
+    const body = h("div", { class: "gbody", style: "border-left-color:" + g.color });
+    TREE.groups.filter(x => x.parent_id === g.id && (arch || !x.archived)).forEach(x => body.append(renderGroup(x, arch)));
+    TREE.exps.filter(e => e.group_id === g.id).forEach(e => body.append(renderExp(e, false, !arch)));
+    if (!body.childNodes.length) body.append(h("div", { class: "sbnote" }, "Vuoto: trascina qui degli esperimenti"));
+    wrap.append(body);
+  }
+  if (!arch) {
+    head.setAttribute("draggable", "true");
+    head.addEventListener("dragstart", ev => {
+      ev.stopPropagation();
+      ev.dataTransfer.setData("text/plain", "grp:" + g.id);
+      ev.dataTransfer.effectAllowed = "move";
+    });
+    wrap.addEventListener("dragover", ev => { ev.preventDefault(); ev.stopPropagation(); head.classList.add("dropover"); });
+    wrap.addEventListener("dragleave", ev => { if (!wrap.contains(ev.relatedTarget)) head.classList.remove("dropover"); });
+    wrap.addEventListener("drop", ev => {
+      ev.preventDefault(); ev.stopPropagation(); head.classList.remove("dropover");
+      handleDrop(ev.dataTransfer.getData("text/plain"), g.id);
+    });
+  }
+  return wrap;
+}
+
+function renderList() {
+  const box = $("list");
+  box.innerHTML = "";
+  const q = $("search").value.trim();
+  const roots = TREE.groups.filter(isArchiveRoot);
+  $("btnArchive").textContent = archiveMode ? "← Torna ai miei esperimenti" : "📦 Archivio" + (roots.length ? " (" + roots.length + ")" : "");
+  if (archiveMode) box.append(h("div", { class: "sbnote" }, "📦 Archivio: qui ci sono i gruppi archiviati. Per rimetterne uno nell'elenco clicca ⋯ → Ripristina."));
+  if (q) {
+    const found = TREE.exps.filter(e => archiveMode ? (e.group_id != null && inArchive(e.group_id)) : !inArchive(e.group_id));
+    if (!found.length) box.append(h("div", { class: "sbnote" }, "Nessun risultato"));
+    found.forEach(e => box.append(renderExp(e, true, false)));
+    return;
+  }
+  if (archiveMode) {
+    if (!roots.length) box.append(h("div", { class: "sbnote" }, "Nessun gruppo archiviato."));
+    roots.forEach(g => box.append(renderGroup(g, true)));
+    return;
+  }
+  TREE.groups.filter(g => g.parent_id == null && !g.archived).forEach(g => box.append(renderGroup(g, false)));
+  TREE.exps.filter(e => e.group_id == null).forEach(e => box.append(renderExp(e, false, true)));
+  if (!box.childNodes.length) box.append(h("div", { class: "sbnote" }, "Nessun esperimento."));
+}
+
+async function handleDrop(payload, gid) {
+  const m = /^(exp|grp):(\d+)$/.exec(payload || "");
+  if (!m) return;
+  const id = Number(m[2]);
+  try {
+    if (m[1] === "exp") {
+      await api("exp_move", { id, group_id: gid });
+      if (id === curId) curGroup = gid;
+    } else {
+      if (gid === id || isUnder(gid, id)) return;      // non si può spostare un gruppo dentro se stesso
+      await api("group_move", { id, parent_id: gid });
+    }
+    if (gid != null) { const t = gById(gid); if (t && t.collapsed) await api("group_update", { id: gid, collapsed: 0 }); }
+    await loadList();
+  } catch (e) { fail(e); }
+}
+
+function closeMenu() { document.querySelectorAll(".gmenu").forEach(m => m.remove()); }
+function openGroupMenu(ev, items, colorGroup) {
+  ev.stopPropagation();
+  closeMenu();
+  const r = ev.currentTarget.getBoundingClientRect();
+  const m = h("div", { class: "gmenu" });
+  if (colorGroup) {
+    const row = h("div", { class: "gcolors" }, h("span", null, "Colore"));
+    PALETTE.forEach(c => row.append(h("button", {
+      class: "sw" + (c === colorGroup.color ? " cur" : ""), style: "background:" + c, title: c,
+      onclick: e => { e.stopPropagation(); closeMenu(); setColor(colorGroup, c).catch(fail); }
+    })));
+    m.append(row);
+  }
+  items.forEach(([label, fn, danger]) => m.append(h("button", {
+    class: danger ? "danger" : "",
+    onclick: e => { e.stopPropagation(); closeMenu(); Promise.resolve(fn()).catch(fail); }
+  }, label)));
+  document.body.append(m);
+  const mw = m.offsetWidth, mh = m.offsetHeight;
+  m.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + "px";
+  m.style.top = (r.bottom + mh + 8 > window.innerHeight ? Math.max(8, r.top - mh - 4) : r.bottom + 4) + "px";
+}
+
+function toggleGroup(g) {
+  g.collapsed = g.collapsed ? 0 : 1;
+  renderList();
+  api("group_update", { id: g.id, collapsed: g.collapsed }).catch(() => {});
+}
+async function newGroup(parentId) {
+  const name = prompt(parentId == null ? "Nome del nuovo gruppo (es. Progetto NG012):" : "Nome del sottogruppo:");
+  if (name === null) return;
+  await api("group_new", { name: name.trim(), parent_id: parentId });
+  await loadList();
+}
+async function renameGroup(g) {
+  const n = prompt("Nome del gruppo:", g.name);
+  if (n === null || !n.trim()) return;
+  await api("group_update", { id: g.id, name: n.trim() });
+  await loadList();
+}
+async function setColor(g, c) {
+  await api("group_update", { id: g.id, color: c });
+  await loadList();
+}
+async function archiveGroup(g) {
+  await api("group_update", { id: g.id, archived: 1 });
+  await loadList();
+  status("📦 «" + g.name + "» archiviato: lo trovi in 📦 Archivio", 7000);
+}
+async function restoreGroup(g) {
+  await api("group_update", { id: g.id, archived: 0 });
+  await loadList();
+  status("✅ «" + g.name + "» ripristinato", 4000);
+}
+async function deleteGroup(g) {
+  if (!confirm("Eliminare il gruppo «" + g.name + "»?\n\nGli esperimenti NON vengono cancellati: passano al gruppo superiore (o all'elenco principale).")) return;
+  await api("group_delete", { id: g.id });
+  await loadList();
+}
+
+async function switchTo(id) {
+  if (id === curId) return;
+  await saveNow();
+  await openExp(id);
+}
+
+async function openExp(id) {
+  const d = await api("get", { id });
+  curId = id;
+  const e = d.exp;
+  curGroup = e.group_id == null ? null : e.group_id;
+  $("name").value = e.name || "";
+  $("date").value = e.date || "";
+  $("project").value = e.project || "";
+  SECTIONS.forEach(s => { const t = $("sec_" + s[0]); t.value = e[s[0]] || ""; autosize(t); });
+  renderAtt(d.attachments);
+  dirty = false;
+  await loadList();
+}
+
+async function newExp(gid) {
+  await saveNow();
+  const d = await api("new", { group_id: gid == null ? null : gid });
+  await openExp(d.id);
+  $("name").focus();
+  $("name").select();
+}
+
+async function deleteExp() {
+  if (curId == null) return;
+  if (!confirm("Eliminare questo esperimento e i suoi allegati?")) return;
+  clearTimeout(saveTimer);
+  const d = await api("delete", { id: curId });
+  curId = null;
+  dirty = false;
+  if (d.next) await openExp(d.next); else await newExp();
+}
+
+function setActive(k) {
+  active = k;
+  SECTIONS.forEach(s => $("card_" + s[0]).classList.toggle("active", s[0] === k));
+  const sec = SECTIONS.find(s => s[0] === k);
+  $("ailabel").textContent = "✨ AI su: " + sec[1].split(" ").slice(1).join(" ");
+}
+
+// ---------- allegati ----------
+function renderAtt(list) {
+  const box = $("attlist");
+  box.innerHTML = "";
+  if (!list.length) {
+    box.append(h("div", { class: "muted" }, "Nessun allegato. Aggiungi o trascina qui i tuoi schemi ChemDraw."));
+    return;
+  }
+  const imgStems = new Set(list.filter(x => /\.(png|jpe?g)$/i.test(x.filename))
+    .map(x => x.filename.replace(/\.[^.]*$/, "").toLowerCase()));
+  list.forEach(a => {
+    const chem = /\.(cdx|cdxml|cd|c3xml)$/i.test(a.filename);
+    const isImg = /\.(png|jpe?g)$/i.test(a.filename);
+    const stem = a.filename.replace(/\.[^.]*$/, "").toLowerCase();
+    const noImg = chem && !imgStems.has(stem);
+    box.append(h("div", { class: "att" },
+      isImg ? h("img", { class: "thumb", src: "/att?id=" + a.id + "&t=" + TOKEN, alt: a.filename })
+            : h("span", null, chem ? "⚗️" : "📄"),
+      h("span", { class: "nm" }, a.filename,
+        noImg ? h("div", { class: "warn" }, "⚠️ Nessuna immagine associata: nel Word comparirà solo il nome. Incolla lo schema da ChemDraw (⌘C → ⌘V qui) o aggiungi un PNG con lo stesso nome.") : null),
+      h("button", { class: "btn violet small", onclick: () => api("att_open", { id: a.id }).catch(fail) }, "Apri"),
+      h("button", { class: "btn blue small", onclick: () => api("att_reveal", { id: a.id }).catch(fail) }, "Finder"),
+      h("button", { class: "btn red small", onclick: () => delAtt(a.id) }, "✕")));
+  });
+}
+
+async function delAtt(id) {
+  if (!confirm("Rimuovere l'allegato?")) return;
+  await api("att_delete", { id });
+  const d = await api("get", { id: curId });
+  renderAtt(d.attachments);
+}
+
+async function uploadFiles(files) {
+  if (curId == null) return;
+  for (const f of files) {
+    status("⬆️ Carico " + f.name + "…");
+    const r = await fetch("/api/upload?exp=" + curId + "&name=" + encodeURIComponent(f.name),
+      { method: "POST", headers: { "X-Token": TOKEN }, body: f });
+    if (!r.ok) {
+      let m = "";
+      try { m = (await r.json()).error; } catch (e) {}
+      alert("Errore nel caricamento di " + f.name + ": " + m);
+    }
+  }
+  status("✅ Allegati caricati", 2000);
+  const d = await api("get", { id: curId });
+  renderAtt(d.attachments);
+}
+
+// ---------- AI ----------
+const engineName = () => ($("engine").value === "gemini" ? "Gemini" : "Claude");
+function setBusy(b) {
+  document.querySelectorAll(".aibtn").forEach(x => { x.disabled = b; });
+  status(b ? "✨ " + engineName() + " sta lavorando…" : "");
+}
+
+async function runAI(mode) {
+  let text, target, instr = "";
+  if (mode === "titolo") {
+    text = SECTIONS.map(s => s[1] + ":\n" + $("sec_" + s[0]).value).join("\n\n");
+    target = "name";
+  } else {
+    text = $("sec_" + active).value;
+    target = active;
+  }
+  if (!text.replace(/[^\p{L}\p{N}]/gu, "")) { alert("Scrivi prima qualcosa nella sezione selezionata."); return; }
+  if (mode === "libera") {
+    instr = prompt("Cosa vuoi che faccia " + engineName() + " con questo testo?\n(es. riassumi in 3 righe, aggiungi una tabella delle rese)");
+    if (!instr) return;
+  }
+  const engine = $("engine").value, name = engineName();
+  setBusy(true);
+  try {
+    const d = await api("ai", { mode, text, instr, engine });
+    showPreview(d.result, target, name);
+  } catch (e) {
+    if ((e.message || "").startsWith("NOKEY")) openKey("Manca la chiave API di " + name + ": incollala qui sotto.");
+    else alert(e.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function modal(children) {
+  const bg = h("div", { class: "modal-bg" }, h("div", { class: "modal" }, children));
+  document.body.append(bg);
+  return bg;
+}
+
+function showPreview(result, target, who) {
+  const ta = h("textarea", null);
+  ta.value = result;
+  const close = () => bg.remove();
+  const apply = append => {
+    const v = ta.value;
+    if (target === "name") {
+      $("name").value = v.trim();
+    } else {
+      const box = $("sec_" + target);
+      box.value = append ? (box.value + "\n\n" + v) : v;
+      autosize(box);
+    }
+    close();
+    saveNow().catch(fail);
+  };
+  const btns = [h("button", { class: "btn green", onclick: () => apply(false) }, "✅ Sostituisci")];
+  if (target !== "name") btns.push(h("button", { class: "btn blue", onclick: () => apply(true) }, "➕ Aggiungi sotto"));
+  btns.push(h("button", { class: "btn grey", onclick: () => close() }, "Annulla"));
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, "✨ Proposta di " + (who || "Claude") + " — controlla e modifica prima di applicare"),
+    ta,
+    h("div", { class: "btns" }, btns)
+  ]);
+}
+
+async function openKey(hint) {
+  let st = { claude: false, gemini: false, gemini_model: "", chemdraw: "", sync_dir: "" };
+  try { st = await api("key_status"); } catch (e) {}
+  const done = "✅ già salvata (lascia vuoto per non cambiarla)";
+  const cin = h("input", { type: "password", autocomplete: "off", placeholder: st.claude ? done : "sk-ant-…" });
+  const gin = h("input", { type: "password", autocomplete: "off", placeholder: st.gemini ? done : "incolla la chiave Gemini" });
+  const gm = h("input", { type: "text", autocomplete: "off", placeholder: "lascia vuoto: scelta automatica" });
+  gm.value = st.gemini_model || "";
+  const chem = h("input", { type: "text", autocomplete: "off", placeholder: "lascia vuoto: ricerca automatica" });
+  chem.value = st.chemdraw || "";
+  const drv = h("input", { type: "text", autocomplete: "off", placeholder: "es. ~/Library/CloudStorage/GoogleDrive-…/Il mio Drive" });
+  drv.value = st.sync_dir || "";
+  const drvFound = h("div", { class: "hint" }, "");
+  const findDrive = async () => {
+    try {
+      const r = await api("drive_find");
+      drvFound.innerHTML = "";
+      if (!r.found.length) { drvFound.textContent = "Non ho trovato Google Drive per desktop su questo Mac: installalo da google.com/drive/download oppure scrivi tu il percorso della cartella."; return; }
+      drvFound.append("Trovata: ");
+      r.found.forEach(p => drvFound.append(h("a", { href: "#", onclick: ev => { ev.preventDefault(); drv.value = p; } }, p), " "));
+      drvFound.append(" (clicca per usarla)");
+    } catch (e) { fail(e); }
+  };
+  const close = () => bg.remove();
+  const rm = who => h("button", { class: "btn grey small", onclick: async () => {
+    try { await api("set_keys", { remove: [who] }); close(); status("✅ Chiave rimossa", 2500); } catch (e) { fail(e); }
+  } }, "Rimuovi");
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, "🔑 Chiavi API e impostazioni"),
+    hint ? h("div", { class: "warn", style: "font-size:14px" }, hint) : null,
+    h("div", { class: "keyrow" }, h("b", null, "🟣 Claude (Anthropic)"), st.claude ? rm("claude") : null),
+    h("div", { class: "hint" }, "Creala su ",
+      h("a", { href: "https://console.anthropic.com", target: "_blank" }, "console.anthropic.com"), " → API keys."),
+    cin,
+    h("div", { class: "keyrow" }, h("b", null, "🔵 Gemini (Google)"), st.gemini ? rm("gemini") : null),
+    h("div", { class: "hint" }, "Creala su ",
+      h("a", { href: "https://aistudio.google.com/apikey", target: "_blank" }, "aistudio.google.com/apikey"), "."),
+    gin,
+    h("div", { class: "hint" }, "Modello Gemini (facoltativo, es. gemini-2.5-flash):"),
+    gm,
+    h("div", { class: "keyrow" }, h("b", null, "⚗️ App ChemDraw")),
+    h("div", { class: "hint" }, "Di solito si trova da sola. Se serve, scrivi il nome (es. ChemDraw 23.1) o il percorso dell'app."),
+    chem,
+    h("div", { class: "keyrow" }, h("b", null, "☁️ Cartella di Google Drive (facoltativa)")),
+    h("div", { class: "hint" }, "Il Word di ogni esperimento e una copia di sicurezza (database e allegati) vengono salvati qui, in «Diario del Ricercatore». Serve l'app Google Drive per desktop, che poi sincronizza online da sola. Si aggiorna da sola ogni 5 minuti se hai fatto modifiche, oppure con «☁️ Sincronizza con Drive»."),
+    drv,
+    h("div", { class: "row" }, h("button", { class: "btn blue small", onclick: () => findDrive() }, "🔎 Cerca Google Drive"),
+      st.sync_last ? h("span", { class: "hint" }, "Ultima sincronizzazione: " + st.sync_last.replace("T", " ")) : null),
+    drvFound,
+    st.sync_error ? h("div", { class: "warn", style: "font-size:13px" }, "Ultimo errore di sincronizzazione: " + st.sync_error) : null,
+    h("div", { class: "hint" }, "Le chiavi vengono salvate solo sul tuo Mac, in ~/DiarioRicercatore/config.json."),
+    h("div", { class: "btns" },
+      h("button", { class: "btn green", onclick: async () => {
+        try {
+          await api("set_keys", { claude: cin.value, gemini: gin.value, gemini_model: gm.value });
+          if (chem.value.trim() !== (st.chemdraw || "")) await api("chemdraw_set", { app: chem.value });
+          if (drv.value.trim() !== (st.sync_dir || "")) await api("drive_set", { path: drv.value });
+          close(); status("✅ Impostazioni salvate", 2500);
+        } catch (e) { fail(e); }
+      } }, "Salva"),
+      h("button", { class: "btn grey", onclick: () => close() }, "Annulla"))
+  ]);
+  (hint ? (/Gemini/.test(hint) ? gin : cin) : cin).focus();
+}
+
+async function openChemDraw() {
+  try {
+    status("⚗️ Apro ChemDraw…");
+    await api("chemdraw_open");
+    status("✅ ChemDraw aperto", 3000);
+  } catch (e) {
+    status("");
+    if (e.message !== "NOCHEMDRAW") return fail(e);
+    const v = prompt("Non ho trovato ChemDraw tra le applicazioni.\nScrivi il nome dell'app (es. ChemDraw 23.1) oppure incolla il suo percorso completo (in Finder: seleziona l'app e premi ⌥⌘C).");
+    if (!v || !v.trim()) return;
+    await api("chemdraw_set", { app: v });
+    try {
+      await api("chemdraw_open");
+      status("✅ ChemDraw aperto", 3000);
+    } catch (e2) {
+      await api("chemdraw_set", { app: "" });
+      alert("Non riesco ad aprire «" + v.trim() + "». Controlla il nome o il percorso e riprova.");
+    }
+  }
+}
+
+// ---------- Disegno di molecole (JSME) ----------
+let jsmeLoading = null;
+function loadJsme() {
+  if (window.JSApplet && window.JSApplet.JSME) return Promise.resolve();
+  if (!jsmeLoading) {
+    jsmeLoading = new Promise((res, rej) => {
+      const sc = document.createElement("script");
+      sc.src = JSME_URL; sc.async = true;
+      const fail2 = m => { jsmeLoading = null; rej(new Error(m)); };
+      sc.onerror = () => fail2("Non riesco a caricare l'editor di strutture. Serve la connessione a internet (oppure scarica JSME e mettilo nella cartella «jsme» accanto a diario_web.py).");
+      document.head.append(sc);
+      const t0 = Date.now();
+      const iv = setInterval(() => {
+        if (window.JSApplet && window.JSApplet.JSME) { clearInterval(iv); res(); }
+        else if (Date.now() - t0 > 20000) { clearInterval(iv); fail2("L'editor di strutture non risponde."); }
+      }, 200);
+    });
+  }
+  return jsmeLoading;
+}
+
+function svgToPng(svg) {
+  return new Promise((resolve, reject) => {
+    let w = 0, h0 = 0;
+    const vb = svg.match(/viewBox\s*=\s*"([\d.\-eE+ ,]+)"/i);
+    if (vb) { const p = vb[1].trim().split(/[\s,]+/).map(Number); w = p[2]; h0 = p[3]; }
+    const mw = svg.match(/<svg[^>]*\swidth\s*=\s*"([\d.]+)/i), mh = svg.match(/<svg[^>]*\sheight\s*=\s*"([\d.]+)/i);
+    if (mw && mh) { w = parseFloat(mw[1]); h0 = parseFloat(mh[1]); }
+    if (!(w > 0 && h0 > 0)) { w = 700; h0 = 400; }
+    if (!/<svg[^>]*\sxmlns=/i.test(svg)) svg = svg.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
+    if (!/<svg[^>]*\swidth=/i.test(svg)) svg = svg.replace("<svg", '<svg width="' + w + '" height="' + h0 + '"');
+    const scale = Math.min(3, 1600 / w);
+    const img = new Image();
+    img.onload = () => {
+      const cv = document.createElement("canvas");
+      cv.width = Math.round(w * scale); cv.height = Math.round(h0 * scale);
+      const cx = cv.getContext("2d");
+      cx.fillStyle = "#fff"; cx.fillRect(0, 0, cv.width, cv.height);
+      cx.drawImage(img, 0, 0, cv.width, cv.height);
+      cv.toBlob(b => b ? resolve(b) : reject(new Error("Immagine non creata.")), "image/png");
+    };
+    img.onerror = () => reject(new Error("Non riesco a convertire il disegno in immagine."));
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+  });
+}
+
+async function molImage(applet, box) {
+  let svg = null;
+  try { if (applet.getMolecularAreaGraphicsString) svg = applet.getMolecularAreaGraphicsString(); } catch (e) {}
+  if (svg && /<svg/i.test(svg)) return svgToPng(svg);
+  const cv = box.querySelector("canvas");
+  if (cv) {
+    return new Promise((res, rej) => {
+      const out = document.createElement("canvas");
+      out.width = cv.width; out.height = cv.height;
+      const cx = out.getContext("2d");
+      cx.fillStyle = "#fff"; cx.fillRect(0, 0, out.width, out.height);
+      cx.drawImage(cv, 0, 0);
+      out.toBlob(b => b ? res(b) : rej(new Error("Immagine non creata.")), "image/png");
+    });
+  }
+  throw new Error("Questa versione dell'editor non permette di ottenere l'immagine del disegno. Disegna in ChemDraw e incolla lo schema (⌘C → ⌘V).");
+}
+
+async function openMolEditor() {
+  if (curId == null) return;
+  await saveNow();
+  const holder = h("div", { id: "jsmebox", style: "min-height:380px;overflow:auto" }, h("div", { class: "muted" }, "Carico l'editor di strutture…"));
+  const nm = h("input", { type: "text", placeholder: "Nome della molecola (es. NG012)", maxlength: "60" });
+  const smi = h("div", { class: "hint" }, "");
+  let applet = null;
+  const close = () => bg.remove();
+  const add = h("button", { class: "btn green", onclick: async () => {
+    try {
+      if (!applet) return;
+      if (!(applet.smiles() || "").trim()) { alert("Disegna prima almeno una molecola."); return; }
+      status("🧪 Creo l'immagine…");
+      const png = await molImage(applet, holder);
+      const mol = applet.molFile();
+      const pad = n => String(n).padStart(2, "0");
+      const dt = new Date();
+      const stamp = dt.getFullYear() + pad(dt.getMonth() + 1) + pad(dt.getDate()) + "-" + pad(dt.getHours()) + pad(dt.getMinutes()) + pad(dt.getSeconds());
+      const base = (nm.value.trim().replace(/[^\w.\- ]+/g, "").replace(/\s+/g, "_") || "molecola") + "-" + stamp;
+      const files = [new File([png], base + ".png", { type: "image/png" })];
+      if (mol && mol.trim()) files.push(new File([mol], base + ".mol", { type: "chemical/x-mdl-molfile" }));
+      close();
+      await uploadFiles(files);
+    } catch (e) { fail(e); }
+  } }, "Aggiungi all'esperimento");
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, "🧪 Disegna una molecola"),
+    h("div", { class: "hint" }, "Disegna la struttura o lo schema. Verrà allegata come immagine (compare nel Word) insieme al file .mol modificabile, che si apre anche con ChemDraw."),
+    holder, nm, smi,
+    h("div", { class: "btns" }, add, h("button", { class: "btn grey", onclick: () => close() }, "Annulla"))
+  ]);
+  try {
+    await loadJsme();
+    holder.innerHTML = "";
+    const w = Math.max(320, Math.min(700, Math.floor(window.innerWidth * 0.8)));
+    applet = new window.JSApplet.JSME("jsmebox", w + "px", "380px");
+    applet.setCallBack("AfterStructureModified", ev => { try { smi.textContent = "SMILES: " + (ev.src.smiles() || ""); } catch (e) {} });
+  } catch (e) { holder.textContent = e.message; }
+}
+
+// ---------- Cartella Google Drive ----------
+async function syncDrive(silent) {
+  let st = {};
+  try { st = await api("key_status"); } catch (e) {}
+  if (!st.sync_dir) { if (!silent) openKey("Scegli prima la cartella di Google Drive qui sotto."); return; }
+  try {
+    status("☁️ Sincronizzo con Drive…");
+    const r = await api("drive_sync");
+    status("✅ Drive aggiornato: " + r.documenti + " Word nuovi/aggiornati, " + r.allegati + " allegati copiati (" + r.esperimenti + " esperimenti)", 9000);
+  } catch (e) { fail(e); }
+}
+
+// ---------- avvio ----------
+function build() {
+  const box = $("sections");
+  SECTIONS.forEach(([k, title, ph, rows]) => {
+    const t = h("textarea", { id: "sec_" + k, rows: String(rows), placeholder: ph });
+    t.addEventListener("focus", () => setActive(k));
+    t.addEventListener("input", () => { autosize(t); scheduleSave(); });
+    box.append(h("div", { class: "card", id: "card_" + k }, h("div", { class: "h2" }, title), t));
+  });
+  const bar = $("aibar");
+  AIBTNS.forEach(([label, color, mode]) => {
+    bar.append(h("button", { class: "btn aibtn " + color, onclick: () => runAI(mode) }, label));
+  });
+  bar.append(h("span", { id: "status" }));
+  setActive("procedura");
+
+  ["name", "date", "project"].forEach(id => $(id).addEventListener("input", scheduleSave));
+  $("btnNew").onclick = () => newExp().catch(fail);
+  $("btnSave").onclick = () => saveNow().catch(fail);
+  $("btnDel").onclick = () => deleteExp().catch(fail);
+  $("btnExport").onclick = async () => {
+    try {
+      await saveNow();
+      status("📄 Creo il documento Word…");
+      const d = await api("export", { id: curId });
+      status("✅ Word salvato: " + d.file + " — cartella " + d.folder + (d.drive ? " · copiato anche su Drive" : ""), 9000);
+    } catch (e) { fail(e); }
+  };
+  $("btnKey").onclick = () => openKey();
+  $("btnDraw").onclick = () => openMolEditor().catch(fail);
+  $("btnSync").onclick = () => syncDrive(false).catch(fail);
+  $("btnChem").onclick = () => openChemDraw().catch(fail);
+  try { const e = localStorage.getItem("diario_engine"); if (e === "claude" || e === "gemini") $("engine").value = e; } catch (e) {}
+  $("engine").addEventListener("change", () => { try { localStorage.setItem("diario_engine", $("engine").value); } catch (e) {} });
+  $("btnNewGroup").onclick = () => newGroup(null).catch(fail);
+  document.addEventListener("click", closeMenu);
+  $("list").addEventListener("scroll", closeMenu);
+  window.addEventListener("keydown", ev => { if (ev.key === "Escape") closeMenu(); });
+  $("btnArchive").onclick = () => { archiveMode = !archiveMode; renderList(); };
+  $("groupsel").addEventListener("change", async () => {
+    if (curId == null) return;
+    const v = $("groupsel").value === "" ? null : Number($("groupsel").value);
+    try {
+      await api("exp_move", { id: curId, group_id: v });
+      curGroup = v;
+      await loadList();
+      status("✅ Esperimento spostato", 2500);
+    } catch (e) { fail(e); }
+  });
+  const lst = $("list");   // lasciare un elemento sullo sfondo dell'elenco lo toglie dal gruppo
+  lst.addEventListener("dragover", ev => ev.preventDefault());
+  lst.addEventListener("drop", ev => { ev.preventDefault(); handleDrop(ev.dataTransfer.getData("text/plain"), null); });
+  $("search").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => loadList().catch(() => {}), 250);
+  });
+  $("btnAdd").onclick = () => $("filepick").click();
+  $("filepick").onchange = e => { uploadFiles(Array.from(e.target.files)).catch(fail); e.target.value = ""; };
+  const drop = $("drop");
+  ["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", e => uploadFiles(Array.from(e.dataTransfer.files)).catch(fail));
+  // evita che un file trascinato fuori dalla zona venga aperto dal browser
+  window.addEventListener("dragover", e => e.preventDefault());
+  window.addEventListener("drop", e => e.preventDefault());
+  // incolla un'immagine (es. uno schema copiato da ChemDraw con ⌘C) come allegato
+  window.addEventListener("paste", e => {
+    const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
+    const it = items.find(x => x.kind === "file" && /^image\/(png|jpeg)$/.test(x.type));
+    if (!it) return;
+    const f = it.getAsFile();
+    if (!f) return;
+    e.preventDefault();
+    const pad = n => String(n).padStart(2, "0");
+    const dt = new Date();
+    const stamp = dt.getFullYear() + pad(dt.getMonth() + 1) + pad(dt.getDate()) + "-" +
+      pad(dt.getHours()) + pad(dt.getMinutes()) + pad(dt.getSeconds());
+    const name = "incollata-" + stamp + (f.type === "image/jpeg" ? ".jpg" : ".png");
+    uploadFiles([new File([f], name, { type: f.type })]).catch(fail);
+  });
+  window.addEventListener("keydown", e => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") { e.preventDefault(); saveNow().catch(fail); }
+  });
+  window.addEventListener("pagehide", () => {
+    if (dirty && curId != null) {
+      fetch("/api/save", { method: "POST", keepalive: true,
+        headers: { "X-Token": TOKEN, "Content-Type": "application/json" }, body: JSON.stringify(collect()) });
+    }
+  });
+}
+
+(async () => {
+  build();
+  const d = await api("list", { q: "" });
+  if (d.items.length) await openExp(d.items[0].id); else await newExp();
+})().catch(fail);
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    init_db()
+    srv = None
+    for port in range(8765, 8785):
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            continue
+    if srv is None:
+        print("Nessuna porta libera tra 8765 e 8784.")
+        sys.exit(1)
+    url = "http://127.0.0.1:%d/" % srv.server_port
+    print("🔬 Diario del Ricercatore attivo su", url)
+    print("Si apre nel browser. Per fermarlo chiudi questa finestra del Terminale (o premi Ctrl+C).")
+    sys.stdout.flush()
+    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    threading.Thread(target=auto_sync_loop, daemon=True).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+
+
+if __name__ == "__main__":
+    main()

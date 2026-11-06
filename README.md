@@ -40,10 +40,11 @@ In entrambi i casi lascia aperta la finestra nera (Terminale / Prompt dei comand
   - "Elimina il gruppo" toglie solo il contenitore: gli esperimenti non vengono cancellati e passano al gruppo superiore.
 - **📎 Allegati**: "Aggiungi file" oppure trascina i file ChemDraw (.cdx, .cdxml, .cd) o altri file. "Apri" li apre con ChemDraw, "Finder" li mostra nella cartella.
 - **Schemi ChemDraw nel Word**: Word non legge i file ChemDraw, quindi serve anche l'immagine dello schema, che compare nel documento Word (sezione "Schema di reazione e strutture", centrata e ridimensionata alla pagina). Due modi:
-  1. In ChemDraw seleziona la struttura/lo schema, ⌘C, poi ⌘V sulla pagina del Diario: l'immagine viene allegata da sola.
+  1. In ChemDraw seleziona la struttura/lo schema, ⌘C (Ctrl+C su Windows), poi nel Diario premi **📋 Incolla da ChemDraw** (oppure ⌘V / Ctrl+V sulla pagina). Il Diario legge direttamente gli appunti del sistema: allega un PNG nitido (da PDF vettoriale a 288 dpi) e, se ChemDraw lo mette negli appunti, anche l'originale .cdx modificabile.
   2. Oppure in ChemDraw "Salva con nome" PNG (meglio ad alta risoluzione) e trascina il PNG nella pagina. Se ha lo stesso nome del file .cdx/.cdxml vengono abbinati.
   Se un file ChemDraw non ha un'immagine associata, il Diario te lo segnala con un avviso arancione. Sono accettati PNG e JPG.
-- **📄 Esporta in Word**: crea un documento .docx dell'esperimento (titolo, data, progetto, sezioni compilate, elenco allegati), lo salva in `~/DiarioRicercatore/esportazioni/` e lo apre. Da Word puoi poi usare File → Esporta/Salva come per ottenere il PDF o un vecchio .doc.
+- **📄 Esporta in Word**: crea un documento .docx dell'esperimento (titolo, data, progetto, sezioni compilate, elenco allegati), lo salva in `~/DiarioRicercatore/esportazioni/` e lo apre. Da Word puoi poi usare File → Esporta/Salva come per ottenere il PDF o un vecchio .doc. Il testo è giustificato, gli elenchi (`-`, `1)`) diventano elenchi, le immagini sono centrate, dimensionate al massimo 16×9 cm con didascalia «Figura n» e le pagine sono numerate.
+  *Windows vs Mac:* su Windows ChemDraw può inserire in Word un oggetto OLE modificabile; su Mac non esiste. Il Diario usa quindi lo stesso metodo su entrambi: immagine nitida nel Word + file .cdx originale tra gli allegati (per modificare la struttura si riapre il .cdx con ChemDraw).
 - **✨ AI** (agisce sulla sezione dove hai il cursore): Stila, Correggi, In inglese, Suggerisci titolo, Istruzione libera. La proposta compare in una finestra che puoi modificare prima di applicarla.
 
 ## 🧪 Disegnare le molecole

@@ -525,6 +525,168 @@ def reveal_path(path):
         subprocess.Popen(["xdg-open", os.path.dirname(path)])
 
 
+# ---------------- Appunti (ChemDraw -> Diario) ----------------
+JXA_CLIP = r"""
+ObjC.import('AppKit');
+ObjC.import('Foundation');
+function run(argv) {
+  var dir = argv[0];
+  var pb = $.NSPasteboard.generalPasteboard;
+  var types = ObjC.deepUnwrap(pb.types) || [];
+  var out = {types: types, png: null, cdx: null, dpi: 0, how: ""};
+  function save(data, name) {
+    var path = dir + "/" + name;
+    data.writeToFileAtomically(path, true);
+    return path;
+  }
+  function has(t) { return types.indexOf(t) >= 0; }
+  // 1) l'originale ChemDraw (formato CDX), se presente
+  for (var i = 0; i < types.length; i++) {
+    var low = String(types[i]).toLowerCase();
+    if (low.indexOf("cdx") >= 0 || (low.indexOf("chemdraw") >= 0 && low.indexOf("interchange") >= 0)) {
+      var dd = pb.dataForType(types[i]);
+      if (dd && dd.length > 0) { out.cdx = save(dd, "clip.cdx"); break; }
+    }
+  }
+  // 2) immagine: PDF vettoriale (nitido) > PNG > TIFF
+  var pdf = has("com.adobe.pdf") ? pb.dataForType("com.adobe.pdf") : null;
+  if (pdf && pdf.length > 0) {
+    try {
+      var img = $.NSImage.alloc.initWithData(pdf);
+      var sz = img.size;
+      var k = 4;
+      var w = Math.max(1, Math.ceil(sz.width * k)), h = Math.max(1, Math.ceil(sz.height * k));
+      var rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(
+        null, w, h, 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0);
+      $.NSGraphicsContext.saveGraphicsState;
+      $.NSGraphicsContext.setCurrentContext($.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep));
+      $.NSColor.whiteColor.set;
+      $.NSRectFill($.NSMakeRect(0, 0, w, h));
+      img.drawInRectFromRectOperationFraction($.NSMakeRect(0, 0, w, h), $.NSZeroRect, 2, 1.0);
+      $.NSGraphicsContext.restoreGraphicsState;
+      var png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+      out.png = save(png, "clip.png");
+      out.dpi = 72 * k;
+      out.how = "pdf";
+    } catch (e) { out.how = "pdf-fallito: " + e; out.png = null; }
+  }
+  if (!out.png && has("public.png")) {
+    var d = pb.dataForType("public.png");
+    if (d && d.length > 0) { out.png = save(d, "clip.png"); out.how = "png"; }
+  }
+  if (!out.png && has("public.tiff")) {
+    var d2 = pb.dataForType("public.tiff");
+    if (d2 && d2.length > 0) {
+      var rep2 = $.NSBitmapImageRep.imageRepWithData(d2);
+      var p2 = rep2.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+      out.png = save(p2, "clip.png"); out.how = "tiff";
+    }
+  }
+  return JSON.stringify(out);
+}
+"""
+
+PS_CLIP = (
+    "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
+    "$i=[System.Windows.Forms.Clipboard]::GetImage(); "
+    "if($i){$i.Save($args[0],[System.Drawing.Imaging.ImageFormat]::Png); Write-Output 'ok'}"
+)
+
+
+def png_set_dpi(data, dpi):
+    """Scrive (o sostituisce) la risoluzione di un PNG, cosi' il Word lo dimensiona bene."""
+    import zlib
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or not dpi:
+        return data
+    ppm = int(round(dpi / 0.0254))
+    chunk = struct.pack(">IIB", ppm, ppm, 1)
+    crc = zlib.crc32(b"pHYs" + chunk) & 0xffffffff
+    new = struct.pack(">I", 9) + b"pHYs" + chunk + struct.pack(">I", crc)
+    out, pos, done = [data[:8]], 8, False
+    while pos + 8 <= len(data):
+        length, ctype = struct.unpack(">I4s", data[pos:pos + 8])
+        end = pos + 12 + length
+        if ctype == b"pHYs":
+            if not done:
+                out.append(new)
+                done = True
+        else:
+            if ctype == b"IDAT" and not done:
+                out.append(new)
+                done = True
+            out.append(data[pos:end])
+        pos = end
+    return b"".join(out)
+
+
+def read_system_clipboard(tmpdir):
+    """Legge l'immagine dagli appunti del sistema. Ritorna dict(png=bytes|None, cdx=bytes|None, dpi, types, how)."""
+    res = {"png": None, "cdx": None, "dpi": 0, "types": [], "how": ""}
+    if IS_MAC:
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", JXA_CLIP, tmpdir],
+                           capture_output=True, text=True, timeout=40)
+        if r.returncode != 0:
+            raise RuntimeError("Non riesco a leggere gli appunti: " + (r.stderr or "").strip()[:300])
+        info = json.loads((r.stdout or "").strip().splitlines()[-1])
+        res["types"], res["dpi"], res["how"] = info.get("types") or [], info.get("dpi") or 0, info.get("how") or ""
+        for key in ("png", "cdx"):
+            if info.get(key) and os.path.exists(info[key]):
+                with open(info[key], "rb") as f:
+                    res[key] = f.read()
+    elif IS_WIN:
+        out = os.path.join(tmpdir, "clip.png")
+        r = subprocess.run(["powershell", "-STA", "-NoProfile", "-Command", PS_CLIP, out],
+                           capture_output=True, text=True, timeout=40)
+        if os.path.exists(out):
+            with open(out, "rb") as f:
+                res["png"] = f.read()
+            res["how"] = "windows"
+        elif r.returncode != 0:
+            raise RuntimeError("Non riesco a leggere gli appunti: " + (r.stderr or "").strip()[:300])
+    else:
+        raise RuntimeError("L'incolla dagli appunti di sistema e' disponibile solo su Mac e Windows.")
+    return res
+
+
+def add_attachment(exp_id, name, data):
+    dest_dir = os.path.join(ATT_DIR, str(exp_id))
+    os.makedirs(dest_dir, exist_ok=True)
+    base, ext = os.path.splitext(name)
+    dest, k = os.path.join(dest_dir, name), 1
+    while os.path.exists(dest):
+        dest = os.path.join(dest_dir, "%s_%d%s" % (base, k, ext))
+        k += 1
+    with open(dest, "wb") as f:
+        f.write(data)
+    con = db()
+    con.execute("INSERT INTO attachments(exp_id,filename,path) VALUES(?,?,?)", (exp_id, os.path.basename(dest), dest))
+    con.commit()
+    con.close()
+    return os.path.basename(dest)
+
+
+def api_clip_paste(d):
+    exp_id = int(d["exp"])
+    tmp = tempfile.mkdtemp(prefix="diario-clip-")
+    try:
+        res = read_system_clipboard(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if not res["png"] and not res["cdx"]:
+        t = ", ".join(res["types"][:12]) if res["types"] else "nessuno"
+        raise RuntimeError("Negli appunti non c'e' nessuna immagine ChemDraw. Formati presenti: %s. "
+                           "In ChemDraw seleziona la struttura e premi Cmd+C (Ctrl+C su Windows)." % t)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = "chemdraw-" + stamp
+    saved = []
+    if res["png"]:
+        png = png_set_dpi(res["png"], res["dpi"]) if res["dpi"] else res["png"]
+        saved.append(add_attachment(exp_id, stem + ".png", png))
+    if res["cdx"]:
+        saved.append(add_attachment(exp_id, stem + ".cdx", res["cdx"]))
+    return {"saved": saved, "how": res["how"]}
+
+
 def api_att_open(d):
     open_path(att_path(d["id"]))
     return {}
@@ -585,8 +747,15 @@ def xml_esc(t):
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def w_par(text="", style=None, italic=False, color=None, size=None):
-    ppr = '<w:pPr><w:pStyle w:val="%s"/></w:pPr>' % style if style else ""
+def w_par(text="", style=None, italic=False, color=None, size=None, jc=None, ind=None):
+    inner = ""
+    if style:
+        inner += '<w:pStyle w:val="%s"/>' % style
+    if ind:
+        inner += '<w:ind w:left="%d" w:hanging="%d"/>' % ind
+    if jc:
+        inner += '<w:jc w:val="%s"/>' % jc
+    ppr = "<w:pPr>%s</w:pPr>" % inner if inner else ""
     rpr = ""
     if italic:
         rpr += "<w:i/>"
@@ -656,10 +825,14 @@ def img_info(data):
     return None
 
 
-def fit_cm(w, h, dpi, max_w=16.5, max_h=20.0):
-    """Dimensione in cm: grandezza naturale, ridotta se supera la larghezza utile della pagina A4."""
-    d = dpi if dpi and 30 <= dpi <= 1200 else 96.0
+def fit_cm(w, h, dpi, max_w=16.0, max_h=9.0, min_w=3.0):
+    """Dimensione in cm per il Word: grandezza naturale (se manca la risoluzione si assume uno
+    schermo Retina, 144 dpi), ridotta per stare nella pagina e ingrandita se troppo piccola."""
+    d = dpi if dpi and 30 <= dpi <= 1200 else 144.0
     cw, ch = w / d * 2.54, h / d * 2.54
+    if cw < min_w and w >= 60:
+        k = min(min_w / cw, max_h / ch)
+        cw, ch = cw * k, ch * k
     k = min(1.0, max_w / cw, max_h / ch)
     return cw * k, ch * k
 
@@ -717,16 +890,28 @@ def make_docx(exp, atts):
                 fname = im["att"]["filename"]
                 body.append(w_image("rId%d" % (n + 1), n, int(cw * 360000), int(ch * 360000), fname))
                 base = os.path.splitext(fname)[0]
-                if not base.startswith("incollata-"):
-                    body.append(
-                        '<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:color w:val="6B7280"/>'
-                        '<w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % xml_esc(base))
+                auto = re.match(r"^(incollata|chemdraw|molecola)-\d{8}-\d{6}", base)
+                cap = "Figura %d" % n + ("" if auto else ". " + base)
+                body.append(
+                    '<w:p><w:pPr><w:spacing w:after="240"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:color w:val="6B7280"/>'
+                    '<w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % xml_esc(cap))
         txt = s(exp.get(key)).strip()
         if not txt:
             continue
         body.append(w_par(title, style="Heading1"))
+        prev_blank = True
         for line in txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            body.append(w_par(line))
+            line = line.rstrip()
+            if not line.strip():
+                prev_blank = True
+                continue
+            m = re.match(r"^\s*([-*\u2022\u2013]|\d+[.)])\s+(.*)$", line)
+            if m:
+                mark = "\u2022" if m.group(1) in "-*\u2022\u2013" else m.group(1)
+                body.append(w_par(mark + "\t" + m.group(2), jc="both", ind=(567, 283), style="ListLine"))
+            else:
+                body.append(w_par(line.strip(), jc="both"))
+            prev_blank = False
     if atts:
         body.append(w_par("Allegati", style="Heading1"))
         in_doc = set(im["att"]["filename"] for im in images)
@@ -753,8 +938,8 @@ def make_docx(exp, atts):
         'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
         'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
         'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>' % W_NS + "".join(body) +
-        '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
-        '<w:pgMar w:top="1417" w:right="1134" w:bottom="1134" w:left="1134" '
+        '<w:sectPr><w:footerReference w:type="default" r:id="rId900"/><w:pgSz w:w="11906" w:h="16838"/>'
+        '<w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" '
         'w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>'
     )
     styles = (
@@ -769,7 +954,18 @@ def make_docx(exp, atts):
         '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>'
         '<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="280" w:after="100"/>'
         '<w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:color w:val="7C3AED"/><w:sz w:val="28"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="ListLine"><w:name w:val="List Line"/><w:basedOn w:val="Normal"/>'
+        '<w:pPr><w:tabs><w:tab w:val="left" w:pos="567"/></w:tabs><w:spacing w:after="60"/></w:pPr></w:style>'
         "</w:styles>"
+    )
+    footer = (
+        head + '<w:ftr xmlns:w="%s"><w:p><w:pPr><w:jc w:val="center"/></w:pPr>'
+        '<w:r><w:rPr><w:color w:val="9CA3AF"/><w:sz w:val="18"/></w:rPr><w:fldChar w:fldCharType="begin"/></w:r>'
+        '<w:r><w:rPr><w:color w:val="9CA3AF"/><w:sz w:val="18"/></w:rPr><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>'
+        '<w:r><w:rPr><w:color w:val="9CA3AF"/><w:sz w:val="18"/></w:rPr><w:fldChar w:fldCharType="separate"/></w:r>'
+        '<w:r><w:rPr><w:color w:val="9CA3AF"/><w:sz w:val="18"/></w:rPr><w:t>1</w:t></w:r>'
+        '<w:r><w:rPr><w:color w:val="9CA3AF"/><w:sz w:val="18"/></w:rPr><w:fldChar w:fldCharType="end"/></w:r>'
+        "</w:p></w:ftr>" % W_NS
     )
     content_types = (
         head + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -779,6 +975,7 @@ def make_docx(exp, atts):
         '<Default Extension="jpeg" ContentType="image/jpeg"/>'
         '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
         '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+        '<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>'
         "</Types>"
     )
     rels = (
@@ -789,6 +986,7 @@ def make_docx(exp, atts):
     doc_rels = (
         head + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
         '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        '<Relationship Id="rId900" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>'
         "@@MEDIA@@</Relationships>"
     )
     doc_rels = doc_rels.replace("@@MEDIA@@", "".join(media_rels))
@@ -798,6 +996,7 @@ def make_docx(exp, atts):
         z.writestr("_rels/.rels", rels)
         z.writestr("word/document.xml", document)
         z.writestr("word/styles.xml", styles)
+        z.writestr("word/footer1.xml", footer)
         z.writestr("word/_rels/document.xml.rels", doc_rels)
         for name, data in media:
             z.writestr("word/media/" + name, data)
@@ -1152,7 +1351,7 @@ def api_set_keys(d):
 ROUTES = {
     "/api/list": api_list, "/api/get": api_get, "/api/new": api_new, "/api/save": api_save,
     "/api/delete": api_delete, "/api/att_open": api_att_open, "/api/att_reveal": api_att_reveal,
-    "/api/att_delete": api_att_delete, "/api/ai": api_ai, "/api/key_status": api_key_status,
+    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/ai": api_ai, "/api/key_status": api_key_status,
     "/api/set_keys": api_set_keys, "/api/export": api_export,
     "/api/chemdraw_open": api_chemdraw_open, "/api/chemdraw_set": api_chemdraw_set,
     "/api/drive_find": api_drive_find, "/api/drive_set": api_drive_set, "/api/drive_sync": api_drive_sync,
@@ -1301,7 +1500,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Aria
 .app{display:flex;height:100vh}
 aside{width:300px;flex:none;background:linear-gradient(180deg,#7C3AED,#5B21B6);color:#fff;padding:20px 16px;display:flex;flex-direction:column;gap:10px}
 .logo{font-size:26px;font-weight:800;line-height:1.1;margin:4px 4px 8px}
-#search{width:100%;border:0;border-radius:10px;padding:10px 12px;font:inherit;outline:none}
+#search{width:100%;border:0;border-radius:10px;padding:10px 12px;font:inherit;outline:none;background:#fff;color:#1F2937;-webkit-text-fill-color:#1F2937;caret-color:#5B21B6}
+#search::placeholder{color:#6B7280;-webkit-text-fill-color:#6B7280;opacity:1}
 #list{flex:1;overflow:auto;background:rgba(0,0,0,.18);border-radius:14px;padding:6px}
 .item{display:flex;flex-direction:column;width:100%;text-align:left;background:transparent;color:#fff;border:0;border-radius:10px;padding:9px 12px;margin-bottom:3px;cursor:pointer;font:inherit}
 .item:hover{background:rgba(255,255,255,.14)}
@@ -1410,6 +1610,7 @@ select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px
       <div class="topline">
         <div class="h2" style="margin:0">📎 Allegati (ChemDraw e altri file)</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn orange" id="btnPasteChem" title="Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)">📋 Incolla da ChemDraw</button>
           <button class="btn violet" id="btnDraw" title="Disegna una molecola o uno schema e allegalo all'esperimento">🧪 Disegna molecola</button>
           <button class="btn blue" id="btnAdd">＋ Aggiungi file</button>
         </div>
@@ -1555,7 +1756,9 @@ function fillGroupSelect() {
 }
 
 function renderExp(e, showPath, draggable) {
-  const el = h("div", { class: "item" + (e.id === curId ? " sel" : ""), onclick: () => switchTo(e.id).catch(fail) },
+  const full = (e.name || "Senza nome") + (e.date ? "  ·  " + e.date : "") +
+    (e.group_id != null ? "\n📁 " + groupPath(e.group_id) : "");
+  const el = h("div", { class: "item" + (e.id === curId ? " sel" : ""), title: full, onclick: () => switchTo(e.id).catch(fail) },
     h("span", { class: "it-name" }, "🧪 " + (e.name || "Senza nome")),
     h("span", { class: "it-date" }, (showPath && e.group_id != null ? groupPath(e.group_id) + " · " : "") + (e.date || "")));
   if (draggable) {
@@ -1586,7 +1789,7 @@ function renderGroup(g, arch) {
       ["🗑  Elimina il gruppo…", () => deleteGroup(g), true]];
   }
   if (items) ctl.append(h("button", { class: "gmore", title: "Azioni del gruppo", onclick: ev => openGroupMenu(ev, items, arch ? null : g) }, "⋯"));
-  const head = h("div", { class: "ghead", style: "background:" + g.color, onclick: () => toggleGroup(g) },
+  const head = h("div", { class: "ghead", title: groupPath(g.id), style: "background:" + g.color, onclick: () => toggleGroup(g) },
     h("span", { class: "garrow" }, g.collapsed ? "▸" : "▾"),
     h("span", { class: "gname", title: g.name }, "📁 " + g.name),
     h("span", { class: "gcount" }, String(countExps(g.id))),
@@ -1793,6 +1996,22 @@ async function delAtt(id) {
   await api("att_delete", { id });
   const d = await api("get", { id: curId });
   renderAtt(d.attachments);
+}
+
+async function pasteChem(silent) {
+  if (curId == null) return;
+  status("📋 Leggo gli appunti…");
+  try {
+    if (dirty) await saveNow();
+    const r = await api("clip_paste", { exp: curId });
+    status("✅ Struttura incollata: " + r.saved.join(", "), 3000);
+    const d = await api("get", { id: curId });
+    renderAtt(d.attachments);
+  } catch (ex) {
+    status("");
+    if (!silent) throw ex;
+    status("Negli appunti non c'e' nessuna struttura (usa il pulsante 📋 Incolla da ChemDraw per i dettagli)", 4000);
+  }
 }
 
 async function uploadFiles(files) {
@@ -2112,6 +2331,7 @@ function build() {
   $("btnDraw").onclick = () => openMolEditor().catch(fail);
   $("btnSync").onclick = () => syncDrive(false).catch(fail);
   $("btnChem").onclick = () => openChemDraw().catch(fail);
+  $("btnPasteChem").onclick = () => pasteChem(false).catch(fail);
   try { const e = localStorage.getItem("diario_engine"); if (e === "claude" || e === "gemini") $("engine").value = e; } catch (e) {}
   $("engine").addEventListener("change", () => { try { localStorage.setItem("diario_engine", $("engine").value); } catch (e) {} });
   $("btnNewGroup").onclick = () => newGroup(null).catch(fail);
@@ -2149,7 +2369,13 @@ function build() {
   window.addEventListener("paste", e => {
     const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
     const it = items.find(x => x.kind === "file" && /^image\/(png|jpeg)$/.test(x.type));
-    if (!it) return;
+    if (!it) {
+      // ChemDraw (soprattutto su Mac) non mette un'immagine "normale" negli appunti del browser:
+      // se non c'e' testo da incollare, la legge il programma direttamente dagli appunti di sistema.
+      const hasText = items.some(x => x.kind === "string" && x.type === "text/plain");
+      if (!hasText && curId != null) { e.preventDefault(); pasteChem(true).catch(() => {}); }
+      return;
+    }
     const f = it.getAsFile();
     if (!f) return;
     e.preventDefault();

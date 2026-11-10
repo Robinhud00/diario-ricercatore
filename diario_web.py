@@ -268,6 +268,10 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             exp_id INTEGER, filename TEXT, path TEXT
         );
+        CREATE TABLE IF NOT EXISTS datasets(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exp_id INTEGER, title TEXT, kind TEXT, payload TEXT, updated TEXT
+        );
         CREATE TABLE IF NOT EXISTS exp_groups(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT, parent_id INTEGER, color TEXT,
@@ -711,6 +715,31 @@ def api_att_delete(d):
     return {}
 
 
+SECTOR_AI = {
+    "chimica": ("chimici di laboratorio", "Riscrivi il testo come sezione sperimentale professionale in stile articolo scientifico (ACS): forma impersonale/passato, ordine cronologico, quantita' con unita' e mmol/equivalenti se presenti nel testo, work-up e purificazione ben distinti."),
+    "farmaco": ("farmacologi e biochimici", "Riscrivi il testo come sezione Materials and Methods di un articolo di farmacologia/biochimica: forma impersonale/passato, bersaglio, composti, concentrazioni, tampone, incubazione, rivelazione, controlli e analisi dei dati (fit, IC50) ben distinti."),
+    "biologia": ("biologi molecolari e cellulari", "Riscrivi il testo come sezione Materials and Methods di un articolo di biologia molecolare/cellulare: forma impersonale/passato, linee cellulari (passaggio), terreni, trattamenti, anticorpi con diluizioni, kit, repliche e analisi statistica ben distinti."),
+    "micro": ("microbiologi", "Riscrivi il testo come sezione Materials and Methods di un articolo di microbiologia: forma impersonale/passato, ceppi, terreni, condizioni di crescita, inoculo, metodo (CFU, MIC, curve di crescita) e standard di riferimento ben distinti."),
+    "materiali": ("ricercatori di materiali, fisica e ingegneria", "Riscrivi il testo come sezione sperimentale di un articolo di materiali/fisica/ingegneria: forma impersonale/passato, materiali e lotti, parametri di processo, strumenti e modelli, condizioni di misura e calibrazione ben distinti."),
+    "dati": ("ricercatori di informatica e data science", "Riscrivi il testo come sezione di metodo di un articolo di informatica/data science: forma impersonale/passato, dati, versioni, iperparametri, seed, hardware, metriche e procedura di valutazione ben distinti."),
+}
+
+
+def primary_sector():
+    sel = load_cfg().get("sectors") or []
+    return sel[0] if sel and sel[0] in SECTOR_AI else "chimica"
+
+
+def base_rules():
+    who = SECTOR_AI[primary_sector()][0]
+    return (
+        "Sei un assistente per %s che scrivono il quaderno di laboratorio. "
+        "Non inventare MAI dati: conserva esattamente quantita', unita', valori, rese, temperature, tempi, "
+        "nomi di reagenti, campioni, ceppi, linee cellulari, parametri e sigle (es. NG012, FM03). "
+        "Se manca un'informazione importante, segnalala tra parentesi quadre come [da completare: ...]. "
+        "Rispondi SOLO con il testo risultante, senza commenti, senza virgolette, senza markdown." % who)
+
+
 def api_ai(d):
     mode = s(d.get("mode"))
     text = s(d.get("text"))
@@ -720,9 +749,12 @@ def api_ai(d):
         instr = s(d.get("instr")).strip()
         if not instr:
             raise RuntimeError("Istruzione mancante.")
-        system = BASE_RULES + " Istruzione dell'utente: " + instr
+        system = base_rules() + " Istruzione dell'utente: " + instr
     elif mode in MODES:
-        system = BASE_RULES + " " + MODES[mode]
+        body = MODES[mode]
+        if mode == "stila":
+            body = SECTOR_AI[primary_sector()][1] + " Mantieni la lingua del testo originale."
+        system = base_rules() + " " + body
     else:
         raise RuntimeError("Modalita' sconosciuta.")
     engine = s(d.get("engine") or "claude")
@@ -733,12 +765,27 @@ def api_ai(d):
 
 
 EXPORT_DIR = os.path.join(APP_DIR, "esportazioni")
-SEC_TITLES = [
-    ("obiettivo", "Obiettivo"),
-    ("procedura", "Procedura sperimentale"),
-    ("risultati", "Risultati e osservazioni"),
-    ("note", "Note e prossimi passi"),
-]
+_OB = ("🎯 Obiettivo", "Qual è lo scopo dell'esperimento?")
+_NO = ("📝 Note e prossimi passi", "")
+SECTION_SETS = {
+    "chimica": {"obiettivo": _OB, "procedura": ("🧪 Procedura sperimentale", "Scrivi qui appunti e procedura, anche in modo disordinato: l'AI li metterà in forma."),
+                "risultati": ("📊 Risultati e osservazioni", "Rese, aspetto, TLC, NMR, osservazioni…"), "note": _NO},
+    "farmaco": {"obiettivo": ("🎯 Obiettivo e ipotesi", "Bersaglio, composti, domanda a cui risponde il saggio."), "procedura": ("🧫 Saggio e condizioni", "Bersaglio/enzima, composti e concentrazioni, tampone, incubazione, rivelazione, controlli…"),
+                "risultati": ("📊 Risultati (IC50, Ki, inibizione)", "Valori ottenuti, confronto con i riferimenti, osservazioni…"), "note": _NO},
+    "biologia": {"obiettivo": ("🎯 Obiettivo e ipotesi", "Domanda biologica e ipotesi da verificare."), "procedura": ("🧬 Materiali e metodi", "Linee cellulari e passaggio, trattamenti, anticorpi (diluizioni, lotti), kit, protocollo…"),
+                 "risultati": ("📊 Risultati e osservazioni", "Espressione, bande, immagini, repliche, osservazioni…"), "note": _NO},
+    "micro": {"obiettivo": ("🎯 Obiettivo e ipotesi", "Ceppi, composti e domanda a cui risponde l'esperimento."), "procedura": ("🦠 Materiali e metodi", "Ceppi, terreni, condizioni di crescita, inoculo, metodo (CFU, MIC, curve), controlli…"),
+              "risultati": ("📊 Risultati (conte, MIC, crescita)", "Conte, MIC, tempi di raddoppio, osservazioni…"), "note": _NO},
+    "materiali": {"obiettivo": _OB, "procedura": ("🔧 Preparazione e condizioni di misura", "Materiale e lotto, processo, parametri, strumento e calibrazione, condizioni ambientali…"),
+                  "risultati": ("📊 Misure e risultati", "Valori misurati, incertezze, confronto con le attese…"), "note": _NO},
+    "dati": {"obiettivo": ("🎯 Obiettivo e ipotesi", "Domanda di ricerca, ipotesi, metrica di successo."), "procedura": ("💻 Metodo e configurazione", "Dati e versione, modello, iperparametri, seed, hardware, comando eseguito…"),
+             "risultati": ("📊 Risultati e metriche", "Metriche, confronti con la baseline, osservazioni…"), "note": _NO},
+}
+
+
+def sec_titles():
+    st = SECTION_SETS[primary_sector()]
+    return [(k, re.sub(r"^[^\w]+", "", st[k][0]).strip()) for k in ("obiettivo", "procedura", "risultati", "note")]
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
@@ -853,7 +900,34 @@ def w_image(rid, idx, cx, cy, descr):
     ) % (cx, cy, idx, idx, d, idx, d, rid, cx, cy)
 
 
-def make_docx(exp, atts):
+def w_table(rows):
+    """Tabella Word semplice (prima riga = intestazione), colonne di larghezza uguale."""
+    rows = [[s(c) for c in r] for r in rows if r]
+    if not rows:
+        return ""
+    ncol = max(len(r) for r in rows)
+    width = 9638 // ncol
+    out = ['<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="pct"/><w:jc w:val="center"/><w:tblBorders>'
+           + "".join('<w:%s w:val="single" w:sz="4" w:space="0" w:color="C4B5FD"/>' % b
+                     for b in ("top", "left", "bottom", "right", "insideH", "insideV"))
+           + '</w:tblBorders><w:tblLayout w:type="fixed"/><w:tblCellMar><w:left w:w="80" w:type="dxa"/>'
+           '<w:right w:w="80" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>'
+           + "".join('<w:gridCol w:w="%d"/>' % width for _ in range(ncol)) + "</w:tblGrid>"]
+    for ri, r in enumerate(rows):
+        out.append("<w:tr>" + ("<w:trPr><w:cantSplit/><w:tblHeader/></w:trPr>" if ri == 0 else "<w:trPr><w:cantSplit/></w:trPr>"))
+        for ci in range(ncol):
+            txt = r[ci] if ci < len(r) else ""
+            shade = '<w:shd w:val="clear" w:color="auto" w:fill="EDE9FE"/>' if ri == 0 else ""
+            rpr = "<w:rPr><w:b/><w:sz w:val=\"20\"/></w:rPr>" if ri == 0 else '<w:rPr><w:sz w:val="20"/></w:rPr>'
+            out.append('<w:tc><w:tcPr><w:tcW w:w="%d" w:type="dxa"/>%s</w:tcPr><w:p><w:pPr><w:spacing w:after="20"/>'
+                       '<w:jc w:val="center"/></w:pPr><w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p></w:tc>'
+                       % (width, shade, rpr, xml_esc(txt)))
+        out.append("</w:tr>")
+    out.append("</w:tbl>")
+    return "".join(out)
+
+
+def make_docx(exp, atts, datasets=None):
     """Crea un file .docx (Word) con la sola libreria standard."""
     body = [w_par(exp.get("name") or "Esperimento senza nome", style="Title")]
     media, media_rels, images = [], [], []
@@ -876,42 +950,62 @@ def make_docx(exp, atts):
         meta.append("Progetto: " + s(exp["project"]).strip())
     if meta:
         body.append(w_par("   ·   ".join(meta), color="6B7280"))
-    for key, title in SEC_TITLES:
+    chart_images = [im for im in images if im["att"]["filename"].lower().startswith("grafico-")]
+    images = [im for im in images if im not in chart_images]
+
+    def emit_images(lst):
+        for im in lst:
+            n = len(media) + 1
+            name = "image%d.%s" % (n, im["ext"])
+            media.append((name, im["data"]))
+            media_rels.append(
+                '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/%s"/>'
+                % (n + 1, name))
+            fname = im["att"]["filename"]
+            if fname.lower().startswith("grafico-"):
+                cw, ch = fit_cm(im["info"][0], im["info"][1], 200.0, max_h=10.5)
+            else:
+                cw, ch = fit_cm(*im["info"])
+            body.append(w_image("rId%d" % (n + 1), n, int(cw * 360000), int(ch * 360000), fname))
+            base = os.path.splitext(fname)[0]
+            base = re.sub(r"-\d{8}-\d{6}$", "", base)
+            base = re.sub(r"^(grafico|molecola)-", "", base)
+            auto = base.lower() in ("incollata", "chemdraw", "molecola", "grafico")
+            cap = "Figura %d" % n + ("" if auto else ". " + base.replace("_", " "))
+            body.append(
+                '<w:p><w:pPr><w:spacing w:after="240"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:color w:val="6B7280"/>'
+                '<w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % xml_esc(cap))
+
+    for key, title in sec_titles():
         if key == "procedura" and images:
             body.append(w_par("Schema di reazione e strutture", style="Heading1"))
-            for im in images:
-                n = len(media) + 1
-                name = "image%d.%s" % (n, im["ext"])
-                media.append((name, im["data"]))
-                media_rels.append(
-                    '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/%s"/>'
-                    % (n + 1, name))
-                cw, ch = fit_cm(*im["info"])
-                fname = im["att"]["filename"]
-                body.append(w_image("rId%d" % (n + 1), n, int(cw * 360000), int(ch * 360000), fname))
-                base = os.path.splitext(fname)[0]
-                auto = re.match(r"^(incollata|chemdraw|molecola)-\d{8}-\d{6}", base)
-                cap = "Figura %d" % n + ("" if auto else ". " + base)
-                body.append(
-                    '<w:p><w:pPr><w:spacing w:after="240"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:color w:val="6B7280"/>'
-                    '<w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % xml_esc(cap))
+            emit_images(images)
         txt = s(exp.get(key)).strip()
-        if not txt:
-            continue
-        body.append(w_par(title, style="Heading1"))
-        prev_blank = True
-        for line in txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            line = line.rstrip()
-            if not line.strip():
-                prev_blank = True
-                continue
-            m = re.match(r"^\s*([-*\u2022\u2013]|\d+[.)])\s+(.*)$", line)
-            if m:
-                mark = "\u2022" if m.group(1) in "-*\u2022\u2013" else m.group(1)
-                body.append(w_par(mark + "\t" + m.group(2), jc="both", ind=(567, 283), style="ListLine"))
-            else:
-                body.append(w_par(line.strip(), jc="both"))
-            prev_blank = False
+        if txt:
+            body.append(w_par(title, style="Heading1"))
+            for line in txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                line = line.rstrip()
+                if not line.strip():
+                    continue
+                m = re.match(r"^\s*([-*\u2022\u2013]|\d+[.)])\s+(.*)$", line)
+                if m:
+                    mark = "\u2022" if m.group(1) in "-*\u2022\u2013" else m.group(1)
+                    body.append(w_par(mark + "\t" + m.group(2), jc="both", ind=(567, 283), style="ListLine"))
+                else:
+                    body.append(w_par(line.strip(), jc="both"))
+        if key == "risultati" and (datasets or chart_images):
+            body.append(w_par("Dati e grafici", style="Heading1"))
+            for ds in datasets or []:
+                pl = ds.get("payload") or {}
+                body.append(w_par(s(ds.get("title")) or "Dati", style="Heading2"))
+                if s(pl.get("summary")).strip():
+                    for ln in s(pl["summary"]).split("\n"):
+                        if ln.strip():
+                            body.append(w_par(ln.strip(), jc="both"))
+                if pl.get("table"):
+                    body.append(w_table(pl["table"]))
+                    body.append(w_par(""))
+            emit_images(chart_images)
     if atts:
         body.append(w_par("Allegati", style="Heading1"))
         in_doc = set(im["att"]["filename"] for im in images)
@@ -954,6 +1048,9 @@ def make_docx(exp, atts):
         '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>'
         '<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="280" w:after="100"/>'
         '<w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:color w:val="7C3AED"/><w:sz w:val="28"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/>'
+        '<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="200" w:after="80"/>'
+        '<w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:b/><w:color w:val="5B21B6"/><w:sz w:val="24"/></w:rPr></w:style>'
         '<w:style w:type="paragraph" w:styleId="ListLine"><w:name w:val="List Line"/><w:basedOn w:val="Normal"/>'
         '<w:pPr><w:tabs><w:tab w:val="left" w:pos="567"/></w:tabs><w:spacing w:after="60"/></w:pPr></w:style>'
         "</w:styles>"
@@ -1013,13 +1110,14 @@ def api_export(d):
     con = db()
     row = con.execute("SELECT * FROM experiments WHERE id=?", (exp_id,)).fetchone()
     atts = con.execute("SELECT filename,path FROM attachments WHERE exp_id=? ORDER BY id", (exp_id,)).fetchall()
+    dsets = ds_for(con, exp_id)
     con.close()
     if not row:
         raise RuntimeError("Esperimento non trovato.")
     os.makedirs(EXPORT_DIR, exist_ok=True)
     path = os.path.join(EXPORT_DIR, "%s (n.%d).docx" % (safe_name(row["name"]), exp_id))
     with open(path, "wb") as f:
-        f.write(make_docx(dict(row), [dict(a) for a in atts]))
+        f.write(make_docx(dict(row), [dict(a) for a in atts], dsets))
     drive = False
     base = sync_base()
     if base:
@@ -1267,10 +1365,16 @@ def sync_to_drive():
                     upd = max(upd, os.path.getmtime(a["path"]))
                 except OSError:
                     pass
+            dsets = ds_for(con, row["id"])
+            for ds in dsets:
+                try:
+                    upd = max(upd, datetime.datetime.fromisoformat(s(ds["updated"])).timestamp())
+                except ValueError:
+                    pass
             if os.path.exists(path) and os.path.getmtime(path) >= upd:
                 continue
             with open(path, "wb") as f:
-                f.write(make_docx(dict(row), [dict(a) for a in atts]))
+                f.write(make_docx(dict(row), [dict(a) for a in atts], dsets))
             n_doc += 1
         con.close()
         _sync_state.update({"time": now(), "error": "", "last_ts": time.time()})
@@ -1314,9 +1418,75 @@ def jsme_url():
     return JSME_CDN
 
 
+SECTORS = {
+    "chimica": "Chimica (sintesi)", "farmaco": "Farmacologia / biochimica",
+    "biologia": "Biologia molecolare e cellulare", "micro": "Microbiologia",
+    "materiali": "Materiali / fisica / ingegneria", "dati": "Informatica e dati",
+}
+
+
+def api_sector_set(d):
+    sel = [x for x in (d.get("sectors") or []) if x in SECTORS]
+    cfg = load_cfg()
+    cfg["sectors"] = sel
+    save_cfg(cfg)
+    return {"sectors": sel}
+
+
+def ds_row(r):
+    try:
+        payload = json.loads(r["payload"] or "{}")
+    except ValueError:
+        payload = {}
+    return {"id": r["id"], "exp_id": r["exp_id"], "title": r["title"], "kind": r["kind"],
+            "payload": payload, "updated": r["updated"]}
+
+
+def ds_for(con, exp_id):
+    return [ds_row(r) for r in con.execute("SELECT * FROM datasets WHERE exp_id=? ORDER BY id", (exp_id,)).fetchall()]
+
+
+def api_ds_list(d):
+    con = db()
+    res = ds_for(con, int(d["exp"]))
+    con.close()
+    return {"datasets": res}
+
+
+def api_ds_save(d):
+    payload = d.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError("Dati non validi.")
+    blob = json.dumps(payload, ensure_ascii=False)
+    if len(blob) > 2000000:
+        raise RuntimeError("Tabella troppo grande.")
+    title = s(d.get("title")).strip()[:120] or "Dati senza titolo"
+    kind = s(d.get("kind"))[:20]
+    con = db()
+    if d.get("id"):
+        con.execute("UPDATE datasets SET title=?,kind=?,payload=?,updated=? WHERE id=? AND exp_id=?",
+                    (title, kind, blob, now(), int(d["id"]), int(d["exp"])))
+        new_id = int(d["id"])
+    else:
+        cur = con.execute("INSERT INTO datasets(exp_id,title,kind,payload,updated) VALUES(?,?,?,?,?)",
+                          (int(d["exp"]), title, kind, blob, now()))
+        new_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return {"id": new_id}
+
+
+def api_ds_delete(d):
+    con = db()
+    con.execute("DELETE FROM datasets WHERE id=?", (int(d["id"]),))
+    con.commit()
+    con.close()
+    return {}
+
+
 def api_key_status(d):
     cfg = load_cfg()
-    return {"claude": bool(get_api_key()), "gemini": bool(get_gemini_key()),
+    return {"sectors": cfg.get("sectors"), "sector_names": SECTORS, "sections": SECTION_SETS[primary_sector()], "claude": bool(get_api_key()), "gemini": bool(get_gemini_key()),
             "gemini_model": s(cfg.get("gemini_model")), "chemdraw": s(cfg.get("chemdraw_app")),
             "sync_dir": s(cfg.get("sync_dir")), "sync_last": _sync_state["time"], "sync_error": _sync_state["error"]}
 
@@ -1351,7 +1521,8 @@ def api_set_keys(d):
 ROUTES = {
     "/api/list": api_list, "/api/get": api_get, "/api/new": api_new, "/api/save": api_save,
     "/api/delete": api_delete, "/api/att_open": api_att_open, "/api/att_reveal": api_att_reveal,
-    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/ai": api_ai, "/api/key_status": api_key_status,
+    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/sector_set": api_sector_set,
+    "/api/ds_list": api_ds_list, "/api/ds_save": api_ds_save, "/api/ds_delete": api_ds_delete, "/api/ai": api_ai, "/api/key_status": api_key_status,
     "/api/set_keys": api_set_keys, "/api/export": api_export,
     "/api/chemdraw_open": api_chemdraw_open, "/api/chemdraw_set": api_chemdraw_set,
     "/api/drive_find": api_drive_find, "/api/drive_set": api_drive_set, "/api/drive_sync": api_drive_sync,
@@ -1562,6 +1733,32 @@ select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px
 .drop{border:2px dashed #C4B5FD;border-radius:12px;padding:12px;margin-top:8px}
 .drop.over{background:var(--vl)}
 .topline{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.secgrid{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}
+.secopt{display:flex;align-items:center;gap:6px;padding:8px 10px;border:1px solid #DDD6FE;border-radius:10px;cursor:pointer}
+.modal.wide{width:min(1180px,96vw)}
+.dsgrid{display:flex;gap:16px;flex-wrap:wrap;overflow:auto;min-height:0}
+.dsleft{flex:1 1 360px;display:flex;flex-direction:column;gap:8px;min-width:300px}
+.dsright{flex:1.4 1 460px;display:flex;flex-direction:column;gap:8px;min-width:320px}
+.dsopt{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.dsopt input[type=text],.dsopt select{flex:1;min-width:120px}
+.dsopt select,.dsleft select{border:1px solid #DDD6FE;border-radius:10px;padding:9px 10px;background:#fff;font:inherit}
+.dstext{min-height:240px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;white-space:pre}
+.dsprev{border:1px solid #E5E7EB;border-radius:12px;background:#fff;padding:4px}
+.dsprev svg{width:100%;height:auto;display:block}
+.dssum{white-space:pre-wrap;font-size:13px;color:#374151;background:#F5F3FF;border-radius:10px;padding:8px 10px}
+.dssum:empty{display:none}
+table.grid{border-collapse:collapse;width:100%;font-size:13px}
+table.grid th{background:#EDE9FE;color:#5B21B6;font-weight:600;padding:5px 6px;text-align:left;white-space:nowrap}
+table.grid td{padding:2px;border-bottom:1px solid #F3F4F6}
+table.grid input,table.grid select{width:100%;border:1px solid #E5E7EB;border-radius:6px;padding:5px 6px;font:inherit;font-size:13px;background:#fff}
+table.grid .gcomp{display:block;padding:5px 6px;color:#5B21B6;font-weight:600;white-space:nowrap}
+.gdel{border:0;background:transparent;color:#EF4444;cursor:pointer;font-size:14px}
+.gridwrap{display:flex;flex-direction:column;gap:8px;align-items:flex-start;max-width:100%;overflow:auto}
+.platebox{overflow:auto;max-width:100%}
+table.plate{border-collapse:collapse;font-size:11px}
+table.plate th{color:#6B7280;font-weight:600;padding:2px 4px}
+table.plate td{padding:1px}
+table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:4px;font:inherit;font-size:11px;text-align:center;background:#fff}
 .modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(30,20,60,.45);display:flex;align-items:center;justify-content:center;z-index:10}
 .modal{background:#fff;border-radius:18px;padding:20px;width:min(760px,92vw);max-height:90vh;display:flex;flex-direction:column;gap:10px}
 .modal textarea{min-height:300px}
@@ -1579,6 +1776,7 @@ select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px
     </div>
     <input id="search" placeholder="🔍 Cerca esperimento…">
     <div id="list"></div>
+    <button class="btn ghost" id="btnSector">🧭 Settore</button>
     <button class="btn ghost" id="btnArchive">📦 Archivio</button>
     <button class="btn ghost" id="btnSync" title="Salva Word e copia di sicurezza nella cartella di Google Drive">☁️ Sincronizza con Drive</button>
     <button class="btn ghost" id="btnKey">🔑 Chiavi API e impostazioni</button>
@@ -1608,6 +1806,13 @@ select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px
     <div id="sections"></div>
     <div class="card">
       <div class="topline">
+        <div class="h2" style="margin:0">📈 Dati e grafici</div>
+      </div>
+      <div id="dsquick" class="dsopt" style="margin-top:8px"></div>
+      <div id="dslist" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <div class="topline">
         <div class="h2" style="margin:0">📎 Allegati (ChemDraw e altri file)</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn orange" id="btnPasteChem" title="Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)">📋 Incolla da ChemDraw</button>
@@ -1626,7 +1831,7 @@ select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px
 <script>
 const TOKEN = "__TOKEN__";
 const JSME_URL = "__JSME__";
-const SECTIONS = [
+let SECTIONS = [
   ["obiettivo", "🎯 Obiettivo", "Qual è lo scopo dell'esperimento?", 3],
   ["procedura", "🧪 Procedura sperimentale", "Scrivi qui appunti e procedura, anche in modo disordinato: l'AI li metterà in forma.", 10],
   ["risultati", "📊 Risultati e osservazioni", "Rese, aspetto, TLC, NMR, osservazioni…", 5],
@@ -1936,6 +2141,7 @@ async function openExp(id) {
   $("project").value = e.project || "";
   SECTIONS.forEach(s => { const t = $("sec_" + s[0]); t.value = e[s[0]] || ""; autosize(t); });
   renderAtt(d.attachments);
+  refreshDs().catch(() => {});
   dirty = false;
   await loadList();
 }
@@ -2299,6 +2505,1013 @@ async function syncDrive(silent) {
   } catch (e) { fail(e); }
 }
 
+// ---------- Settori di ricerca ----------
+let SECTORS_SEL = null, SECTOR_NAMES = {};
+const CHEM_SECTORS = ["chimica", "farmaco"];
+function sectorHas(k) { return !SECTORS_SEL || !SECTORS_SEL.length || SECTORS_SEL.indexOf(k) >= 0; }
+function applySections(map) {
+  if (!map) return;
+  SECTIONS.forEach(s => {
+    const m = map[s[0]]; if (!m) return;
+    s[1] = m[0]; if (m[1] !== undefined) s[2] = m[1];
+    const card = $("card_" + s[0]); if (!card) return;
+    card.querySelector(".h2").textContent = s[1];
+    $("sec_" + s[0]).placeholder = s[2];
+  });
+  if (typeof active === "string" && $("ailabel")) setActive(active);
+}
+function applySectors() {
+  const chem = !SECTORS_SEL || !SECTORS_SEL.length || SECTORS_SEL.some(s => CHEM_SECTORS.indexOf(s) >= 0);
+  ["btnChem", "btnPasteChem", "btnDraw"].forEach(id => { const b = $(id); if (b) b.style.display = chem ? "" : "none"; });
+  const names = (SECTORS_SEL || []).map(k => SECTOR_NAMES[k]).filter(Boolean);
+  $("btnSector").textContent = "🧭 Settore: " + (names.length ? (names.length > 1 ? names.length + " settori" : names[0]) : "tutti");
+  $("btnSector").title = names.length ? names.join(", ") : "Scegli il tuo settore di ricerca";
+  renderQuick();
+}
+async function loadSectors() {
+  const st = await api("key_status");
+  SECTOR_NAMES = st.sector_names || {};
+  SECTORS_SEL = st.sectors == null ? null : st.sectors;
+  applySectors();
+  applySections(st.sections);
+  return st.sectors == null;
+}
+function openSectors(first) {
+  const boxes = {};
+  const rows = Object.keys(SECTOR_NAMES).map(k => {
+    const cb = h("input", { type: "checkbox" });
+    cb.checked = (SECTORS_SEL || []).indexOf(k) >= 0;
+    boxes[k] = cb;
+    return h("label", { class: "secopt" }, cb, " " + SECTOR_NAMES[k]);
+  });
+  const close = () => bg.remove();
+  const save = async () => {
+    const sel = Object.keys(boxes).filter(k => boxes[k].checked);
+    try { await api("sector_set", { sectors: sel }); } catch (e) { fail(e); return; }
+    SECTORS_SEL = sel; applySectors(); close();
+    try { applySections((await api("key_status")).sections); } catch (e) {}
+  };
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, "🧭 In che settore lavori?"),
+    h("div", { class: "hint" }, "Puoi sceglierne più di uno. Il Diario mostra gli strumenti del tuo settore (per esempio il disegno delle molecole per chi fa chimica o farmacologia). Si può cambiare in qualsiasi momento."),
+    h("div", { class: "secgrid" }, rows),
+    h("div", { class: "btns" }, h("button", { class: "btn green", onclick: save }, "Conferma"),
+      first ? null : h("button", { class: "btn grey", onclick: close }, "Annulla"))
+  ]);
+}
+
+// ---------- Matematica e statistica ----------
+const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+const sdev = a => { if (a.length < 2) return NaN; const m = mean(a); return Math.sqrt(a.reduce((s, x) => s + (x - m) * (x - m), 0) / (a.length - 1)); };
+function fmt(v, sig) {
+  sig = sig || 3;
+  if (v == null || !isFinite(v)) return "–";
+  if (v === 0) return "0";
+  const a = Math.abs(v);
+  if (a >= 1e5 || a < 1e-3) return v.toExponential(sig - 1).replace("e+", "e");
+  return String(parseFloat(v.toPrecision(sig)));
+}
+function lgam(x) {
+  const c = [76.18009172947146, -86.50532032941677, 24.01409824083091, -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5];
+  let y = x, t = x + 5.5; t -= (x + 0.5) * Math.log(t);
+  let s = 1.000000000190015; for (const cc of c) { y += 1; s += cc / y; }
+  return -t + Math.log(2.5066282746310005 * s / x);
+}
+function betacf(a, b, x) {
+  const FP = 1e-300; const qab = a + b, qap = a + 1, qam = a - 1;
+  let c = 1, d = 1 - qab * x / qap; if (Math.abs(d) < FP) d = FP; d = 1 / d; let hh = d;
+  for (let m = 1; m <= 300; m++) {
+    const m2 = 2 * m; let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+    d = 1 + aa * d; if (Math.abs(d) < FP) d = FP; c = 1 + aa / c; if (Math.abs(c) < FP) c = FP; d = 1 / d; hh *= d * c;
+    aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+    d = 1 + aa * d; if (Math.abs(d) < FP) d = FP; c = 1 + aa / c; if (Math.abs(c) < FP) c = FP; d = 1 / d;
+    const del = d * c; hh *= del; if (Math.abs(del - 1) < 3e-12) break;
+  }
+  return hh;
+}
+function incbeta(x, a, b) {
+  if (x <= 0) return 0; if (x >= 1) return 1;
+  const bt = Math.exp(lgam(a + b) - lgam(a) - lgam(b) + a * Math.log(x) + b * Math.log(1 - x));
+  return x < (a + 1) / (a + b + 2) ? bt * betacf(a, b, x) / a : 1 - bt * betacf(b, a, 1 - x) / b;
+}
+const T975 = [0, 12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042];
+function tcrit(df) { if (df < 1) return NaN; if (df <= 30) return T975[Math.round(df)]; if (df <= 60) return 2.0 - (df - 30) * 0.00133; if (df <= 120) return 2.0 - 0.04 - (df - 60) * 0.0003; return 1.96; }
+function pStars(p) { return p < 0.001 ? "***" : p < 0.01 ? "**" : p < 0.05 ? "*" : "ns"; }
+function fmtP(p) { return p < 0.0001 ? "p < 0.0001" : "p = " + p.toFixed(4).replace(/0+$/, "").replace(/\.$/, ""); }
+function welch(a, b) {
+  const n1 = a.length, n2 = b.length; if (n1 < 2 || n2 < 2) return null;
+  const v1 = sdev(a) ** 2 / n1, v2 = sdev(b) ** 2 / n2; if (v1 + v2 === 0) return null;
+  const t = (mean(a) - mean(b)) / Math.sqrt(v1 + v2);
+  const df = (v1 + v2) ** 2 / (v1 * v1 / (n1 - 1) + v2 * v2 / (n2 - 1));
+  return { t, df, p: incbeta(df / (df + t * t), df / 2, 0.5) };
+}
+function anova1(groups) {
+  const k = groups.length, all = [].concat(...groups), N = all.length; if (k < 2 || N - k < 1) return null;
+  const gm = mean(all); let ssb = 0, ssw = 0;
+  groups.forEach(g => { const m = mean(g); ssb += g.length * (m - gm) ** 2; g.forEach(v => { ssw += (v - m) ** 2; }); });
+  if (ssw === 0) return null;
+  const d1 = k - 1, d2 = N - k, F = (ssb / d1) / (ssw / d2);
+  return { F, d1, d2, p: incbeta(d2 / (d2 + d1 * F), d2 / 2, d1 / 2) };
+}
+function solveLin(A, b) {
+  const n = b.length, M = A.map((r, i) => r.concat([b[i]]));
+  for (let i = 0; i < n; i++) {
+    let p = i; for (let r = i + 1; r < n; r++) if (Math.abs(M[r][i]) > Math.abs(M[p][i])) p = r;
+    if (Math.abs(M[p][i]) < 1e-300) return null;
+    const tmp = M[i]; M[i] = M[p]; M[p] = tmp;
+    for (let r = 0; r < n; r++) { if (r === i) continue; const f = M[r][i] / M[i][i]; for (let c = i; c <= n; c++) M[r][c] -= f * M[i][c]; }
+  }
+  return M.map((r, i) => r[n] / r[i]);
+}
+function invMat(A) {
+  const n = A.length, cols = [];
+  for (let j = 0; j < n; j++) { const e = Array(n).fill(0); e[j] = 1; const s = solveLin(A, e); if (!s) return null; cols.push(s); }
+  return A.map((_, i) => cols.map(c => c[i]));
+}
+// minimi quadrati non lineari (Levenberg-Marquardt) su model(x, p); free = indici dei parametri liberi
+function lsq(model, xs, ys, p0, free) {
+  let p = p0.slice(), lam = 1e-2;
+  const sse = pp => { let s = 0; for (let i = 0; i < xs.length; i++) { const r = ys[i] - model(xs[i], pp); s += r * r; } return s; };
+  const jac = pp => xs.map(x => free.map(k => {
+    const hh = 1e-6 * Math.max(Math.abs(pp[k]), 1e-3), q = pp.slice(), q2 = pp.slice(); q[k] += hh; q2[k] -= hh;
+    return (model(x, q) - model(x, q2)) / (2 * hh);
+  }));
+  const normal = pp => {
+    const J = jac(pp), k = free.length, A = Array.from({ length: k }, () => Array(k).fill(0)), g = Array(k).fill(0);
+    for (let i = 0; i < xs.length; i++) { const r = ys[i] - model(xs[i], pp); for (let a = 0; a < k; a++) { g[a] += J[i][a] * r; for (let b = 0; b < k; b++) A[a][b] += J[i][a] * J[i][b]; } }
+    return { A, g };
+  };
+  let cost = sse(p);
+  if (!isFinite(cost)) return null;
+  for (let it = 0; it < 300; it++) {
+    const { A, g } = normal(p); let improved = false, tiny = false;
+    for (let tr = 0; tr < 14; tr++) {
+      const B = A.map((row, a) => row.map((v, b) => a === b ? v * (1 + lam) + 1e-12 : v));
+      const d = solveLin(B, g); if (!d) { lam *= 10; continue; }
+      const q = p.slice(); free.forEach((kk, a) => { q[kk] += d[a]; });
+      const c = sse(q);
+      if (isFinite(c) && c < cost) { tiny = (cost - c) / (cost + 1e-30) < 1e-13; p = q; cost = c; lam = Math.max(lam / 5, 1e-9); improved = true; break; }
+      lam *= 5;
+    }
+    if (!improved || tiny) break;
+  }
+  const { A } = normal(p), inv = invMat(A), df = xs.length - free.length;
+  const se = Array(p.length).fill(NaN);
+  if (inv && df > 0) { const s2 = cost / df; free.forEach((k, a) => { se[k] = Math.sqrt(Math.max(0, s2 * inv[a][a])); }); }
+  return { p, sse: cost, df, se };
+}
+function r2of(ys, sse) { const m = mean(ys); const sst = ys.reduce((s, y) => s + (y - m) ** 2, 0); return sst > 0 ? 1 - sse / sst : NaN; }
+
+// curva dose-risposta a 4 parametri: y = bottom + (top-bottom) / (1 + 10^((logEC50 - logx) * hill))
+const model4 = (x, p) => p[0] + (p[1] - p[0]) / (1 + Math.pow(10, Math.max(-300, Math.min(300, (p[2] - x) * p[3]))));
+function fit4PL(pts, fix) {
+  const lx = pts.map(q => Math.log10(q.x)), ys = pts.map(q => q.y);
+  const ux = Array.from(new Set(lx)).sort((a, b) => a - b);
+  if (ux.length < (fix ? 3 : 4) || pts.length < (fix ? 3 : 5)) return null;
+  const mu = ux.map(u => mean(ys.filter((_, i) => lx[i] === u)));
+  const lo = Math.min.apply(null, mu), hi = Math.max.apply(null, mu), dec = mu[0] > mu[mu.length - 1];
+  const mid = (lo + hi) / 2; let c0 = ux[Math.floor(ux.length / 2)];
+  for (let i = 0; i < ux.length - 1; i++) if ((mu[i] - mid) * (mu[i + 1] - mid) <= 0) { c0 = (ux[i] + ux[i + 1]) / 2; break; }
+  const free = fix ? [2, 3] : [0, 1, 2, 3]; let best = null;
+  for (const hh of [1, 0.6, 2]) for (const dc of [0, -0.5, 0.5, 1, -1]) {
+    const r = lsq(model4, lx, ys, [fix ? fix[0] : lo, fix ? fix[1] : hi, c0 + dc, dec ? -hh : hh], free);
+    if (r && (!best || r.sse < best.sse)) best = r;
+  }
+  if (!best) return null;
+  const p = best.p, t = tcrit(best.df), c = p[2], se = best.se[2];
+  const out = { bottom: p[0], top: p[1], logc: c, hill: p[3], ec50: Math.pow(10, c), sse: best.sse, df: best.df, r2: r2of(ys, best.sse), n: pts.length, se: best.se, dec };
+  if (isFinite(se) && isFinite(t)) out.ci = [Math.pow(10, c - t * se), Math.pow(10, c + t * se)];
+  out.curve = [];
+  const a = ux[0] - 0.4, b = ux[ux.length - 1] + 0.4;
+  for (let i = 0; i <= 120; i++) { const x = a + (b - a) * i / 120; out.curve.push([Math.pow(10, x), model4(x, p)]); }
+  return out;
+}
+function fitLinear(pts) {
+  const n = pts.length; if (n < 3) return null;
+  const mx = mean(pts.map(q => q.x)), my = mean(pts.map(q => q.y));
+  let sxx = 0, sxy = 0; pts.forEach(q => { sxx += (q.x - mx) ** 2; sxy += (q.x - mx) * (q.y - my); });
+  if (sxx === 0) return null;
+  const m = sxy / sxx, q0 = my - m * mx; let sse = 0; pts.forEach(q => { sse += (q.y - (q0 + m * q.x)) ** 2; });
+  const s2 = sse / (n - 2), sem = Math.sqrt(s2 / sxx), seq = Math.sqrt(s2 * (1 / n + mx * mx / sxx));
+  const xs = pts.map(q => q.x), a = Math.min.apply(null, xs), b = Math.max.apply(null, xs);
+  return { slope: m, intercept: q0, se_slope: sem, se_int: seq, r2: r2of(pts.map(q => q.y), sse), n, curve: [[a, q0 + m * a], [b, q0 + m * b]] };
+}
+function fitMM(pts) {
+  const xs = pts.map(q => q.x), ys = pts.map(q => q.y); if (new Set(xs).size < 3 || pts.length < 4) return null;
+  const model = (x, p) => p[0] * x / (p[1] + x), vmax = Math.max.apply(null, ys), sx = xs.slice().sort((a, b) => a - b);
+  let best = null;
+  for (const f of [1, 0.3, 3]) { const r = lsq(model, xs, ys, [vmax * 1.1, Math.max(1e-12, sx[Math.floor(sx.length / 2)]) * f], [0, 1]); if (r && (!best || r.sse < best.sse)) best = r; }
+  if (!best) return null;
+  const hi = sx[sx.length - 1], curve = [];
+  for (let i = 0; i <= 100; i++) { const x = hi * 1.05 * i / 100; curve.push([x, model(x, best.p)]); }
+  return { vmax: best.p[0], km: best.p[1], se: best.se, r2: r2of(ys, best.sse), n: pts.length, curve };
+}
+
+function fitPoly2(pts) {
+  const n = pts.length; if (n < 4) return null;
+  const S = k => pts.reduce((s, q) => s + Math.pow(q.x, k), 0), T = k => pts.reduce((s, q) => s + q.y * Math.pow(q.x, k), 0);
+  const c = solveLin([[n, S(1), S(2)], [S(1), S(2), S(3)], [S(2), S(3), S(4)]], [T(0), T(1), T(2)]); if (!c) return null;
+  let sse = 0; pts.forEach(q => { sse += (q.y - (c[0] + c[1] * q.x + c[2] * q.x * q.x)) ** 2; });
+  const xs = pts.map(q => q.x), a = Math.min.apply(null, xs), b = Math.max.apply(null, xs), curve = [];
+  for (let i = 0; i <= 100; i++) { const x = a + (b - a) * i / 100; curve.push([x, c[0] + c[1] * x + c[2] * x * x]); }
+  return { c, r2: r2of(pts.map(q => q.y), sse), n, curve };
+}
+function fitExp(pts) {
+  const p = pts.filter(q => q.y > 0); if (p.length < 3) return null;
+  const lin = fitLinear(p.map(q => ({ x: q.x, y: Math.log(q.y) }))); if (!lin) return null;
+  const model = (x, q) => q[0] * Math.exp(Math.max(-700, Math.min(700, q[1] * x)));
+  const r = lsq(model, p.map(q => q.x), p.map(q => q.y), [Math.exp(lin.intercept), lin.slope], [0, 1]); if (!r) return null;
+  const xs = p.map(q => q.x), a = Math.min.apply(null, xs), b = Math.max.apply(null, xs), curve = [];
+  for (let i = 0; i <= 100; i++) { const x = a + (b - a) * i / 100; curve.push([x, model(x, r.p)]); }
+  return { a: r.p[0], k: r.p[1], se: r.se, r2: r2of(p.map(q => q.y), r.sse), n: p.length, curve };
+}
+function fitPower(pts) {
+  const p = pts.filter(q => q.y > 0 && q.x > 0); if (p.length < 3) return null;
+  const lin = fitLinear(p.map(q => ({ x: Math.log(q.x), y: Math.log(q.y) }))); if (!lin) return null;
+  const model = (x, q) => q[0] * Math.pow(x, q[1]);
+  const r = lsq(model, p.map(q => q.x), p.map(q => q.y), [Math.exp(lin.intercept), lin.slope], [0, 1]); if (!r) return null;
+  const xs = p.map(q => q.x), a = Math.min.apply(null, xs), b = Math.max.apply(null, xs), curve = [];
+  for (let i = 0; i <= 100; i++) { const x = a + (b - a) * i / 100; curve.push([x, model(x, r.p)]); }
+  return { a: r.p[0], b: r.p[1], se: r.se, r2: r2of(p.map(q => q.y), r.sse), n: p.length, curve };
+}
+
+// ---------- Lettura della tabella incollata ----------
+function splitLine(l) { if (l.indexOf("\t") >= 0) return l.split("\t"); if (l.indexOf(";") >= 0) return l.split(";"); return l.trim().split(/\s+/); }
+function num(c) {
+  if (c == null) return NaN; c = String(c).trim().replace(",", ".");
+  return /^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(c) ? parseFloat(c) : NaN;
+}
+function parseSeries(text, kind) {
+  const series = []; let cur = null;
+  for (const raw of String(text).replace(/\r/g, "").split("\n")) {
+    const line = raw.trim(); if (!line) continue;
+    if (line[0] === "#") { cur = { name: line.slice(1).trim() || ("Serie " + (series.length + 1)), rows: [] }; series.push(cur); continue; }
+    if (!cur) { cur = { name: "", rows: [] }; series.push(cur); }
+    const cells = splitLine(line).map(c => c.trim());
+    if (kind === "bars") {
+      const ys = cells.slice(1).map(num).filter(isFinite);
+      if (cells[0] && ys.length) cur.rows.push({ label: cells[0], ys });
+    } else {
+      const x = num(cells[0]); if (!isFinite(x)) continue;
+      const ys = cells.slice(1).map(num).filter(isFinite);
+      if (ys.length) cur.rows.push({ x, ys });
+    }
+  }
+  return series.filter(s => s.rows.length);
+}
+
+// ---------- Analisi: ritorna grafico, riassunto e tabella ----------
+const TEXT_KINDS = { dr: "Dose-risposta (IC50 / EC50)", xy: "Grafico x-y (con fit)", bars: "Barre: gruppi, media ± DS e test", table: "Tabella libera con grafico" };
+const DS_KINDS = Object.assign({}, TEXT_KINDS);
+const DS_EXAMPLES = {
+  dr: "# Composto A\n0.001\t98\t101\t97\n0.01\t95\t93\t96\n0.1\t80\t84\t78\n1\t48\t52\t50\n10\t15\t18\t12\n100\t4\t6\t3\n# Composto B\n0.001\t100\t99\t102\n0.01\t99\t97\t100\n0.1\t92\t90\t94\n1\t75\t72\t78\n10\t40\t38\t45\n100\t12\t10\t14",
+  xy: "0\t0.1\t0.2\t0.1\n10\t0.9\t1.0\t0.8\n20\t1.8\t1.7\t1.9\n30\t2.6\t2.7\t2.5\n40\t3.6\t3.5\t3.7\n50\t4.4\t4.5\t4.3",
+  bars: "Controllo\t100\t96\t104\t99\nTrattato 1\t72\t68\t75\t70\nTrattato 2\t45\t50\t41\t47",
+  table: "Prova\tLearning rate\tEpoche\tAccuratezza\nrun1\t0.01\t20\t0.81\nrun2\t0.001\t20\t0.86\nrun3\t0.001\t50\t0.89\nrun4\t0.0001\t50\t0.84"
+};
+function analyzeTable(spec) {
+  const o = spec.opts || {}, warns = [];
+  const rows = String(spec.text).replace(/\r/g, "").split("\n").filter(l => l.trim()).map(l => splitLine(l).map(c => c.trim()));
+  const chart = { kind: "bars", title: spec.title || "", xlabel: spec.xlabel || "", ylabel: spec.ylabel || "", series: [], bars: [] };
+  if (rows.length < 2) return { chart, summary: "", table: [], warns: ["Scrivi la riga di intestazione e almeno una riga di dati."] };
+  const head = rows[0], body = rows.slice(1).map(r => head.map((_, i) => r[i] || ""));
+  const table = [head].concat(body);
+  const ci = Math.min(Math.max(parseInt(o.col, 10) || (head.length - 1), 1), head.length - 1);
+  const vals = body.map(r => num(r[ci])), ok = vals.filter(isFinite);
+  let summary = "";
+  if (head.length < 2) { warns.push("Servono almeno due colonne."); return { chart, summary, table, warns }; }
+  if (ok.length) summary = "Colonna «" + head[ci] + "»: n = " + ok.length + ", media = " + fmt(mean(ok), 4) + (ok.length > 1 ? ", DS = " + fmt(sdev(ok), 3) : "") + ", min = " + fmt(Math.min.apply(null, ok), 4) + ", max = " + fmt(Math.max.apply(null, ok), 4) + ".";
+  else warns.push("La colonna scelta per il grafico non contiene numeri.");
+  const xs = body.map(r => num(r[0]));
+  if (ok.length && xs.every(isFinite) && body.length >= 2) {
+    const sub = analyze({ kind: "xy", title: spec.title, unit: spec.unit, xlabel: spec.xlabel || head[0], ylabel: spec.ylabel || head[ci], opts: o,
+      text: body.map((r, i) => isFinite(vals[i]) ? xs[i] + "\t" + vals[i] : "").filter(Boolean).join("\n") });
+    return { chart: sub.chart, summary: [summary, sub.summary].filter(Boolean).join("\n"), table, warns: warns.concat(sub.warns) };
+  }
+  chart.bars = body.map((r, i) => isFinite(vals[i]) ? { label: r[0] || ("riga " + (i + 1)), ys: [vals[i]], mean: vals[i], sd: NaN, n: 1 } : null).filter(Boolean);
+  chart.xlabel = spec.xlabel || ""; chart.ylabel = spec.ylabel || head[ci];
+  return { chart, summary, table, warns };
+}
+function analyze(spec) {
+  if (spec.kind === "table") return analyzeTable(spec);
+  const kind = spec.kind, o = spec.opts || {}, unit = spec.unit || "";
+  const raw = parseSeries(spec.text, kind), lines = [], warns = [];
+  const chart = { kind, title: spec.title || "", xlabel: spec.xlabel || "", ylabel: spec.ylabel || "", logx: kind === "dr" || !!o.logx, logy: kind === "xy" && !!o.logy, series: [], bars: [] };
+  let table = [];
+  if (!raw.length) return { chart, summary: "", table, warns: ["Inserisci i dati nella tabella."] };
+  if (kind === "bars") {
+    const rows = [].concat(...raw.map(s => s.rows));
+    chart.bars = rows.map(r => ({ label: r.label, ys: r.ys, mean: mean(r.ys), sd: sdev(r.ys), n: r.ys.length }));
+    table = [["Gruppo", "Media", "DS", "SEM", "n"]].concat(chart.bars.map(b => [b.label, fmt(b.mean, 4), fmt(b.sd, 3), fmt(b.sd / Math.sqrt(b.n), 3), String(b.n)]));
+    const groups = rows.map(r => r.ys);
+    if (groups.length === 2) {
+      const w = welch(groups[0], groups[1]);
+      if (w) { lines.push("Test t di Welch (" + rows[0].label + " vs " + rows[1].label + "): t = " + fmt(w.t, 3) + ", gdl = " + fmt(w.df, 3) + ", " + fmtP(w.p) + " (" + pStars(w.p) + ")."); chart.note = fmtP(w.p) + " (" + pStars(w.p) + ", Welch)"; }
+      else warns.push("Per il test servono almeno 2 valori per gruppo.");
+    } else if (groups.length > 2) {
+      const a = anova1(groups);
+      if (a) { lines.push("ANOVA a una via: F(" + a.d1 + ", " + a.d2 + ") = " + fmt(a.F, 3) + ", " + fmtP(a.p) + " (" + pStars(a.p) + ")."); chart.note = "ANOVA " + fmtP(a.p) + " (" + pStars(a.p) + ")"; }
+      else warns.push("Per l'ANOVA servono almeno 2 valori per gruppo.");
+    }
+    if (groups.some(g => g.length < 3)) warns.push("Alcuni gruppi hanno meno di 3 repliche: le statistiche sono poco affidabili.");
+    return { chart, summary: lines.join("\n"), table, warns };
+  }
+  const lab = n => (o.label && o.label !== "auto") ? o.label : (n ? "IC50" : "EC50");
+  raw.forEach((s, si) => {
+    const name = s.name || spec.title || "Dati";
+    const color = CHART_COLORS[si % CHART_COLORS.length], pts = [], flat = [];
+    s.rows.forEach(r => {
+      if (kind === "dr" && r.x <= 0) { warns.push("Concentrazione ≤ 0 (" + r.x + ") non inclusa nel grafico e nel fit."); return; }
+      if (kind === "xy" && o.logx && r.x <= 0) { warns.push("Valori di x ≤ 0 non inclusi (asse logaritmico)."); return; }
+      if (kind === "xy" && o.logy && r.ys.some(v => v <= 0)) { warns.push("Valori di y ≤ 0 non inclusi (asse y logaritmico)."); r = { x: r.x, ys: r.ys.filter(v => v > 0) }; if (!r.ys.length) return; }
+      pts.push({ x: r.x, ys: r.ys, mean: mean(r.ys), sd: sdev(r.ys), n: r.ys.length });
+      r.ys.forEach(y => flat.push({ x: r.x, y }));
+    });
+    const ser = { name, color, pts, curve: null };
+    if (kind === "dr") {
+      const f = fit4PL(flat, o.fixTB ? [0, 100] : null);
+      if (!f) { warns.push(name + ": servono almeno 5 punti su 4 concentrazioni diverse per il fit (3 con estremi fissi)."); }
+      else {
+        ser.curve = f.curve; ser.fit = f;
+        const L = lab(f.dec), u = unit ? " " + unit : "";
+        let s1 = name + ": " + L + " = " + fmt(f.ec50, 3) + u;
+        if (f.ci) s1 += " (IC 95%: " + fmt(f.ci[0], 3) + " – " + fmt(f.ci[1], 3) + ")"; else warns.push(name + ": intervallo di confidenza non calcolabile (pochi punti).");
+        s1 += "; pendenza (Hill) = " + fmt(f.hill, 3) + "; top = " + fmt(f.top, 3) + "; bottom = " + fmt(f.bottom, 3) + "; R² = " + fmt(f.r2, 4) + "; n = " + f.n + " (gdl " + f.df + ").";
+        lines.push(s1);
+        ser.legend = name + "  " + L + " " + fmt(f.ec50, 3) + u;
+        if (f.r2 < 0.9) warns.push(name + ": R² basso (" + fmt(f.r2, 3) + "): controlla i dati o prova gli estremi fissi.");
+        if (f.ec50 < Math.min.apply(null, flat.map(q => q.x)) || f.ec50 > Math.max.apply(null, flat.map(q => q.x))) warns.push(name + ": " + L + " fuori dall'intervallo di concentrazioni misurato, il valore è un'estrapolazione.");
+      }
+    } else if (o.fit === "lineare") {
+      const f = fitLinear(flat);
+      if (f) { ser.curve = f.curve; lines.push(name + ": y = " + fmt(f.slope, 4) + " · x " + (f.intercept < 0 ? "− " : "+ ") + fmt(Math.abs(f.intercept), 4) + "; pendenza ± ES = " + fmt(f.slope, 4) + " ± " + fmt(f.se_slope, 2) + "; R² = " + fmt(f.r2, 4) + "; n = " + f.n + "."); ser.legend = name + "  R² " + fmt(f.r2, 3); }
+      else warns.push(name + ": servono almeno 3 punti per la retta.");
+    } else if (o.fit === "poly2") {
+      const f = fitPoly2(flat);
+      if (f) { ser.curve = f.curve; lines.push(name + ": y = " + fmt(f.c[2], 4) + " · x² " + (f.c[1] < 0 ? "− " : "+ ") + fmt(Math.abs(f.c[1]), 4) + " · x " + (f.c[0] < 0 ? "− " : "+ ") + fmt(Math.abs(f.c[0]), 4) + "; R² = " + fmt(f.r2, 4) + "; n = " + f.n + "."); ser.legend = name + "  R² " + fmt(f.r2, 3); }
+      else warns.push(name + ": servono almeno 4 punti per il polinomio di 2° grado.");
+    } else if (o.fit === "exp") {
+      const f = fitExp(flat);
+      if (f) {
+        ser.curve = f.curve;
+        const t2 = f.k > 0 ? "tempo di raddoppio = " + fmt(Math.LN2 / f.k, 3) : "emivita = " + fmt(Math.LN2 / Math.abs(f.k), 3);
+        lines.push(name + ": y = " + fmt(f.a, 4) + " · exp(" + fmt(f.k, 4) + " · x); k = " + fmt(f.k, 4) + " ± " + fmt(f.se[1], 2) + "; " + t2 + (unit ? " " + unit : "") + "; R² = " + fmt(f.r2, 4) + "; n = " + f.n + ".");
+        ser.legend = name + "  k " + fmt(f.k, 3);
+      } else warns.push(name + ": servono almeno 3 punti con y > 0 per l'esponenziale.");
+    } else if (o.fit === "power") {
+      const f = fitPower(flat);
+      if (f) { ser.curve = f.curve; lines.push(name + ": y = " + fmt(f.a, 4) + " · x^" + fmt(f.b, 4) + "; esponente = " + fmt(f.b, 4) + " ± " + fmt(f.se[1], 2) + "; R² = " + fmt(f.r2, 4) + "; n = " + f.n + "."); ser.legend = name + "  esp. " + fmt(f.b, 3); }
+      else warns.push(name + ": servono almeno 3 punti con x > 0 e y > 0 per la legge di potenza.");
+    } else if (o.fit === "mm") {
+      const f = fitMM(flat);
+      if (f) { ser.curve = f.curve; lines.push(name + ": Vmax = " + fmt(f.vmax, 3) + " ± " + fmt(f.se[0], 2) + "; Km = " + fmt(f.km, 3) + " ± " + fmt(f.se[1], 2) + (unit ? " " + unit : "") + "; R² = " + fmt(f.r2, 4) + "; n = " + f.n + "."); ser.legend = name + "  Km " + fmt(f.km, 3); }
+      else warns.push(name + ": servono almeno 4 punti su 3 valori di x diversi per Michaelis-Menten.");
+    }
+    if (pts.some(q => q.n < 2)) warns.push(name + ": alcuni punti hanno una sola replica (niente barre di errore).");
+    chart.series.push(ser);
+  });
+  // tabella: x e, per ogni serie, media ± DS (n)
+  const xs = Array.from(new Set([].concat(...chart.series.map(s => s.pts.map(q => q.x))))).sort((a, b) => a - b);
+  table = [[(spec.xlabel || "x") + (unit && kind === "dr" ? " (" + unit + ")" : "")].concat(chart.series.map(s => (chart.series.length > 1 ? s.name + ": " : "") + "media ± DS (n)"))];
+  xs.forEach(x => table.push([fmt(x, 4)].concat(chart.series.map(s => { const q = s.pts.find(p => p.x === x); return q ? fmt(q.mean, 4) + (isFinite(q.sd) ? " ± " + fmt(q.sd, 2) : "") + " (" + q.n + ")" : "–"; }))));
+  return { chart, summary: lines.join("\n"), table, warns: Array.from(new Set(warns)) };
+}
+
+// ---------- Disegno del grafico (SVG) ----------
+const CHART_COLORS = ["#2563EB", "#DC2626", "#059669", "#D97706", "#7C3AED", "#DB2777", "#0891B2", "#65A30D"];
+const xesc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function niceTicks(lo, hi, n) {
+  n = n || 6; if (!(hi > lo)) { lo -= 1; hi += 1; }
+  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / mag;
+  const step = (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * mag, s = Math.floor(lo / step + 1e-9) * step, e = Math.ceil(hi / step - 1e-9) * step, t = [];
+  for (let v = s; v <= e + step * 1e-6; v += step) t.push(parseFloat(v.toPrecision(12)));
+  return t;
+}
+function chartSVG(c) {
+  const W = 680, H = 440, many = c.kind !== "bars" && c.series.length > 1;
+  const L = 74, R = many ? 20 : 24, T = c.title ? 44 : 22, B = 64, pw = W - L - R, ph = H - T - B;
+  let xmin, xmax, ymin = Infinity, ymax = -Infinity, cats = [];
+  const ylog = !!c.logy && c.kind !== "bars";
+  const upd = v => { if (isFinite(v) && (!ylog || v > 0)) { ymin = Math.min(ymin, v); ymax = Math.max(ymax, v); } };
+  if (c.kind === "bars") {
+    cats = c.bars; c.bars.forEach(b => { upd(b.mean + (isFinite(b.sd) ? b.sd : 0)); upd(b.mean - (isFinite(b.sd) ? b.sd : 0)); b.ys.forEach(upd); });
+    ymin = Math.min(0, ymin);
+  } else {
+    xmin = Infinity; xmax = -Infinity;
+    c.series.forEach(s => {
+      s.pts.forEach(q => { xmin = Math.min(xmin, q.x); xmax = Math.max(xmax, q.x); q.ys.forEach(upd); upd(q.mean - (isFinite(q.sd) ? q.sd : 0)); upd(q.mean + (isFinite(q.sd) ? q.sd : 0)); });
+      if (s.curve) s.curve.forEach(pt => { xmin = Math.min(xmin, pt[0]); xmax = Math.max(xmax, pt[0]); upd(pt[1]); });
+    });
+    if (!isFinite(xmin)) return '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '"><rect width="100%" height="100%" fill="#fff"/></svg>';
+  }
+  if (!isFinite(ymin)) { ymin = 0; ymax = 1; }
+  let yt, y0, y1, sy;
+  if (ylog) {
+    const a = Math.floor(Math.log10(ymin) - 1e-9), b0 = Math.ceil(Math.log10(ymax) + 1e-9), b = b0 === a ? b0 + 1 : b0;
+    yt = []; for (let e = a; e <= b; e++) yt.push(Math.pow(10, e));
+    y0 = Math.pow(10, a); y1 = Math.pow(10, b);
+    sy = v => T + ph - (Math.log10(Math.max(v, y0)) - a) / (b - a) * ph;
+  } else {
+    yt = niceTicks(ymin - (c.kind === "bars" ? 0 : (ymax - ymin) * 0.04), ymax + (ymax - ymin) * 0.06, 6); y0 = yt[0]; y1 = yt[yt.length - 1];
+    sy = v => T + ph - (v - y0) / (y1 - y0) * ph;
+  }
+  let sx, xticks = [], out = [];
+  if (c.kind === "bars") { sx = i => L + pw * (i + 0.5) / cats.length; }
+  else if (c.logx) {
+    const a = Math.floor(Math.log10(xmin) - 1e-9), b = Math.ceil(Math.log10(xmax) + 1e-9), bb = b === a ? b + 1 : b;
+    sx = v => L + (Math.log10(v) - a) / (bb - a) * pw;
+    for (let e = a; e <= bb; e++) xticks.push([e, "10"]);
+  } else {
+    const xt = niceTicks(xmin, xmax, 6), a = xt[0], b = xt[xt.length - 1];
+    sx = v => L + (v - a) / (b - a) * pw; xt.forEach(v => xticks.push([v, null]));
+  }
+  out.push('<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '" font-family="Arial, Helvetica, sans-serif">');
+  out.push('<rect width="100%" height="100%" fill="#ffffff"/>');
+  if (c.title) out.push('<text x="' + W / 2 + '" y="26" text-anchor="middle" font-size="16" font-weight="bold" fill="#111827">' + xesc(c.title) + "</text>");
+  yt.forEach(v => {
+    out.push('<line x1="' + L + '" x2="' + (L + pw) + '" y1="' + sy(v) + '" y2="' + sy(v) + '" stroke="#E5E7EB" stroke-width="1"/>');
+    out.push(ylog ? '<text x="' + (L - 8) + '" y="' + (sy(v) + 4) + '" text-anchor="end" font-size="12" fill="#374151">10<tspan dy="-5" font-size="9">' + Math.round(Math.log10(v)) + "</tspan></text>"
+      : '<text x="' + (L - 8) + '" y="' + (sy(v) + 4) + '" text-anchor="end" font-size="12" fill="#374151">' + fmt(v, 4) + "</text>");
+  });
+  if (c.kind !== "bars") xticks.forEach(([v, tag]) => {
+    const x = tag ? sx(Math.pow(10, v)) : sx(v);
+    out.push('<line x1="' + x + '" x2="' + x + '" y1="' + (T + ph) + '" y2="' + (T + ph + 5) + '" stroke="#374151"/>');
+    out.push(tag ? '<text x="' + x + '" y="' + (T + ph + 20) + '" text-anchor="middle" font-size="12" fill="#374151">10<tspan dy="-5" font-size="9">' + v + "</tspan></text>"
+      : '<text x="' + x + '" y="' + (T + ph + 20) + '" text-anchor="middle" font-size="12" fill="#374151">' + fmt(v, 4) + "</text>");
+  });
+  out.push('<line x1="' + L + '" x2="' + L + '" y1="' + T + '" y2="' + (T + ph) + '" stroke="#374151" stroke-width="1.4"/>');
+  out.push('<line x1="' + L + '" x2="' + (L + pw) + '" y1="' + (T + ph) + '" y2="' + (T + ph) + '" stroke="#374151" stroke-width="1.4"/>');
+  if (c.kind === "bars") {
+    const bw = Math.min(90, pw / cats.length * 0.6);
+    cats.forEach((b, i) => {
+      const x = sx(i), col = CHART_COLORS[i % CHART_COLORS.length], top = sy(Math.max(b.mean, 0)), base = sy(0);
+      out.push('<rect x="' + (x - bw / 2) + '" y="' + Math.min(top, base) + '" width="' + bw + '" height="' + Math.abs(base - top) + '" fill="' + col + '" fill-opacity="0.75" stroke="' + col + '"/>');
+      if (isFinite(b.sd)) {
+        const a = sy(b.mean - b.sd), z = sy(b.mean + b.sd);
+        out.push('<path d="M' + x + " " + a + "V" + z + "M" + (x - 8) + " " + a + "H" + (x + 8) + "M" + (x - 8) + " " + z + "H" + (x + 8) + '" stroke="#111827" stroke-width="1.6" fill="none"/>');
+      }
+      b.ys.forEach((v, j) => { const jx = x + (b.ys.length > 1 ? (j / (b.ys.length - 1) - 0.5) * bw * 0.5 : 0); out.push('<circle cx="' + jx + '" cy="' + sy(v) + '" r="3.2" fill="#fff" stroke="#111827" stroke-width="1"/>'); });
+      out.push('<text x="' + x + '" y="' + (T + ph + 20) + '" text-anchor="middle" font-size="12" fill="#374151">' + xesc(b.label.length > 18 ? b.label.slice(0, 17) + "…" : b.label) + "</text>");
+    });
+    if (c.note) out.push('<text x="' + (L + pw) + '" y="' + (T + 14) + '" text-anchor="end" font-size="12" fill="#374151">' + xesc(c.note) + "</text>");
+  } else {
+    c.series.forEach(s => {
+      if (s.curve) out.push('<polyline fill="none" stroke="' + s.color + '" stroke-width="2.2" points="' + s.curve.filter(p => (!c.logx || p[0] > 0) && (!ylog || p[1] > 0)).map(p => sx(p[0]).toFixed(1) + "," + sy(p[1]).toFixed(1)).join(" ") + '"/>');
+      s.pts.forEach(q => {
+        const x = sx(q.x);
+        if (ylog && !(q.mean > 0)) return;
+        if (isFinite(q.sd) && q.n > 1) { const a = sy(q.mean - q.sd), z = sy(q.mean + q.sd); out.push('<path d="M' + x + " " + a + "V" + z + "M" + (x - 4) + " " + a + "H" + (x + 4) + "M" + (x - 4) + " " + z + "H" + (x + 4) + '" stroke="' + s.color + '" stroke-width="1.4" fill="none"/>'); }
+        out.push('<circle cx="' + x + '" cy="' + sy(q.mean) + '" r="4.6" fill="' + s.color + '" stroke="#fff" stroke-width="1"/>');
+      });
+    });
+    const leg = c.series.map(s => s.legend || s.name).filter(Boolean);
+    if (leg.length && (many || c.series.some(s => s.legend))) {
+      const lw = Math.min(330, Math.max.apply(null, leg.map(t => t.length)) * 6.6 + 34), lx = L + pw - lw - 6, ly = T + 8;
+      out.push('<rect x="' + lx + '" y="' + ly + '" width="' + lw + '" height="' + (leg.length * 18 + 8) + '" fill="#fff" fill-opacity="0.9" stroke="#D1D5DB"/>');
+      c.series.forEach((s, i) => {
+        const yy = ly + 8 + i * 18 + 8;
+        out.push('<line x1="' + (lx + 8) + '" x2="' + (lx + 24) + '" y1="' + yy + '" y2="' + yy + '" stroke="' + s.color + '" stroke-width="2.4"/><circle cx="' + (lx + 16) + '" cy="' + yy + '" r="3.6" fill="' + s.color + '"/>');
+        out.push('<text x="' + (lx + 30) + '" y="' + (yy + 4) + '" font-size="12" fill="#111827">' + xesc(s.legend || s.name) + "</text>");
+      });
+    }
+  }
+  if (c.xlabel) out.push('<text x="' + (L + pw / 2) + '" y="' + (H - 14) + '" text-anchor="middle" font-size="13" fill="#111827">' + xesc(c.xlabel) + "</text>");
+  if (c.ylabel) out.push('<text transform="translate(18 ' + (T + ph / 2) + ') rotate(-90)" text-anchor="middle" font-size="13" fill="#111827">' + xesc(c.ylabel) + "</text>");
+  out.push("</svg>");
+  return out.join("");
+}
+
+// ---------- Finestra "Dati e grafici" ----------
+function defaultKind() {
+  const s = SECTORS_SEL || [];
+  if (!s.length || s.indexOf("farmaco") >= 0) return "dr";
+  if (s.indexOf("biologia") >= 0) return "bars";
+  return "xy";
+}
+function openAny(d) { if (STRUCT_KINDS[d.kind]) openStructured(d, d.kind); else openDataset(d); }
+function openDataset(ds, preset) {
+  if (curId == null) return;
+  const tool = preset && preset.tool ? TOOLS[preset.tool] : null;
+  const pl = ds ? ds.payload : {};
+  const kindSel = h("select", null, Object.keys(TEXT_KINDS).map(k => h("option", { value: k }, TEXT_KINDS[k])));
+  kindSel.value = (ds && ds.kind) || (tool && tool.text) || defaultKind();
+  const title = h("input", { type: "text", placeholder: "Titolo (es. Inibizione di NLRP3 – composti A e B)", maxlength: "120" }); title.value = ds ? ds.title : (tool ? tool.label : "");
+  const unitSel = h("select", null, ["", "M", "mM", "µM", "nM", "pM", "µg/mL", "mg/mL", "mg/kg", "s", "min", "h", "°C", "V", "mV", "nm", "mm"].map(u => h("option", { value: u }, u || "(unità)")));
+  unitSel.value = pl.unit != null ? pl.unit : (tool && tool.unit ? tool.unit : "µM");
+  const xl = h("input", { type: "text", placeholder: "Etichetta asse x" }), yl = h("input", { type: "text", placeholder: "Etichetta asse y" });
+  xl.value = pl.xlabel || (tool && tool.xl) || ""; yl.value = pl.ylabel || (tool && tool.yl) || "";
+  const o0 = pl.opts || (tool && tool.opts) || {};
+  const fixTB = h("input", { type: "checkbox" }); fixTB.checked = !!o0.fixTB;
+  const logx = h("input", { type: "checkbox" }); logx.checked = !!o0.logx;
+  const logy = h("input", { type: "checkbox" }); logy.checked = !!o0.logy;
+  const labSel = h("select", null, [["auto", "IC50/EC50 automatico"], ["IC50", "IC50"], ["EC50", "EC50"]].map(a => h("option", { value: a[0] }, a[1])));
+  labSel.value = o0.label || "auto";
+  const fitSel = h("select", null, [["none", "nessun fit"], ["lineare", "retta (regressione lineare)"], ["poly2", "polinomio di 2° grado"], ["exp", "esponenziale (k, raddoppio / emivita)"], ["power", "legge di potenza"], ["mm", "Michaelis-Menten (Vmax, Km)"]].map(a => h("option", { value: a[0] }, a[1])));
+  fitSel.value = o0.fit || "none";
+  const colSel = h("select", null);
+  const ta = h("textarea", { class: "dstext", spellcheck: "false", placeholder: "Incolla qui da Excel…" });
+  ta.value = pl.text || "";
+  const hint = h("div", { class: "hint" }), preview = h("div", { class: "dsprev" }), summ = h("div", { class: "dssum" }), warnBox = h("div", { class: "warn", style: "font-size:13px" });
+  const optDr = h("div", { class: "dsopt" }, h("label", null, fixTB, " estremi fissi (top 100, bottom 0)"), labSel);
+  const optXy = h("div", { class: "dsopt" }, h("label", null, logx, " x logaritmico"), h("label", null, logy, " y logaritmico"), fitSel);
+  const optTb = h("div", { class: "dsopt" }, h("span", { class: "muted" }, "Colonna da rappresentare:"), colSel);
+  let timer = null, last = null, lastHead = "";
+  const fillCols = () => {
+    const first = ta.value.replace(/\r/g, "").split("\n").find(l => l.trim()) || "";
+    if (first === lastHead) return; lastHead = first;
+    const cur = colSel.value, head = first ? splitLine(first).map(c => c.trim()) : [];
+    colSel.innerHTML = "";
+    head.forEach((c, i) => { if (i > 0) colSel.append(h("option", { value: String(i) }, c || ("colonna " + (i + 1)))); });
+    colSel.value = (o0.col && !cur) ? String(o0.col) : (cur || String(Math.max(head.length - 1, 1)));
+    if (!colSel.value && colSel.options.length) colSel.selectedIndex = colSel.options.length - 1;
+  };
+  const spec = () => {
+    const k = kindSel.value;
+    return { kind: k, title: title.value.trim(), unit: k === "bars" || k === "table" && !fitSel.value ? "" : unitSel.value,
+      xlabel: xl.value.trim() || (k === "dr" ? "Concentrazione" + (unitSel.value ? " (" + unitSel.value + ")" : "") : ""),
+      ylabel: yl.value.trim() || (k === "dr" ? "Risposta (%)" : ""), text: ta.value,
+      opts: { fixTB: fixTB.checked, logx: logx.checked, logy: logy.checked, label: labSel.value, fit: (k === "xy" || k === "table") ? fitSel.value : "none", col: colSel.value } };
+  };
+  const refresh = () => {
+    const k = kindSel.value;
+    hint.textContent = k === "bars"
+      ? "Una riga per gruppo: nome, poi i valori delle repliche (separati da tab, «;» o spazio). Con 2 gruppi fa il test t di Welch, con 3 o più l'ANOVA."
+      : k === "dr" ? "Una riga per concentrazione: concentrazione, poi le repliche della risposta. Più composti: separali con una riga «# Nome». Il fit è a 4 parametri."
+        : k === "table" ? "La prima riga è l'intestazione, poi una riga per prova. Se la prima colonna è numerica fa un grafico x-y (con fit a scelta), altrimenti un grafico a barre."
+          : "Una riga per punto: x, poi le repliche di y. Più serie: separale con una riga «# Nome».";
+    optDr.style.display = k === "dr" ? "" : "none"; optXy.style.display = (k === "xy" || k === "table") ? "" : "none"; optTb.style.display = k === "table" ? "" : "none";
+    unitSel.style.display = (k === "bars") ? "none" : "";
+    if (k === "table") fillCols();
+    try {
+      last = analyze(spec());
+      preview.innerHTML = chartSVG(last.chart);
+      summ.textContent = last.summary;
+      warnBox.textContent = last.warns.length ? "⚠️ " + last.warns.join(" · ") : "";
+    } catch (e) { preview.textContent = "Errore nel calcolo: " + e.message; }
+  };
+  const sched = () => { clearTimeout(timer); timer = setTimeout(refresh, 250); };
+  [kindSel, unitSel, fixTB, logx, logy, labSel, fitSel, colSel].forEach(el => el.addEventListener("change", refresh));
+  [title, xl, yl, ta].forEach(el => el.addEventListener("input", sched));
+  const close = () => bg.remove();
+  const persist = async () => {
+    if (!ta.value.trim()) { alert("Inserisci prima i dati."); return null; }
+    const sp = spec(), a = analyze(sp);
+    const pl2 = { kind: sp.kind, title: sp.title, text: sp.text, unit: sp.unit, xlabel: xl.value.trim(), ylabel: yl.value.trim(), opts: sp.opts, summary: a.summary, table: a.table };
+    const r = await api("ds_save", { id: ds ? ds.id : null, exp: curId, title: title.value.trim() || DS_KINDS[kindSel.value], kind: kindSel.value, payload: pl2 });
+    if (ds) ds.id = r.id; else ds = { id: r.id };
+    return r.id;
+  };
+  const save = h("button", { class: "btn green", onclick: async () => { try { if (await persist() == null) return; close(); await refreshDs(); status("✅ Dati salvati", 2500); } catch (e) { fail(e); } } }, "💾 Salva i dati");
+  const attach = h("button", { class: "btn violet", onclick: async () => {
+    try {
+      if (await persist() == null) return;
+      status("🖼️ Creo l'immagine del grafico…");
+      const png = await svgToPng(chartSVG(analyze(spec()).chart));
+      const pad = n => String(n).padStart(2, "0"), dt = new Date();
+      const stamp = dt.getFullYear() + pad(dt.getMonth() + 1) + pad(dt.getDate()) + "-" + pad(dt.getHours()) + pad(dt.getMinutes()) + pad(dt.getSeconds());
+      const nm = (title.value.trim().replace(/[^\w.\- ]+/g, "").replace(/\s+/g, "_").slice(0, 50) || "grafico");
+      close();
+      await uploadFiles([new File([png], "grafico-" + (nm === "grafico" ? "" : nm + "-") + stamp + ".png", { type: "image/png" })]);
+      await refreshDs();
+    } catch (e) { fail(e); }
+  } }, "🖼️ Salva e allega il grafico");
+  const example = h("button", { class: "btn grey small", onclick: () => { ta.value = DS_EXAMPLES[kindSel.value] || ""; if (!title.value) title.value = "Esempio"; lastHead = "\u0000"; refresh(); } }, "Esempio");
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, "📈 Dati e grafici"),
+    h("div", { class: "dsgrid" },
+      h("div", { class: "dsleft" }, title, h("div", { class: "dsopt" }, kindSel, unitSel), hint,
+        h("div", { class: "keyrow" }, h("span", { class: "muted" }, "Tabella dei dati (puoi incollare da Excel)"), example), ta, optDr, optXy, optTb,
+        h("div", { class: "dsopt" }, xl, yl)),
+      h("div", { class: "dsright" }, preview, warnBox, summ)),
+    h("div", { class: "btns" }, save, attach, h("button", { class: "btn grey", onclick: close }, "Chiudi"))
+  ]);
+  bg.querySelector(".modal").classList.add("wide");
+  refresh();
+}
+
+// ---------- Strumenti per settore ----------
+// preset = tipo di tabella di testo con le opzioni gia' pronte; kind = finestra strutturata
+const TOOLS = {
+  reag:      { label: "Reagenti e rese", icon: "⚗️", sectors: ["chimica"], kind: "reag" },
+  char:      { label: "Caratterizzazione", icon: "🔬", sectors: ["chimica"], kind: "char" },
+  dr:        { label: "Dose-risposta (IC50)", icon: "📈", sectors: ["farmaco"], text: "dr" },
+  mm:        { label: "Cinetica enzimatica (Km, Vmax)", icon: "🧪", sectors: ["farmaco"], text: "xy", opts: { fit: "mm" }, unit: "µM" },
+  assay:     { label: "Scheda del saggio", icon: "🧫", sectors: ["farmaco"], kind: "assay" },
+  plate:     { label: "Piastra a 96 pozzetti", icon: "🔳", sectors: ["biologia"], kind: "plate" },
+  qpcr:      { label: "qPCR (ΔΔCt)", icon: "🧬", sectors: ["biologia"], kind: "qpcr" },
+  samples:   { label: "Campioni e reagenti", icon: "🧫", sectors: ["biologia"], kind: "samples" },
+  cfu:       { label: "Conte CFU", icon: "🦠", sectors: ["micro"], kind: "cfu" },
+  mic:       { label: "MIC", icon: "💊", sectors: ["micro"], kind: "mic" },
+  growth:    { label: "Curva di crescita", icon: "📈", sectors: ["micro"], text: "xy", opts: { fit: "exp", logy: true }, unit: "h", xl: "Tempo (h)", yl: "OD600 / CFU" },
+  strain:    { label: "Ceppo e condizioni", icon: "🧫", sectors: ["micro"], kind: "strain" },
+  xy:        { label: "Misure x-y con fit", icon: "📉", sectors: ["materiali", "dati", "farmaco", "biologia", "micro", "chimica"], text: "xy" },
+  table:     { label: "Tabella con grafico", icon: "📋", sectors: ["materiali", "dati"], text: "table" },
+  bars:      { label: "Gruppi: media ± DS e test", icon: "📊", sectors: ["biologia", "farmaco", "micro", "materiali", "dati", "chimica"], text: "bars" },
+  materials: { label: "Materiale e condizioni di misura", icon: "🔧", sectors: ["materiali"], kind: "materials" },
+  env:       { label: "Ambiente e riproducibilità", icon: "💻", sectors: ["dati"], kind: "env" },
+};
+const SECTOR_TOOLS = {
+  chimica: ["reag", "char", "bars", "xy"],
+  farmaco: ["dr", "mm", "assay", "bars"],
+  biologia: ["plate", "qpcr", "samples", "bars"],
+  micro: ["cfu", "mic", "growth", "strain"],
+  materiali: ["xy", "table", "materials", "bars"],
+  dati: ["table", "bars", "xy", "env"]
+};
+const CARD_TEMPLATES = {
+  char: ["Aspetto", "Resa", "Punto di fusione", "Rf (eluente)", "1H NMR", "13C NMR", "MS (ESI / HRMS)", "HPLC (purezza, tR)", "IR", "[α]D"],
+  assay: ["Bersaglio / enzima", "Composto (lotto)", "Substrato / ligando e concentrazione", "Tampone e pH", "Temperatura e tempo di incubazione", "Metodo di rivelazione", "Controlli (positivo, negativo, veicolo)", "Concentrazione di DMSO"],
+  samples: ["Linea cellulare (passaggio)", "Terreno e siero", "Densità di semina", "Trattamento (concentrazione, tempo)", "Anticorpi primari (diluizione, lotto)", "Anticorpi secondari", "Kit / reagenti (lotto)", "Repliche biologiche / tecniche"],
+  strain: ["Ceppo (codice)", "Terreno", "Temperatura e atmosfera", "Inoculo (CFU/mL o OD)", "Tempo di incubazione", "Composto / antibiotico (lotto)", "Standard di riferimento (CLSI, EUCAST)"],
+  materials: ["Materiale e lotto", "Sintesi / processo (parametri)", "Strumento e modello", "Condizioni ambientali (T, umidità)", "Calibrazione", "Preparazione del campione", "Norma di riferimento"],
+  env: ["Repository e commit", "Versione software e librerie", "Seed casuale", "Hardware", "Dataset (versione)", "Comando eseguito", "Tempo di calcolo"]
+};
+const STRUCT_KINDS = { reag: "Reagenti e rese", char: "Caratterizzazione", assay: "Scheda del saggio", plate: "Piastra a 96 pozzetti", qpcr: "qPCR (ΔΔCt)", samples: "Campioni e reagenti", cfu: "Conte CFU", mic: "MIC", strain: "Ceppo e condizioni", materials: "Materiale e condizioni di misura", env: "Ambiente e riproducibilità" };
+Object.assign(DS_KINDS, STRUCT_KINDS);
+
+function toolsForSectors() {
+  const sel = (SECTORS_SEL && SECTORS_SEL.length) ? SECTORS_SEL : ["chimica"];
+  const out = [];
+  sel.forEach(s => (SECTOR_TOOLS[s] || []).forEach(k => { if (out.indexOf(k) < 0) out.push(k); }));
+  return out;
+}
+function startTool(k) {
+  const t = TOOLS[k];
+  if (t.kind) openStructured(null, t.kind); else openDataset(null, { tool: k });
+}
+function renderQuick() {
+  const box = $("dsquick"); if (!box) return;
+  box.innerHTML = "";
+  toolsForSectors().forEach(k => box.append(h("button", { class: "btn blue small", title: TOOLS[k].label, onclick: () => startTool(k) }, TOOLS[k].icon + " " + TOOLS[k].label)));
+  box.append(h("button", { class: "btn grey small", onclick: openToolChooser }, "＋ Altri strumenti…"));
+}
+function openToolChooser() {
+  const close = () => bg.remove(), parts = [];
+  Object.keys(SECTOR_NAMES).forEach(s => {
+    parts.push(h("div", { class: "h2", style: "margin:8px 0 2px" }, SECTOR_NAMES[s]));
+    parts.push(h("div", { class: "dsopt" }, (SECTOR_TOOLS[s] || []).map(k => h("button", { class: "btn violet small", onclick: () => { close(); startTool(k); } }, TOOLS[k].icon + " " + TOOLS[k].label))));
+  });
+  const bg = modal([h("div", { class: "h2", style: "margin:0" }, "＋ Scegli lo strumento")].concat(parts, [h("div", { class: "btns" }, h("button", { class: "btn grey", onclick: close }, "Chiudi"))]));
+}
+
+// ---------- Editor a griglia ----------
+function gridEditor(cols, rows, onChange) {
+  const table = h("table", { class: "grid" }), tbody = h("tbody");
+  table.append(h("thead", null, h("tr", null, cols.map(c => h("th", { style: c.w ? "min-width:" + c.w + "px" : "" }, c.label)).concat([h("th", null, "")]))), tbody);
+  let data = rows.map(r => Object.assign({}, r));
+  const cellEls = [];
+  const readonlyCols = cols.filter(c => c.computed);
+  const fire = () => onChange && onChange(data);
+  function build() {
+    tbody.innerHTML = ""; cellEls.length = 0;
+    data.forEach((row, ri) => {
+      const tr = h("tr"), els = {};
+      cols.forEach((c, ci) => {
+        let el;
+        if (c.computed) { el = h("span", { class: "gcomp" }, ""); }
+        else if (c.type === "select") {
+          el = h("select", null, (c.opts || []).map(o => h("option", { value: o }, o || "–")));
+          el.value = row[c.key] != null ? row[c.key] : (c.opts || [""])[0];
+          row[c.key] = el.value;
+          el.addEventListener("change", () => { row[c.key] = el.value; fire(); });
+        } else {
+          el = h("input", { type: "text", autocomplete: "off", placeholder: c.ph || "" });
+          el.value = row[c.key] != null ? row[c.key] : "";
+          el.addEventListener("input", () => { row[c.key] = el.value; fire(); });
+          el.addEventListener("paste", ev => {
+            const txt = (ev.clipboardData || window.clipboardData).getData("text");
+            if (txt.indexOf("\t") < 0 && txt.indexOf("\n") < 0) return;
+            ev.preventDefault();
+            const lines = txt.replace(/\r/g, "").split("\n").filter((l, i, a) => l !== "" || i < a.length - 1);
+            const editable = cols.filter(x => !x.computed && x.type !== "select");
+            const start = editable.indexOf(c);
+            lines.forEach((ln, li) => {
+              const rr = ri + li; while (data.length <= rr) data.push({});
+              ln.split("\t").forEach((v, k) => { const cc = editable[start + k]; if (cc) data[rr][cc.key] = v.trim(); });
+            });
+            build(); fire();
+          });
+        }
+        els[c.key] = el; tr.append(h("td", null, el));
+      });
+      tr.append(h("td", null, h("button", { class: "gdel", title: "Elimina la riga", onclick: () => { data.splice(ri, 1); if (!data.length) data.push({}); build(); fire(); } }, "✕")));
+      cellEls.push(els); tbody.append(tr);
+    });
+  }
+  build();
+  const add = h("button", { class: "btn grey small", onclick: () => { data.push({}); build(); fire(); } }, "＋ Aggiungi riga");
+  return {
+    el: h("div", { class: "gridwrap" }, table, add),
+    rows: () => data,
+    setComputed: (key, arr) => { cellEls.forEach((els, i) => { if (els[key]) els[key].textContent = arr[i] == null ? "" : arr[i]; }); }
+  };
+}
+const nz = v => { const x = num(v); return isFinite(x) ? x : NaN; };
+
+// ---------- Definizione dei tipi strutturati ----------
+function cardKind(id) {
+  return {
+    hint: "Compila i campi che servono (puoi aggiungere altre righe). I campi vuoti non compaiono nel Word.",
+    init: () => ({ rows: CARD_TEMPLATES[id].map(k => ({ k, v: "" })) }),
+    build: (st, on) => {
+      const g = gridEditor([{ key: "k", label: "Campo", w: 200 }, { key: "v", label: "Valore", w: 320 }], st.rows, rows => { st.rows = rows; on(); });
+      return { el: g.el, sync: () => { st.rows = g.rows(); } };
+    },
+    analyze: st => {
+      const rows = st.rows.filter(r => (r.v || "").trim());
+      return { chart: null, summary: "", table: rows.length ? [["Campo", "Valore"]].concat(rows.map(r => [r.k || "", r.v])) : [], warns: rows.length ? [] : ["Compila almeno un campo."] };
+    }
+  };
+}
+const KIND_DEFS = {};
+["char", "assay", "samples", "strain", "materials", "env"].forEach(k => { KIND_DEFS[k] = cardKind(k); });
+
+// --- Reagenti e rese
+KIND_DEFS.reag = {
+  hint: "Per ogni riga indica PM e una tra massa, mmol oppure volume + densità. La resa si calcola sul reagente limitante (il primo reagente, o quello segnato «limitante»). Stechiometria 1:1 col prodotto.",
+  init: () => ({ rows: [{ role: "Reagente" }, { role: "Reagente" }, { role: "Solvente" }, { role: "Prodotto" }] }),
+  build: (st, on) => {
+    const cols = [{ key: "role", label: "Ruolo", type: "select", opts: ["Reagente", "Catalizzatore / additivo", "Solvente", "Prodotto"] }, { key: "name", label: "Nome", w: 150 },
+      { key: "mw", label: "PM", w: 60 }, { key: "mass", label: "Massa (mg)", w: 70 }, { key: "vol", label: "Vol. (mL)", w: 60 }, { key: "dens", label: "Dens.", w: 55 }, { key: "mmol", label: "mmol", w: 60 },
+      { key: "lim", label: "Limitante", type: "select", opts: ["", "limitante"] }, { key: "c_mmol", label: "mmol", computed: true }, { key: "c_eq", label: "Equiv. / resa", computed: true }];
+    const g = gridEditor(cols, st.rows, rows => { st.rows = rows; on(); });
+    return { el: g.el, sync: () => { st.rows = g.rows(); }, after: () => { const a = reagCalc(st.rows); g.setComputed("c_mmol", a.rows.map(r => r.mmol == null ? "" : fmt(r.mmol, 4))); g.setComputed("c_eq", a.rows.map(r => r.txt)); } };
+  },
+  analyze: st => {
+    const a = reagCalc(st.rows), warns = a.warns;
+    const table = [["Ruolo", "Nome", "PM", "Massa (mg)", "Vol. (mL)", "mmol", "Equiv. / resa"]].concat(a.rows.filter(r => r.src.name || r.mmol != null || r.vol).map(r => [r.src.role || "", r.src.name || "", r.src.mw || "", r.src.mass || "", r.src.vol || "", r.mmol == null ? "" : fmt(r.mmol, 4), r.txt]));
+    return { chart: null, summary: a.summary, table: table.length > 1 ? table : [], warns };
+  }
+};
+function reagCalc(rows) {
+  const warns = [], out = rows.map(src => {
+    const mw = nz(src.mw), mass = nz(src.mass), vol = nz(src.vol), dens = nz(src.dens), mm = nz(src.mmol);
+    let mmol = null;
+    if (isFinite(mm)) mmol = mm; else if (isFinite(mass) && mw > 0) mmol = mass / mw; else if (isFinite(vol) && isFinite(dens) && mw > 0 && src.role !== "Solvente") mmol = vol * dens * 1000 / mw;
+    return { src, mmol, mw, txt: "" };
+  });
+  let lim = out.find(r => r.src.lim === "limitante" && r.mmol != null) || out.find(r => r.src.role === "Reagente" && r.mmol != null);
+  const sum = [];
+  if (lim) {
+    sum.push("Reagente limitante: " + (lim.src.name || "(senza nome)") + ", " + fmt(lim.mmol, 4) + " mmol.");
+    out.forEach(r => {
+      if (r.mmol == null) return;
+      if (r.src.role === "Prodotto") {
+        const y = r.mmol / lim.mmol * 100; r.txt = "resa " + fmt(y, 3) + " %";
+        sum.push("Prodotto " + (r.src.name || "") + ": " + (isFinite(nz(r.src.mass)) ? fmt(nz(r.src.mass), 4) + " mg, " : "") + fmt(r.mmol, 4) + " mmol, resa " + fmt(y, 3) + " %." + (isFinite(r.mw) ? " Massa teorica: " + fmt(lim.mmol * r.mw, 4) + " mg." : ""));
+        if (y > 105) warns.push("Resa superiore al 100%: controlla PM e quantità (" + (r.src.name || "prodotto") + ").");
+      } else r.txt = r === lim ? "1.00 (limitante)" : fmt(r.mmol / lim.mmol, 3) + " equiv.";
+    });
+    const vs = out.filter(r => r.src.role === "Solvente").reduce((s, r) => s + (isFinite(nz(r.src.vol)) ? nz(r.src.vol) : 0), 0);
+    if (vs > 0) sum.push("Concentrazione del limitante: " + fmt(lim.mmol / vs, 3) + " M (" + fmt(vs, 3) + " mL di solvente).");
+  } else if (rows.some(r => r.name || r.mass || r.mmol)) warns.push("Inserisci PM e massa (o mmol) di almeno un reagente per calcolare equivalenti e resa.");
+  out.forEach(r => { if (r.src.role !== "Solvente" && r.src.name && r.mmol == null && (r.src.mass || r.src.vol)) warns.push("«" + r.src.name + "»: manca il PM (o la densità per un volume)."); });
+  return { rows: out, summary: sum.join("\n"), warns: Array.from(new Set(warns)) };
+}
+
+// --- Conte CFU
+function parseDil(v) {
+  v = String(v == null ? "" : v).trim().replace(",", "."); if (!v) return NaN;
+  let m;
+  if ((m = v.match(/^10\^?\s*\(?(-?\d+)\)?$/))) return Math.pow(10, +m[1]);
+  if ((m = v.match(/^1\s*[:/]\s*(\d+(\.\d+)?)$/))) return 1 / +m[1];
+  if (/^-\d+$/.test(v)) return Math.pow(10, +v);
+  const x = Number(v); return isFinite(x) && x > 0 ? x : NaN;
+}
+KIND_DEFS.cfu = {
+  hint: "Per ogni diluizione scrivi le colonie contate sulle piastre. Diluizione: -6, 10^-6, 1e-6 o 1:1000000. Contano le piastre con 30-300 colonie. Volume piastrato in mL (di solito 0.1).",
+  init: () => ({ rows: [{ vol: "0.1" }, { vol: "0.1" }, { vol: "0.1" }] }),
+  build: (st, on) => {
+    const g = gridEditor([{ key: "s", label: "Campione", w: 130 }, { key: "d", label: "Diluizione", w: 80 }, { key: "c1", label: "Piastra 1", w: 60 }, { key: "c2", label: "Piastra 2", w: 60 }, { key: "c3", label: "Piastra 3", w: 60 }, { key: "vol", label: "Vol. (mL)", w: 60 }, { key: "cc", label: "CFU/mL", computed: true }], st.rows, rows => { st.rows = rows; on(); });
+    return { el: g.el, sync: () => { st.rows = g.rows(); }, after: () => { g.setComputed("cc", cfuCalc(st.rows).rowTxt); } };
+  },
+  analyze: st => {
+    const a = cfuCalc(st.rows);
+    return { chart: a.chart, summary: a.summary, table: a.table, warns: a.warns };
+  }
+};
+function cfuCalc(rows) {
+  const warns = [], per = {}, rowTxt = [];
+  rows.forEach(r => {
+    const dil = parseDil(r.d), vol = isFinite(nz(r.vol)) ? nz(r.vol) : 0.1, cs = [r.c1, r.c2, r.c3].map(nz).filter(isFinite);
+    if (!(r.s || "").trim() || !isFinite(dil) || !cs.length) { rowTxt.push(""); return; }
+    const valid = cs.filter(c => c >= 30 && c <= 300);
+    if (!valid.length) { rowTxt.push("fuori 30-300"); warns.push((r.s) + " (diluizione " + r.d + "): nessuna piastra tra 30 e 300 colonie, riga esclusa."); return; }
+    if (valid.length < cs.length) warns.push(r.s + " (diluizione " + r.d + "): alcune piastre fuori dall'intervallo 30-300 sono state escluse.");
+    const cfu = mean(valid) / (dil * vol); rowTxt.push(fmt(cfu, 3));
+    (per[r.s.trim()] = per[r.s.trim()] || []).push(cfu);
+  });
+  const names = Object.keys(per), chart = { kind: "bars", title: "", xlabel: "", ylabel: "log10 CFU/mL", series: [], bars: [] };
+  const table = names.length ? [["Campione", "CFU/mL (media)", "log10 CFU/mL", "n diluizioni"]] : [];
+  names.forEach(n => {
+    const v = per[n], m = mean(v), lg = v.map(x => Math.log10(x));
+    chart.bars.push({ label: n, ys: lg, mean: mean(lg), sd: sdev(lg), n: v.length });
+    table.push([n, m.toExponential(2).replace("e+", "e"), fmt(Math.log10(m), 4), String(v.length)]);
+  });
+  const summary = names.map(n => n + ": " + mean(per[n]).toExponential(2).replace("e+", "e") + " CFU/mL (log10 = " + fmt(Math.log10(mean(per[n])), 4) + ").").join("\n");
+  return { rowTxt, chart: names.length ? chart : null, summary, table, warns: Array.from(new Set(warns)) };
+}
+
+// --- MIC
+KIND_DEFS.mic = {
+  hint: "Una riga per ogni concentrazione provata: composto, ceppo, concentrazione e se c'è crescita. La MIC è la concentrazione più bassa senza crescita.",
+  init: () => ({ rows: [2, 4, 8, 16, 32, 64].map(c => ({ conc: String(c), g: "crescita" })) }),
+  build: (st, on) => {
+    const g = gridEditor([{ key: "s", label: "Composto", w: 130 }, { key: "strain", label: "Ceppo", w: 130 }, { key: "conc", label: "Conc. (µg/mL)", w: 90 }, { key: "g", label: "Crescita", type: "select", opts: ["crescita", "no crescita"] }], st.rows, rows => { st.rows = rows; on(); });
+    return { el: g.el, sync: () => { st.rows = g.rows(); } };
+  },
+  analyze: st => {
+    const groups = {}, warns = [];
+    st.rows.forEach(r => { const c = nz(r.conc); if (!isFinite(c)) return; const key = (r.s || "").trim() + "\u0001" + (r.strain || "").trim(); (groups[key] = groups[key] || []).push({ c, no: r.g === "no crescita" }); });
+    const keys = Object.keys(groups), table = keys.length ? [["Composto", "Ceppo", "MIC (µg/mL)"]] : [], chart = { kind: "bars", title: "", xlabel: "", ylabel: "MIC (µg/mL)", series: [], bars: [] }, lines = [];
+    keys.forEach(k => {
+      const [s, strain] = k.split("\u0001"), list = groups[k].sort((a, b) => a.c - b.c);
+      let mic = null;
+      for (let i = 0; i < list.length; i++) if (list[i].no && list.slice(i).every(x => x.no)) { mic = list[i].c; break; }
+      if (mic == null && list.some(x => x.no)) warns.push((s || "composto") + " / " + (strain || "ceppo") + ": risultati non monotoni (crescita a concentrazioni più alte di una senza crescita): controlla.");
+      const txt = mic != null ? String(mic) : "> " + list[list.length - 1].c;
+      table.push([s, strain, txt]); lines.push((s || "–") + " su " + (strain || "–") + ": MIC = " + txt + " µg/mL.");
+      if (mic != null) chart.bars.push({ label: ((s || "") + " " + (strain || "")).trim(), ys: [mic], mean: mic, sd: NaN, n: 1 });
+    });
+    if (!keys.length) warns.push("Inserisci almeno una concentrazione.");
+    return { chart: chart.bars.length ? chart : null, summary: lines.join("\n"), table, warns };
+  }
+};
+
+// --- qPCR
+KIND_DEFS.qpcr = {
+  hint: "Una riga per gruppo e gene con i Ct delle repliche. Indica il gene di riferimento e il gruppo di controllo qui sopra: il Diario calcola ΔCt, ΔΔCt e fold change (2^-ΔΔCt).",
+  init: () => ({ ref: "GAPDH", ctrl: "Controllo", rows: [{ g: "Controllo", gene: "GAPDH" }, { g: "Controllo", gene: "Gene X" }, { g: "Trattato", gene: "GAPDH" }, { g: "Trattato", gene: "Gene X" }] }),
+  build: (st, on) => {
+    const ref = h("input", { type: "text", placeholder: "Gene di riferimento" }), ctrl = h("input", { type: "text", placeholder: "Gruppo di controllo" });
+    ref.value = st.ref || ""; ctrl.value = st.ctrl || "";
+    ref.addEventListener("input", () => { st.ref = ref.value; on(); }); ctrl.addEventListener("input", () => { st.ctrl = ctrl.value; on(); });
+    const g = gridEditor([{ key: "g", label: "Gruppo", w: 120 }, { key: "gene", label: "Gene", w: 110 }, { key: "c1", label: "Ct 1", w: 60 }, { key: "c2", label: "Ct 2", w: 60 }, { key: "c3", label: "Ct 3", w: 60 }], st.rows, rows => { st.rows = rows; on(); });
+    return { el: h("div", null, h("div", { class: "dsopt" }, ref, ctrl), g.el), sync: () => { st.rows = g.rows(); } };
+  },
+  analyze: st => {
+    const warns = [], cell = {};
+    st.rows.forEach(r => { const cs = [r.c1, r.c2, r.c3].map(nz).filter(isFinite); if (!(r.g || "").trim() || !(r.gene || "").trim() || !cs.length) return; (cell[r.g.trim() + "\u0001" + r.gene.trim()] = cell[r.g.trim() + "\u0001" + r.gene.trim()] || []).push(...cs); if (cs.some(c => c > 35)) warns.push("Ct > 35 (" + r.g + ", " + r.gene + "): segnale molto debole."); });
+    const groups = Array.from(new Set(Object.keys(cell).map(k => k.split("\u0001")[0]))), genes = Array.from(new Set(Object.keys(cell).map(k => k.split("\u0001")[1])));
+    const ref = (st.ref || "").trim(), ctrl = (st.ctrl || "").trim(), chart = { kind: "bars", title: "", xlabel: "", ylabel: "Espressione relativa (2^-ΔΔCt)", series: [], bars: [] }, table = [], lines = [];
+    if (!groups.length) return { chart: null, summary: "", table, warns: ["Inserisci i valori di Ct."] };
+    if (genes.indexOf(ref) < 0) return { chart: null, summary: "", table, warns: ["Il gene di riferimento «" + ref + "» non compare nella tabella."] };
+    if (groups.indexOf(ctrl) < 0) return { chart: null, summary: "", table, warns: ["Il gruppo di controllo «" + ctrl + "» non compare nella tabella."] };
+    table.push(["Gene", "Gruppo", "Ct medio", "ΔCt", "ΔΔCt", "Fold change (intervallo)"]);
+    genes.filter(x => x !== ref).forEach(gene => {
+      const dct = {};
+      groups.forEach(G => {
+        const t = cell[G + "\u0001" + gene], r = cell[G + "\u0001" + ref];
+        if (!t || !r) { warns.push(gene + " / " + G + ": manca il gene o il riferimento."); return; }
+        dct[G] = { d: mean(t) - mean(r), sd: Math.sqrt((isFinite(sdev(t)) ? sdev(t) ** 2 : 0) + (isFinite(sdev(r)) ? sdev(r) ** 2 : 0)), ct: mean(t) };
+      });
+      if (!dct[ctrl]) return;
+      groups.forEach(G => {
+        if (!dct[G]) return;
+        const dd = dct[G].d - dct[ctrl].d, fold = Math.pow(2, -dd), lo = Math.pow(2, -(dd + dct[G].sd)), hi = Math.pow(2, -(dd - dct[G].sd));
+        table.push([gene, G, fmt(dct[G].ct, 4), fmt(dct[G].d, 4), fmt(dd, 4), fmt(fold, 3) + " (" + fmt(lo, 3) + " – " + fmt(hi, 3) + ")"]);
+        lines.push(gene + " – " + G + ": fold change = " + fmt(fold, 3) + " (" + fmt(lo, 3) + " – " + fmt(hi, 3) + ").");
+        chart.bars.push({ label: gene + " " + G, ys: [fold], mean: fold, sd: (hi - lo) / 2, n: 2 });
+      });
+    });
+    if (!chart.bars.length) warns.push("Servono almeno un gene bersaglio oltre al riferimento.");
+    return { chart: chart.bars.length ? chart : null, summary: lines.join("\n"), table: chart.bars.length ? table : [], warns: Array.from(new Set(warns)) };
+  }
+};
+
+// --- Piastra a 96 pozzetti
+const PLATE_ROWS = "ABCDEFGH".split("");
+KIND_DEFS.plate = {
+  hint: "Compila il layout (nome del gruppo in ogni pozzetto, es. Blank, Controllo, Comp-A 10 µM) e i valori letti (assorbanza, fluorescenza…). Puoi incollare un blocco 8×12 da Excel in ciascuna griglia. Pozzetti vuoti ignorati.",
+  init: () => ({ layout: PLATE_ROWS.map(() => Array(12).fill("")), vals: PLATE_ROWS.map(() => Array(12).fill("")), blank: "Blank", ctrl: "Controllo", subBlank: true, norm: true }),
+  build: (st, on) => {
+    const mk = (key, title) => {
+      const tbl = h("table", { class: "plate" }), body = h("tbody");
+      tbl.append(h("thead", null, h("tr", null, [h("th", null, "")].concat(Array.from({ length: 12 }, (_, i) => h("th", null, String(i + 1)))))), body);
+      PLATE_ROWS.forEach((L, r) => {
+        const tr = h("tr", null, h("th", null, L));
+        for (let c = 0; c < 12; c++) {
+          const inp = h("input", { type: "text", autocomplete: "off" }); inp.value = st[key][r][c] || "";
+          inp.addEventListener("input", () => { st[key][r][c] = inp.value; on(); });
+          inp.addEventListener("paste", ev => {
+            const txt = (ev.clipboardData || window.clipboardData).getData("text");
+            if (txt.indexOf("\t") < 0 && txt.indexOf("\n") < 0) return;
+            ev.preventDefault();
+            txt.replace(/\r/g, "").split("\n").forEach((ln, li) => { if (!ln && li > 0) return; ln.split("\t").forEach((v, k) => { if (r + li < 8 && c + k < 12) st[key][r + li][c + k] = v.trim(); }); });
+            const holder = tbl.parentNode; holder.replaceWith(mk(key, title)); on();
+          });
+          tr.append(h("td", null, inp));
+        }
+        body.append(tr);
+      });
+      return h("div", { class: "platebox" }, h("div", { class: "keyrow" }, h("b", null, title)), tbl);
+    };
+    const blank = h("input", { type: "text", placeholder: "Nome del bianco" }), ctrl = h("input", { type: "text", placeholder: "Nome del controllo" });
+    blank.value = st.blank || ""; ctrl.value = st.ctrl || "";
+    blank.addEventListener("input", () => { st.blank = blank.value; on(); }); ctrl.addEventListener("input", () => { st.ctrl = ctrl.value; on(); });
+    const sb = h("input", { type: "checkbox" }), nm = h("input", { type: "checkbox" }); sb.checked = !!st.subBlank; nm.checked = !!st.norm;
+    sb.addEventListener("change", () => { st.subBlank = sb.checked; on(); }); nm.addEventListener("change", () => { st.norm = nm.checked; on(); });
+    return { el: h("div", null, h("div", { class: "dsopt" }, blank, ctrl), h("div", { class: "dsopt" }, h("label", null, sb, " sottrai il bianco"), h("label", null, nm, " normalizza sul controllo (= 100 %)")), mk("layout", "Layout (nome del gruppo)"), mk("vals", "Valori letti")), sync: () => {} };
+  },
+  analyze: st => {
+    const warns = [], wells = [];
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 12; c++) {
+      const lab = (st.layout[r][c] || "").trim(), v = nz(st.vals[r][c]);
+      if (lab && isFinite(v)) wells.push({ lab, v });
+      else if (lab && (st.vals[r][c] || "").trim()) warns.push("Valore non numerico in " + PLATE_ROWS[r] + (c + 1) + ".");
+      else if (isFinite(v) && !lab) warns.push("Pozzetto " + PLATE_ROWS[r] + (c + 1) + " con valore ma senza nome nel layout: ignorato.");
+    }
+    const isB = l => l.toLowerCase() === (st.blank || "").trim().toLowerCase(), isC = l => l.toLowerCase() === (st.ctrl || "").trim().toLowerCase();
+    let bl = 0;
+    if (st.subBlank) { const b = wells.filter(w => isB(w.lab)).map(w => w.v); if (b.length) bl = mean(b); else warns.push("Nessun pozzetto «" + st.blank + "»: il bianco non è stato sottratto."); }
+    let data = wells.filter(w => !(st.subBlank && isB(w.lab))).map(w => ({ lab: w.lab, v: w.v - bl }));
+    let scale = 1, unit = "";
+    if (st.norm) { const c = data.filter(w => isC(w.lab)).map(w => w.v); if (c.length && mean(c) !== 0) { scale = 100 / mean(c); unit = " (% del controllo)"; } else warns.push("Nessun pozzetto «" + st.ctrl + "»: nessuna normalizzazione."); }
+    data = data.map(w => ({ lab: w.lab, v: w.v * scale }));
+    const labs = Array.from(new Set(data.map(w => w.lab))), chart = { kind: "bars", title: "", xlabel: "", ylabel: "Valore" + unit, series: [], bars: [] };
+    labs.forEach(l => { const ys = data.filter(w => w.lab === l).map(w => w.v); chart.bars.push({ label: l, ys, mean: mean(ys), sd: sdev(ys), n: ys.length }); });
+    if (!labs.length) return { chart: null, summary: "", table: [], warns: warns.concat(["Inserisci layout e valori."]) };
+    const table = [["Gruppo", "n", "Media" + unit, "DS"]].concat(chart.bars.map(b => [b.label, String(b.n), fmt(b.mean, 4), fmt(b.sd, 3)]));
+    const lines = [];
+    if (bl) lines.push("Bianco sottratto: " + fmt(bl, 4) + ".");
+    const groups = chart.bars.filter(b => !isC(b.label) || chart.bars.length <= 2).map(b => b.ys);
+    if (chart.bars.length === 2) { const w = welch(chart.bars[0].ys, chart.bars[1].ys); if (w) { lines.push("Test t di Welch: " + fmtP(w.p) + " (" + pStars(w.p) + ")."); chart.note = fmtP(w.p) + " (" + pStars(w.p) + ")"; } }
+    else if (chart.bars.length > 2) { const a = anova1(chart.bars.map(b => b.ys)); if (a) { lines.push("ANOVA a una via: F(" + a.d1 + ", " + a.d2 + ") = " + fmt(a.F, 3) + ", " + fmtP(a.p) + " (" + pStars(a.p) + ")."); chart.note = "ANOVA " + fmtP(a.p) + " (" + pStars(a.p) + ")"; } }
+    if (chart.bars.some(b => b.n < 3)) warns.push("Alcuni gruppi hanno meno di 3 pozzetti.");
+    return { chart, summary: lines.join("\n"), table, warns: Array.from(new Set(warns)) };
+  }
+};
+
+// ---------- Finestra per i tipi strutturati ----------
+function openStructured(ds, kindId) {
+  if (curId == null) return;
+  const def = KIND_DEFS[kindId], pl = ds ? ds.payload : {};
+  const st = (pl && pl.state) ? JSON.parse(JSON.stringify(pl.state)) : def.init();
+  const title = h("input", { type: "text", placeholder: "Titolo", maxlength: "120" }); title.value = ds ? ds.title : STRUCT_KINDS[kindId];
+  const prev = h("div", { class: "dsprev" }), summ = h("div", { class: "dssum" }), warnBox = h("div", { class: "warn", style: "font-size:13px" });
+  let ed = null, last = null, timer = null;
+  const refresh = () => {
+    try {
+      if (ed && ed.sync) ed.sync();
+      last = def.analyze(st);
+      if (ed && ed.after) ed.after();
+      prev.innerHTML = last.chart ? chartSVG(last.chart) : ""; prev.style.display = last.chart ? "" : "none";
+      summ.textContent = last.summary || ""; warnBox.textContent = last.warns.length ? "⚠️ " + last.warns.join(" · ") : "";
+    } catch (e) { warnBox.textContent = "Errore nel calcolo: " + e.message; }
+  };
+  const on = () => { clearTimeout(timer); timer = setTimeout(refresh, 200); };
+  ed = def.build(st, on);
+  const close = () => bg.remove();
+  const persist = async () => {
+    refresh();
+    if (!last.table.length && !last.summary) { alert("Compila prima i dati."); return null; }
+    const r = await api("ds_save", { id: ds ? ds.id : null, exp: curId, title: title.value.trim() || STRUCT_KINDS[kindId], kind: kindId, payload: { state: st, summary: last.summary, table: last.table } });
+    if (ds) ds.id = r.id; else ds = { id: r.id };
+    return r.id;
+  };
+  const save = h("button", { class: "btn green", onclick: async () => { try { if (await persist() == null) return; close(); await refreshDs(); status("✅ Dati salvati", 2500); } catch (e) { fail(e); } } }, "💾 Salva i dati");
+  const attach = h("button", { class: "btn violet", onclick: async () => {
+    try {
+      if (await persist() == null) return;
+      if (!last.chart) { close(); await refreshDs(); return; }
+      status("🖼️ Creo l'immagine del grafico…");
+      const png = await svgToPng(chartSVG(Object.assign({}, last.chart, { title: title.value.trim() })));
+      const pad = n => String(n).padStart(2, "0"), dt = new Date();
+      const stamp = dt.getFullYear() + pad(dt.getMonth() + 1) + pad(dt.getDate()) + "-" + pad(dt.getHours()) + pad(dt.getMinutes()) + pad(dt.getSeconds());
+      const nm = (title.value.trim().replace(/[^\w.\- ]+/g, "").replace(/\s+/g, "_").slice(0, 50) || "grafico");
+      close();
+      await uploadFiles([new File([png], "grafico-" + nm + "-" + stamp + ".png", { type: "image/png" })]);
+      await refreshDs();
+    } catch (e) { fail(e); }
+  } }, "🖼️ Salva e allega il grafico");
+  const hasChart = ["plate", "qpcr", "cfu", "mic"].indexOf(kindId) >= 0;
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, TOOLS[kindId] ? TOOLS[kindId].icon + " " + TOOLS[kindId].label : STRUCT_KINDS[kindId]),
+    h("div", { class: "dsgrid" }, h("div", { class: "dsleft" + (hasChart ? "" : " full"), style: hasChart ? "" : "flex-basis:100%" }, title, h("div", { class: "hint" }, def.hint), ed.el), hasChart ? h("div", { class: "dsright" }, prev, warnBox, summ) : h("div", { class: "dsright", style: "flex-basis:100%" }, warnBox, summ)),
+    h("div", { class: "btns" }, save, hasChart ? attach : null, h("button", { class: "btn grey", onclick: close }, "Chiudi"))
+  ]);
+  bg.querySelector(".modal").classList.add("wide");
+  refresh();
+}
+
+async function refreshDs() {
+  if (curId == null) return;
+  const r = await api("ds_list", { exp: curId });
+  renderDs(r.datasets);
+}
+function renderDs(list) {
+  const box = $("dslist"); box.innerHTML = "";
+  if (!list.length) { box.append(h("div", { class: "muted" }, "Nessuna tabella di dati. Aggiungi misure, curve dose-risposta o confronti tra gruppi: compaiono anche nel Word.")); return; }
+  list.forEach(d => {
+    const sum = (d.payload && d.payload.summary) ? d.payload.summary.split("\n")[0] : "";
+    box.append(h("div", { class: "att" }, h("span", null, "📈"),
+      h("span", { class: "nm" }, d.title, h("div", { class: "muted", style: "font-size:12px" }, (DS_KINDS[d.kind] || "") + (sum ? " · " + sum : ""))),
+      h("button", { class: "btn violet small", onclick: () => openAny(d) }, "Apri"),
+      h("button", { class: "btn red small", onclick: async () => { if (!confirm("Eliminare questa tabella di dati?")) return; try { await api("ds_delete", { id: d.id }); await refreshDs(); } catch (e) { fail(e); } } }, "✕")));
+  });
+}
+
+
 // ---------- avvio ----------
 function build() {
   const box = $("sections");
@@ -2332,6 +3545,8 @@ function build() {
   $("btnSync").onclick = () => syncDrive(false).catch(fail);
   $("btnChem").onclick = () => openChemDraw().catch(fail);
   $("btnPasteChem").onclick = () => pasteChem(false).catch(fail);
+  $("btnSector").onclick = () => openSectors(false);
+
   try { const e = localStorage.getItem("diario_engine"); if (e === "claude" || e === "gemini") $("engine").value = e; } catch (e) {}
   $("engine").addEventListener("change", () => { try { localStorage.setItem("diario_engine", $("engine").value); } catch (e) {} });
   $("btnNewGroup").onclick = () => newGroup(null).catch(fail);
@@ -2399,8 +3614,11 @@ function build() {
 
 (async () => {
   build();
+  let firstRun = false;
+  try { firstRun = await loadSectors(); } catch (e) {}
   const d = await api("list", { q: "" });
   if (d.items.length) await openExp(d.items[0].id); else await newExp();
+  if (firstRun) openSectors(true);
 })().catch(fail);
 </script>
 </body>

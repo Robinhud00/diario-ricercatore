@@ -63,6 +63,20 @@ Nella cartella scelta l'app crea **Diario del Ricercatore/** con:
 
 Si aggiorna da solo ogni 5 minuti se hai fatto modifiche, a ogni «📄 Esporta in Word» e con il pulsante **☁️ Sincronizza con Drive**. Il database di lavoro resta sempre in `~/DiarioRicercatore/` (non in Drive: una cartella sincronizzata può rovinare un database aperto). È una copia a senso unico: le modifiche fatte su Drive non tornano nel Diario.
 
+## 🧭 Settori e strumenti
+Al primo avvio scegli il tuo settore (anche più di uno); il pulsante **🧭 Settore** lo cambia. Il primo settore scelto decide i titoli delle sezioni (per esempio «Materiali e metodi» per biologia e microbiologia), i titoli nel Word e lo stile dell'AI. Nella scheda **📈 Dati e grafici** di ogni esperimento compaiono gli strumenti del tuo settore; «Altri strumenti…» apre tutti gli altri. Ogni strumento si salva nell'esperimento e finisce nel Word (riassunto, tabella e, se vuoi, il grafico).
+
+| Settore | Strumenti |
+|---|---|
+| **Chimica (sintesi)** | Reagenti e rese (mmol, equivalenti, concentrazione, resa dal reagente limitante), scheda di caratterizzazione (aspetto, p.f., Rf, NMR, MS, HPLC, IR, [α]D), disegno molecole e ChemDraw |
+| **Farmacologia / biochimica** | Dose-risposta con IC50/EC50 e intervallo di confidenza al 95% (fit a 4 parametri), cinetica enzimatica (Km, Vmax), scheda del saggio, confronto tra gruppi |
+| **Biologia molecolare e cellulare** | Piastra a 96 pozzetti (layout e valori, sottrazione del bianco, normalizzazione, test), qPCR (ΔCt, ΔΔCt, fold change), scheda campioni e reagenti (linea cellulare, anticorpi e lotti) |
+| **Microbiologia** | Conte CFU (30-300 colonie, diluizioni), MIC, curva di crescita (tempo di raddoppio), scheda ceppo e condizioni |
+| **Materiali / fisica / ingegneria** | Misure x-y con fit (retta, polinomio, esponenziale, legge di potenza), tabella libera con grafico, scheda materiale e condizioni di misura |
+| **Informatica e dati** | Tabella parametri/metriche con grafico, confronto tra gruppi, scheda ambiente e riproducibilità (commit, versioni, seed, hardware) |
+
+**Grafici di testo** (dose-risposta, x-y, barre, tabella libera): incolla i dati da Excel (tab o «;»), il grafico si aggiorna mentre scrivi. Asse x e y anche logaritmici. Barre con media ± DS e singoli punti, test t di Welch o ANOVA. I calcoli (fit, intervalli di confidenza, p) sono stati confrontati con SciPy.
+
 ## ⚗️ ChemDraw
 Il pulsante **⚗️ ChemDraw** in alto apre l'app ChemDraw. La cerca da sola in Applicazioni (Mac) o in Programmi (Windows, `ChemDraw.exe`); se non la trova ti chiede il nome (es. `ChemDraw 23.1`) o il percorso e se lo ricorda. Puoi cambiarlo in "🔑 Chiavi API e impostazioni".
 

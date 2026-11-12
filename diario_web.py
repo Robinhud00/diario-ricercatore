@@ -321,8 +321,19 @@ def api_get(d):
         con.close()
         raise RuntimeError("Esperimento non trovato.")
     atts = con.execute("SELECT id,filename FROM attachments WHERE exp_id=? ORDER BY id", (row["id"],)).fetchall()
+    tr = con.execute("SELECT * FROM translations WHERE exp_id=?", (row["id"],)).fetchone()
     con.close()
-    return {"exp": dict(row), "attachments": [dict(a) for a in atts]}
+    return {"exp": dict(row), "attachments": [dict(a) for a in atts], "translation": dict(tr) if tr else None}
+
+
+def api_tr_save(d):
+    """Salva le modifiche fatte a mano alla versione inglese (il Word inglese si aggiorna da solo)."""
+    con = db()
+    con.execute("UPDATE translations SET name=?,obiettivo=?,procedura=?,risultati=?,note=?,updated=? WHERE exp_id=?",
+                (s(d.get("name")).strip(), s(d.get("obiettivo")), s(d.get("procedura")), s(d.get("risultati")), s(d.get("note")), now(), int(d["id"])))
+    con.commit()
+    con.close()
+    return {}
 
 
 def api_new(d):
@@ -1447,6 +1458,342 @@ _last_req = {"t": time.time()}
 _server = {"srv": None}
 
 
+def api_ui_lang(d):
+    cfg = load_cfg()
+    cfg["ui_lang"] = "en" if d.get("lang") == "en" else "it"
+    save_cfg(cfg)
+    return {"lang": cfg["ui_lang"]}
+
+
+LOGO_PNG_B64 = (
+    "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"
+    "/z9EwyeTeFY6QAAAAABJRU5ErkJggg=="
+)
+
+
+def logo_png():
+    import base64
+    return base64.b64decode(LOGO_PNG_B64)
+
+
+def logo_icns():
+    """Icona Mac (.icns) che contiene il PNG 256x256."""
+    png = logo_png()
+    chunk = b"ic08" + struct.pack(">I", len(png) + 8) + png
+    return b"icns" + struct.pack(">I", len(chunk) + 8) + chunk
+
+
+def logo_ico():
+    """Icona Windows (.ico) che contiene il PNG 256x256."""
+    png = logo_png()
+    return struct.pack("<HHH", 0, 1, 1) + struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png), 22) + png
+
+
+def make_shortcut():
+    """Crea sulla Scrivania l'icona del Diario (Mac: una vera .app; Windows: un collegamento). Ritorna il percorso."""
+    if getattr(sys, "frozen", False):
+        raise RuntimeError("Stai gia' usando l'app pronta: trascinala dove preferisci.")
+    script = os.path.abspath(__file__)
+    name = "Diario del Ricercatore"
+    if IS_MAC:
+        app = os.path.join(os.path.expanduser("~/Desktop"), name + ".app")
+        macos = os.path.join(app, "Contents", "MacOS")
+        os.makedirs(macos, exist_ok=True)
+        res = os.path.join(app, "Contents", "Resources")
+        os.makedirs(res, exist_ok=True)
+        with open(os.path.join(res, "diario.icns"), "wb") as f:
+            f.write(logo_icns())
+        with open(os.path.join(app, "Contents", "Info.plist"), "w", encoding="utf-8") as f:
+            f.write('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                    '<plist version="1.0"><dict><key>CFBundleName</key><string>%s</string><key>CFBundleExecutable</key><string>diario</string><key>CFBundleIconFile</key><string>diario</string>'
+                    '<key>CFBundleIdentifier</key><string>com.scifail.diario</string><key>CFBundlePackageType</key><string>APPL</string>'
+                    '<key>CFBundleVersion</key><string>1</string><key>LSUIElement</key><true/></dict></plist>\n' % name)
+        launcher = os.path.join(macos, "diario")
+        with open(launcher, "w", encoding="utf-8") as f:
+            f.write('#!/bin/bash\nPY="%s"\n[ -x "$PY" ] || PY="$(command -v python3)"\n'
+                    'if [ ! -f "%s" ]; then osascript -e \'display dialog "Diario non trovato: la cartella risulta spostata. Apri di nuovo Avvia Diario dalla nuova posizione e ricrea la sua icona." buttons {"OK"}\'; exit 1; fi\n'
+                    'exec "$PY" "%s"\n' % (sys.executable, script, script))
+        os.chmod(launcher, 0o755)
+        try:  # fa rileggere l'icona al Finder
+            os.utime(app, None)
+            subprocess.run(["touch", app], capture_output=True)
+        except OSError:
+            pass
+        return app
+    if IS_WIN:
+        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        exe = pyw if os.path.exists(pyw) else sys.executable
+        os.makedirs(APP_DIR, exist_ok=True)
+        ico = os.path.join(APP_DIR, "diario.ico")
+        with open(ico, "wb") as f:
+            f.write(logo_ico())
+        ps = ("$d=[Environment]::GetFolderPath('Desktop'); $p=Join-Path $d '%s.lnk'; $s=(New-Object -ComObject WScript.Shell).CreateShortcut($p); "
+              "$s.TargetPath='%s'; $s.Arguments='\"%s\"'; $s.WorkingDirectory='%s'; $s.IconLocation='%s'; $s.Description='Diario del Ricercatore'; $s.Save(); Write-Output $p"
+              % (name, exe.replace("'", "''"), script.replace("'", "''"), os.path.dirname(script).replace("'", "''"), ico.replace("'", "''")))
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=40)
+        out = (r.stdout or "").strip().splitlines()
+        if r.returncode != 0 or not out:
+            raise RuntimeError("Non riesco a creare il collegamento: " + (r.stderr or "").strip()[:200])
+        return out[-1]
+    raise RuntimeError("L'icona si puo' creare solo su Mac e Windows.")
+
+
+def api_shortcut(d):
+    p = make_shortcut()
+    cfg = load_cfg()
+    cfg["shortcut_v2"] = True
+    save_cfg(cfg)
+    return {"path": p}
+
+
+UPDATE_URL = "https://raw.githubusercontent.com/Robinhud00/diario-ricercatore/main/diario_web.py"
+
+
+def _download_update():
+    """Scarica l'ultima versione da GitHub. Ritorna (bytes, uguale_a_quella_installata)."""
+    import hashlib
+    if getattr(sys, "frozen", False):
+        raise RuntimeError("Questa e' l'app pronta: per aggiornarla scarica la nuova versione dalla pagina Releases di GitHub.")
+    tmp = tempfile.mkdtemp(prefix="diario-upd-")
+    try:
+        out = os.path.join(tmp, "diario_web.py")
+        try:
+            r = subprocess.run(["curl", "-fsSL", "--max-time", "40", "-o", out, UPDATE_URL], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError("Non riesco a contattare GitHub: controlla la connessione a internet.")
+        if r.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError("Non riesco a scaricare l'aggiornamento da GitHub: controlla la connessione a internet.")
+        with open(out, "rb") as f:
+            new = f.read()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    with open(os.path.abspath(__file__), "rb") as f:
+        cur = f.read()
+    norm = lambda b: b.replace(b"\r\n", b"\n")
+    return new, hashlib.sha256(norm(new)).digest() == hashlib.sha256(norm(cur)).digest()
+
+
+def api_update_check(d):
+    new, same = _download_update()
+    return {"available": not same}
+
+
+def api_update_apply(d):
+    new, same = _download_update()
+    if same:
+        return {"updated": False}
+    try:
+        src = new.decode("utf-8")
+        compile(src, "diario_web.py", "exec")
+    except (UnicodeDecodeError, SyntaxError, ValueError):
+        raise RuntimeError("Il file scaricato non e' valido: aggiornamento annullato, il Diario resta com'e'.")
+    if "def main()" not in src or "Diario del Ricercatore" not in src or len(new) < 50000:
+        raise RuntimeError("Il file scaricato non sembra il Diario: aggiornamento annullato.")
+    script = os.path.abspath(__file__)
+    bdir = os.path.join(APP_DIR, "versioni_precedenti")
+    os.makedirs(bdir, exist_ok=True)
+    shutil.copy2(script, os.path.join(bdir, "diario_web-%s.py" % datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
+    tmp = script + ".nuovo"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(new)
+        os.replace(tmp, script)
+    except OSError:
+        raise RuntimeError("Non riesco a scrivere nella cartella del Diario: controlla i permessi.")
+
+    def _restart():
+        kw = {"creationflags": 0x00000008 | 0x00000200 | 0x08000000} if IS_WIN else {"start_new_session": True}
+        # il nuovo programma si accorge della versione vecchia ancora accesa, la chiude e parte lui
+        subprocess.Popen([sys.executable, script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    threading.Timer(0.5, _restart).start()
+    return {"updated": True}
+
+
 def api_ping(d):
     return {"app": "diario-ricercatore"}
 
@@ -1474,7 +1821,7 @@ def api_quit(d):
     return {"ok": True}
 
 
-READONLY_ROUTES = {"/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
+READONLY_ROUTES = {"/api/update_check", "/api/update_apply", "/api/ui_lang", "/api/shortcut", "/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
 
 
 def docs_kick():
@@ -2057,7 +2404,7 @@ def api_set_keys(d):
 ROUTES = {
     "/api/list": api_list, "/api/get": api_get, "/api/new": api_new, "/api/save": api_save,
     "/api/delete": api_delete, "/api/att_open": api_att_open, "/api/att_reveal": api_att_reveal,
-    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/docs_reorganize": api_docs_reorganize, "/api/docs_open": api_docs_open, "/api/translate": api_translate, "/api/merge": api_merge, "/api/projects": api_projects, "/api/ping": api_ping, "/api/quit": api_quit, "/api/sector_set": api_sector_set,
+    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/docs_reorganize": api_docs_reorganize, "/api/docs_open": api_docs_open, "/api/translate": api_translate, "/api/tr_save": api_tr_save, "/api/merge": api_merge, "/api/ui_lang": api_ui_lang, "/api/update_check": api_update_check, "/api/update_apply": api_update_apply, "/api/shortcut": api_shortcut, "/api/projects": api_projects, "/api/ping": api_ping, "/api/quit": api_quit, "/api/sector_set": api_sector_set,
     "/api/ds_list": api_ds_list, "/api/ds_save": api_ds_save, "/api/ds_delete": api_ds_delete, "/api/ai": api_ai, "/api/key_status": api_key_status,
     "/api/set_keys": api_set_keys, "/api/export": api_export,
     "/api/chemdraw_open": api_chemdraw_open, "/api/chemdraw_set": api_chemdraw_set,
@@ -2096,13 +2443,21 @@ class Handler(BaseHTTPRequestHandler):
         _last_req["t"] = time.time()
         if path == "/api/ping":
             return self.send_json({"app": "diario-ricercatore"})
+        if path in ("/favicon.ico", "/logo.png"):
+            data = logo_png()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            return self.wfile.write(data)
         if path == "/att":
             return self.serve_attachment(parsed.query)
         if path.startswith("/jsme/"):
             return self.serve_jsme(path[len("/jsme/"):])
         if path != "/":
             return self.send_error(404)
-        data = PAGE.replace("__TOKEN__", TOKEN).replace("__JSME__", jsme_url()).encode("utf-8")
+        data = PAGE.replace("__TOKEN__", TOKEN).replace("__JSME__", jsme_url()).replace("__UILANG__", "en" if load_cfg().get("ui_lang") == "en" else "it").encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -2205,7 +2560,8 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>🔬 Diario del Ricercatore</title>
+<title>Diario del Ricercatore</title>
+<link rel="icon" type="image/png" href="/logo.png">
 <style>
 :root{--v:#7C3AED;--vd:#5B21B6;--vl:#EDE9FE;--g:#10B981;--b:#3B82F6;--o:#F59E0B;--r:#EC4899;--bg:#F8F7FF}
 *{box-sizing:border-box}
@@ -2313,21 +2669,36 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
 <body>
 <div class="app">
   <aside>
-    <div class="logo">🔬 Diario del<br>Ricercatore</div>
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:6px">
+      <div class="logo">🔬 Diario del<br>Ricercatore</div>
+      <button class="btn ghost" id="btnLangTop" style="padding:6px 9px;font-size:13px;white-space:nowrap" title="Interface in English / Interfaccia in italiano">🇬🇧 English</button>
+    </div>
+    <button class="btn green" id="btnUpdateNow" hidden style="width:100%;margin-bottom:8px">⬆️ Nuova versione: aggiorna ora</button>
     <div class="sbrow">
       <button class="btn orange" id="btnNew" style="flex:1.25" title="Nuovo esperimento">＋ Esperimento</button>
       <button class="btn ghost" id="btnNewGroup" style="flex:1" title="Crea un gruppo per raggruppare gli esperimenti">📁＋ Gruppo</button>
     </div>
     <input id="search" placeholder="🔍 Cerca esperimento…">
     <div id="list"></div>
+    <div class="sbrow" style="margin-top:8px">
+      <button class="btn ghost" id="btnMenuDocs" style="flex:1" title="Cartella dei documenti, documento unico di progetto, Google Drive">📂 Documenti ▾</button>
+      <button class="btn ghost" id="btnMenuSet" style="flex:1" title="Settore, chiavi API, lingua, icona sul Desktop">⚙️ Impostazioni ▾</button>
+    </div>
+    <div class="sbrow">
+      <button class="btn ghost" style="flex:1" id="btnArchive">📦 Archivio</button>
+      <button class="btn ghost" id="btnQuit" style="flex:1" title="Salva e ferma il Diario">⏻ Chiudi</button>
+    </div>
+    <div hidden>
+    <button class="btn ghost" id="btnUpdate">⬆️ Cerca aggiornamenti</button>
     <button class="btn ghost" id="btnSector">🧭 Settore</button>
-    <button class="btn ghost" id="btnArchive">📦 Archivio</button>
     <button class="btn ghost" id="btnSync" title="Salva Word e copia di sicurezza nella cartella di Google Drive">☁️ Sincronizza con Drive</button>
     <button class="btn ghost" id="btnMerge" title="Crea un unico Word con tutti gli esperimenti di un gruppo o di un progetto">📚 Documento di progetto</button>
     <button class="btn ghost" id="btnDocs" title="Apre la cartella con i Word e gli allegati, ordinati per gruppo e sottogruppo">📂 Cartella documenti</button>
     <button class="btn ghost" id="btnReorg" title="Rimette in ordine tutti i documenti gia' esistenti (gruppo / sottogruppo / esperimento). Non cancella nulla.">🗂️ Riordina documenti</button>
-    <button class="btn ghost" id="btnQuit" title="Salva e ferma il Diario">⏻ Chiudi il Diario</button>
+    <button class="btn ghost" id="btnUiLang" title="Change the interface language / Cambia la lingua dell'interfaccia">🌐 English</button>
+    <button class="btn ghost" id="btnShortcut" title="Crea l'icona del Diario sulla Scrivania, cosi' si apre con un doppio clic">🖥️ Crea icona sul Desktop</button>
     <button class="btn ghost" id="btnKey">🔑 Chiavi API e impostazioni</button>
+    </div>
   </aside>
   <main>
     <div class="card">
@@ -2336,7 +2707,6 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
         <input id="date" placeholder="Data">
         <input id="project" placeholder="Progetto / molecola target">
         <button class="btn green" id="btnSave">💾 Salva</button>
-        <button class="btn orange" id="btnChem" title="Apre l'app ChemDraw">⚗️ ChemDraw</button>
         <button class="btn blue" id="btnExport" title="Crea un documento Word di questo esperimento">📄 Esporta in Word</button>
         <button class="btn red" id="btnDel" title="Elimina esperimento">🗑</button>
       </div>
@@ -2345,11 +2715,13 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
         <select id="groupsel"></select>
       </div>
     </div>
+    <div id="enBanner" hidden style="background:#DBEAFE;border:2px solid #3B82F6;color:#1E3A8A;border-radius:14px;padding:10px 14px;margin-bottom:12px;font-weight:600">🇬🇧 Stai guardando la versione inglese. Le modifiche che fai qui cambiano solo il documento «English version»; il testo originale non viene toccato.</div>
     <div class="card bar" id="aibar"><span class="ailabel" id="ailabel"></span>
       <select id="lang" title="Lingua in cui scrivi questa voce (l'AI e il Word la useranno)">
         <option value="">🌐 Lingua della voce: nativa</option>
         <option value="en">🇬🇧 Lingua della voce: English</option>
       </select>
+      <button class="btn blue" id="btnView" hidden title="Passa dal testo originale alla versione inglese e viceversa">🇬🇧 Vedi versione inglese</button>
       <select id="engine" title="Quale intelligenza artificiale usare">
         <option value="claude">🟣 Claude</option>
         <option value="gemini">🔵 Gemini</option>
@@ -2367,7 +2739,8 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
       <div class="topline">
         <div class="h2" style="margin:0">📎 Allegati (ChemDraw e altri file)</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn orange" id="btnPasteChem" title="Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)">📋 Incolla da ChemDraw</button>
+          <button class="btn orange" id="btnChem" title="Apre l'app ChemDraw">⚗️ Apri ChemDraw</button>
+        <button class="btn orange" id="btnPasteChem" title="Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)">📋 Incolla da ChemDraw</button>
           <button class="btn violet" id="btnDraw" title="Disegna una molecola o uno schema e allegalo all'esperimento">🧪 Disegna molecola</button>
           <button class="btn blue" id="btnAdd">＋ Aggiungi file</button>
         </div>
@@ -2383,6 +2756,55 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
 <script>
 const TOKEN = "__TOKEN__";
 const JSME_URL = "__JSME__";
+// ---------- Interfaccia in inglese ----------
+const UI_LANG = "__UILANG__";
+const EN_PAIRS = [["🔬 Diario del Ricercatore", "🔬 Researcher's Diary"], ["＋ Esperimento", "＋ Experiment"], ["📁＋ Gruppo", "📁＋ Group"], ["Crea un gruppo per raggruppare gli esperimenti", "Create a group to organise experiments"], ["🔍 Cerca esperimento…", "🔍 Search experiments…"], ["🧭 Settore", "🧭 Field"], ["☁️ Sincronizza con Drive", "☁️ Sync with Drive"], ["Salva Word e copia di sicurezza nella cartella di Google Drive", "Save Word files and a backup copy to the Google Drive folder"], ["📚 Documento di progetto", "📚 Project document"], ["Crea un unico Word con tutti gli esperimenti di un gruppo o di un progetto", "Create a single Word file with all experiments of a group or project"], ["📂 Cartella documenti", "📂 Documents folder"], ["Apre la cartella con i Word e gli allegati, ordinati per gruppo e sottogruppo", "Opens the folder with Word files and attachments, organised by group and subgroup"], ["🗂️ Riordina documenti", "🗂️ Reorganise documents"], ["Rimette in ordine tutti i documenti gia' esistenti (gruppo / sottogruppo / esperimento). Non cancella nulla.", "Reorganises all existing documents (group / subgroup / experiment). Nothing is deleted."], ["⏻ Chiudi il Diario", "⏻ Close the Diary"], ["Salva e ferma il Diario", "Save and stop the Diary"], ["🔑 Chiavi API e impostazioni", "🔑 API keys and settings"], ["Nome dell'esperimento (es. NG012 – step 3)", "Experiment name (e.g. NG012 – step 3)"], ["Data", "Date"], ["Progetto / molecola target", "Project / target molecule"], ["💾 Salva", "💾 Save"], ["Apre l'app ChemDraw", "Opens the ChemDraw app"], ["📄 Esporta in Word", "📄 Export to Word"], ["Crea un documento Word di questo esperimento", "Create a Word document of this experiment"], ["Elimina esperimento", "Delete experiment"], ["📁 Gruppo:", "📁 Group:"], ["🌐 Lingua della voce: nativa", "🌐 Entry language: native"], ["🇬🇧 Lingua della voce: English", "🇬🇧 Entry language: English"], ["Lingua in cui scrivi questa voce (l'AI e il Word la useranno)", "Language you write this entry in (AI and Word will use it)"], ["Quale intelligenza artificiale usare", "Which AI to use"], ["📈 Dati e grafici", "📈 Data and charts"], ["📎 Allegati (ChemDraw e altri file)", "📎 Attachments (ChemDraw and other files)"], ["📋 Incolla da ChemDraw", "📋 Paste from ChemDraw"], ["Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)", "Paste the structure copied from ChemDraw into the experiment (Cmd+C / Ctrl+C in ChemDraw)"], ["🧪 Disegna molecola", "🧪 Draw molecule"], ["Disegna una molecola o uno schema e allegalo all'esperimento", "Draw a molecule or scheme and attach it to the experiment"], ["＋ Aggiungi file", "＋ Add file"], ["🎯 Obiettivo", "🎯 Objective"], ["🎯 Obiettivo e ipotesi", "🎯 Objective and hypothesis"], ["Qual è lo scopo dell'esperimento?", "What is the purpose of the experiment?"], ["Domanda biologica e ipotesi da verificare.", "Biological question and hypothesis to test."], ["Bersaglio, composti, domanda a cui risponde il saggio.", "Target, compounds, question the assay answers."], ["Ceppi, composti e domanda a cui risponde l'esperimento.", "Strains, compounds and question the experiment answers."], ["Domanda di ricerca, ipotesi, metrica di successo.", "Research question, hypothesis, success metric."], ["🧪 Procedura sperimentale", "🧪 Experimental procedure"], ["Scrivi qui appunti e procedura, anche in modo disordinato: l'AI li metterà in forma.", "Write your notes and procedure here, even messily: the AI will put them in shape."], ["🧫 Saggio e condizioni", "🧫 Assay and conditions"], ["Bersaglio/enzima, composti e concentrazioni, tampone, incubazione, rivelazione, controlli…", "Target/enzyme, compounds and concentrations, buffer, incubation, detection, controls…"], ["🧬 Materiali e metodi", "🧬 Materials and methods"], ["Linee cellulari e passaggio, trattamenti, anticorpi (diluizioni, lotti), kit, protocollo…", "Cell lines and passage, treatments, antibodies (dilutions, lots), kits, protocol…"], ["🦠 Materiali e metodi", "🦠 Materials and methods"], ["Ceppi, terreni, condizioni di crescita, inoculo, metodo (CFU, MIC, curve), controlli…", "Strains, media, growth conditions, inoculum, method (CFU, MIC, curves), controls…"], ["🔧 Preparazione e condizioni di misura", "🔧 Preparation and measurement conditions"], ["Materiale e lotto, processo, parametri, strumento e calibrazione, condizioni ambientali…", "Material and lot, process, parameters, instrument and calibration, environmental conditions…"], ["💻 Metodo e configurazione", "💻 Method and configuration"], ["Dati e versione, modello, iperparametri, seed, hardware, comando eseguito…", "Data and version, model, hyperparameters, seed, hardware, command run…"], ["📊 Risultati e osservazioni", "📊 Results and observations"], ["Rese, aspetto, TLC, NMR, osservazioni…", "Yields, appearance, TLC, NMR, observations…"], ["📊 Risultati (IC50, Ki, inibizione)", "📊 Results (IC50, Ki, inhibition)"], ["Valori ottenuti, confronto con i riferimenti, osservazioni…", "Values obtained, comparison with references, observations…"], ["Espressione, bande, immagini, repliche, osservazioni…", "Expression, bands, images, replicates, observations…"], ["📊 Risultati (conte, MIC, crescita)", "📊 Results (counts, MIC, growth)"], ["Conte, MIC, tempi di raddoppio, osservazioni…", "Counts, MIC, doubling times, observations…"], ["📊 Misure e risultati", "📊 Measurements and results"], ["Valori misurati, incertezze, confronto con le attese…", "Measured values, uncertainties, comparison with expectations…"], ["📊 Risultati e metriche", "📊 Results and metrics"], ["Metriche, confronti con la baseline, osservazioni…", "Metrics, comparison with baseline, observations…"], ["📝 Note e prossimi passi", "📝 Notes and next steps"], ["✨ Stila", "✨ Draft"], ["🔤 Correggi", "🔤 Proofread"], ["🌍 Versione inglese (nuovo Word)", "🌍 English version (new Word file)"], ["💡 Suggerisci titolo", "💡 Suggest title"], ["🪄 Istruzione libera", "🪄 Free instruction"], ["Nessun allegato. Aggiungi o trascina qui i tuoi schemi ChemDraw.", "No attachments. Add or drag your ChemDraw schemes here."], ["💡 Per vedere gli schemi nel Word:", "💡 To see the schemes in Word:"], ["Per vedere gli schemi nel Word:", "To see the schemes in Word:"], ["Nessuna tabella di dati. Aggiungi misure, curve dose-risposta o confronti tra gruppi: compaiono anche nel Word.", "No data tables. Add measurements, dose-response curves or group comparisons: they also appear in the Word file."], ["＋ Scegli lo strumento", "＋ Choose a tool"], ["＋ Altri strumenti…", "＋ More tools…"], ["Apri", "Open"], ["Chiudi", "Close"], ["Annulla", "Cancel"], ["Salva", "Save"], ["💾 Salva i dati", "💾 Save data"], ["🖼️ Salva e allega il grafico", "🖼️ Save and attach chart"], ["✅ Sostituisci", "✅ Replace"], ["➕ Aggiungi sotto", "➕ Add below"], ["Nessun esperimento.", "No experiments."], ["Nessun risultato", "No results"], ["Vuoto: trascina qui degli esperimenti", "Empty: drag experiments here"], ["(senza nome)", "(untitled)"], ["Senza nome", "Untitled"], ["(archiviato)", "(archived)"], ["Azioni del gruppo", "Group actions"], ["🧪  Nuovo esperimento in questo gruppo", "🧪  New experiment in this group"], ["📁  Nuovo sottogruppo", "📁  New subgroup"], ["📚  Unisci tutto in un documento…", "📚  Merge everything into one document…"], ["✎  Rinomina", "✎  Rename"], ["📦  Archivia (scompare dall'elenco)", "📦  Archive (disappears from the list)"], ["🗑  Elimina il gruppo…", "🗑  Delete group…"], ["↩  Ripristina nell'elenco", "↩  Restore to the list"], ["📦 Archivio", "📦 Archive"], ["← Torna ai miei esperimenti", "← Back to my experiments"], ["📦 Archivio: qui ci sono i gruppi archiviati. Per rimetterne uno nell'elenco clicca ⋯ → Ripristina.", "📦 Archive: archived groups are here. To put one back in the list click ⋯ → Restore."], ["Nessun gruppo archiviato.", "No archived groups."], ["— nessun gruppo —", "— no group —"], ["Nome del gruppo:", "Group name:"], ["Nome del sottogruppo:", "Subgroup name:"], ["Nome del nuovo gruppo (es. Progetto NG012):", "New group name (e.g. Project NG012):"], ["Eliminare questo esperimento e i suoi allegati?", "Delete this experiment and its attachments?"], ["Eliminare questa tabella di dati?", "Delete this data table?"], ["Rimuovere l'allegato?", "Remove the attachment?"], ["Chiudere il Diario? I dati sono salvati. Per riaprirlo basta fare di nuovo doppio clic sull'icona.", "Close the Diary? Your data is saved. To reopen it just double-click the icon again."], ["Diario chiuso", "Diary closed"], ["Puoi chiudere questa scheda. Per riaprirlo: doppio clic su «Avvia Diario».", "You can close this tab. To reopen it: double-click \"Avvia Diario\"."], ["Sessione scaduta: chiudi questa scheda e riapri il Diario dal file «Avvia Diario.command».", "Session expired: close this tab and reopen the Diary from the \"Avvia Diario\" file."], ["✅ Salvato", "✅ Saved"], ["✅ Dati salvati", "✅ Data saved"], ["✅ Allegati caricati", "✅ Attachments uploaded"], ["✅ Esperimento spostato", "✅ Experiment moved"], ["✅ Impostazioni salvate", "✅ Settings saved"], ["✅ Chiave rimossa", "✅ Key removed"], ["✅ ChemDraw aperto", "✅ ChemDraw opened"], ["⚗️ Apro ChemDraw…", "⚗️ Opening ChemDraw…"], ["📄 Creo il documento Word…", "📄 Creating the Word document…"], ["✅ Word salvato: ", "✅ Word saved: "], [" — cartella ", " — folder "], [" · copiato anche su Drive", " · also copied to Drive"], [" · Drive aggiornato", " · Drive updated"], ["✅ Struttura incollata: ", "✅ Structure pasted: "], ["📋 Leggo gli appunti…", "📋 Reading the clipboard…"], ["⬆️ Carico ", "⬆️ Uploading "], ["Errore nel caricamento di ", "Upload error: "], ["Errore ", "Error "], ["☁️ Sincronizzo con Drive…", "☁️ Syncing with Drive…"], ["✅ Drive aggiornato: ", "✅ Drive updated: "], ["Word nuovi/aggiornati, ", "Word files new/updated, "], ["allegati copiati (", "attachments copied ("], ["🗂️ Riordino i documenti…", "🗂️ Reorganising documents…"], ["✅ Riordinati ", "✅ Reorganised "], [" esperimenti in ", " experiments in "], [" · vecchi file archiviati (", " · old files archived ("], ["), nulla cancellato", "), nothing deleted"], ["📚 Un unico documento per il progetto", "📚 One document for the whole project"], ["Unisce in ordine di data tutti gli esperimenti del gruppo (sottogruppi compresi) o del progetto. È un file a parte: i Word dei singoli esperimenti non cambiano.", "Merges all experiments of the group (subgroups included) or project in date order. It is a separate file: the Word files of single experiments do not change."], [" in inglese (usa le versioni inglesi già create con «Versione inglese»)", " in English (uses English versions already created with \"English version\")"], ["📚 Crea il documento", "📚 Create the document"], ["📚 Unisco gli esperimenti…", "📚 Merging experiments…"], ["Non ci sono ancora gruppi o progetti.", "There are no groups or projects yet."], ["📁 Gruppo: ", "📁 Group: "], ["🏷️ Progetto: ", "🏷️ Project: "], ["Questa voce è già scritta in inglese.", "This entry is already written in English."], [" traduce la voce…", " is translating the entry…"], [" sta lavorando…", " is working…"], ["Scrivi prima qualcosa nella sezione selezionata.", "First write something in the selected section."], ["Manca la chiave API di ", "Missing API key for "], ["Cosa vuoi che faccia ", "What do you want "], ["🖼️ Creo l'immagine del grafico…", "🖼️ Creating the chart image…"], ["🧭 In che settore lavori?", "🧭 What field do you work in?"], ["Puoi sceglierne più di uno. Il Diario mostra gli strumenti del tuo settore (per esempio il disegno delle molecole per chi fa chimica o farmacologia). Si può cambiare in qualsiasi momento.", "You can pick more than one. The Diary shows the tools for your field (for example molecule drawing for chemistry or pharmacology). You can change it at any time."], ["Scegli il tuo settore di ricerca", "Choose your research field"], ["Chimica (sintesi)", "Chemistry (synthesis)"], ["Farmacologia / biochimica", "Pharmacology / biochemistry"], ["Biologia molecolare e cellulare", "Molecular and cell biology"], ["Microbiologia", "Microbiology"], ["Materiali / fisica / ingegneria", "Materials / physics / engineering"], ["Informatica e dati", "Computer science and data"], ["🔑 Chiavi API e impostazioni", "🔑 API keys and settings"], ["incolla la chiave Gemini", "paste the Gemini key"], ["✅ già salvata (lascia vuoto per non cambiarla)", "✅ already saved (leave empty to keep it)"], ["Modello Gemini (facoltativo, es. gemini-2.5-flash):", "Gemini model (optional, e.g. gemini-2.5-flash):"], ["Le chiavi vengono salvate solo sul tuo computer, in ~/DiarioRicercatore/config.json.", "Keys are saved only on your computer, in ~/DiarioRicercatore/config.json."], ["☁️ Cartella di Google Drive (facoltativa)", "☁️ Google Drive folder (optional)"], ["🔎 Cerca Google Drive", "🔎 Find Google Drive"], ["Il Word di ogni esperimento e una copia di sicurezza (database e allegati) vengono salvati qui, in «Diario del Ricercatore». Serve l'app Google Drive per desktop, che poi sincronizza online da sola. Si aggiorna da sola ogni 5 minuti se hai fatto modifiche, oppure con «☁️ Sincronizza con Drive».", "The Word file of each experiment and a backup copy (database and attachments) are saved here, in \"Diario del Ricercatore\". Requires the Google Drive for desktop app, which then syncs online by itself. It updates automatically every 5 minutes if you made changes, or with \"☁️ Sync with Drive\"."], ["Scegli prima la cartella di Google Drive qui sotto.", "First choose the Google Drive folder below."], ["Non ho trovato Google Drive per desktop su questo computer: installalo da google.com/drive/download oppure scrivi tu il percorso della cartella.", "I could not find Google Drive for desktop on this computer: install it from google.com/drive/download or type the folder path yourself."], ["Ultima sincronizzazione: ", "Last sync: "], ["Ultimo errore di sincronizzazione: ", "Last sync error: "], ["Di solito si trova da sola. Se serve, scrivi il nome (es. ChemDraw 23.1) o il percorso dell'app.", "It is usually found automatically. If needed, type the name (e.g. ChemDraw 23.1) or the app path."], ["⚗️ App ChemDraw", "⚗️ ChemDraw app"], ["Disegna la struttura o lo schema. Verrà allegata come immagine (compare nel Word) insieme al file .mol modificabile, che si apre anche con ChemDraw.", "Draw the structure or scheme. It will be attached as an image (shown in Word) together with the editable .mol file, which also opens in ChemDraw."], ["Carico l'editor di strutture…", "Loading the structure editor…"], ["Disegna prima almeno una molecola.", "First draw at least one molecule."], ["Nome della molecola (es. NG012)", "Molecule name (e.g. NG012)"], ["🧪 Creo l'immagine…", "🧪 Creating the image…"], ["✅ Creato «", "✅ Created «"], ["🧪 Disegna una molecola", "🧪 Draw a molecule"], ["Scegli il tuo settore di ricerca", "Choose your research field"], ["Dose-risposta (IC50)", "Dose-response (IC50)"], ["Dose-risposta (IC50 / EC50)", "Dose-response (IC50 / EC50)"], ["Cinetica enzimatica (Km, Vmax)", "Enzyme kinetics (Km, Vmax)"], ["Scheda del saggio", "Assay sheet"], ["Piastra a 96 pozzetti", "96-well plate"], ["Campioni e reagenti", "Samples and reagents"], ["Conte CFU", "CFU counts"], ["Curva di crescita", "Growth curve"], ["Ceppo e condizioni", "Strain and conditions"], ["Misure x-y con fit", "x-y measurements with fit"], ["Tabella con grafico", "Table with chart"], ["Gruppi: media ± DS e test", "Groups: mean ± SD and test"], ["Materiale e condizioni di misura", "Material and measurement conditions"], ["Ambiente e riproducibilità", "Environment and reproducibility"], ["Reagenti e rese", "Reagents and yields"], ["Caratterizzazione", "Characterisation"], ["Lastra TLC (Rf)", "TLC plate (Rf)"], ["Grafico x-y (con fit)", "x-y chart (with fit)"], ["Barre: gruppi, media ± DS e test", "Bars: groups, mean ± SD and test"], ["Tabella libera con grafico", "Free table with chart"], ["Titolo (es. Inibizione di NLRP3 – composti A e B)", "Title (e.g. NLRP3 inhibition – compounds A and B)"], ["Incolla qui da Excel…", "Paste here from Excel…"], ["Tabella dei dati (puoi incollare da Excel)", "Data table (you can paste from Excel)"], ["Etichetta asse x", "x-axis label"], ["Etichetta asse y", "y-axis label"], ["IC50/EC50 automatico", "Automatic IC50/EC50"], ["Aggiungi all'esperimento", "Add to experiment"], ["Inserisci i dati nella tabella.", "Enter the data in the table."], ["Compila prima i dati.", "Fill in the data first."], ["Inserisci prima i dati.", "Enter the data first."], ["Scrivi la riga di intestazione e almeno una riga di dati.", "Write the header row and at least one data row."], ["Servono almeno due colonne.", "At least two columns are needed."], ["Colonna da rappresentare:", "Column to plot:"], ["La colonna scelta per il grafico non contiene numeri.", "The column chosen for the chart contains no numbers."], ["Una riga per concentrazione: concentrazione, poi le repliche della risposta. Più composti: separali con una riga «# Nome». Il fit è a 4 parametri.", "One row per concentration: concentration, then the response replicates. Several compounds: separate them with a \"# Name\" row. The fit is 4-parameter."], ["Una riga per punto: x, poi le repliche di y. Più serie: separale con una riga «# Nome».", "One row per point: x, then the y replicates. Several series: separate them with a \"# Name\" row."], ["Una riga per gruppo: nome, poi i valori delle repliche (separati da tab, «;» o spazio). Con 2 gruppi fa il test t di Welch, con 3 o più l'ANOVA.", "One row per group: name, then replicate values (separated by tab, \";\" or space). With 2 groups it runs Welch's t-test, with 3 or more ANOVA."], ["La prima riga è l'intestazione, poi una riga per prova. Se la prima colonna è numerica fa un grafico x-y (con fit a scelta), altrimenti un grafico a barre.", "The first row is the header, then one row per run. If the first column is numeric it makes an x-y chart (with a fit of your choice), otherwise a bar chart."], ["Compila i campi che servono (puoi aggiungere altre righe). I campi vuoti non compaiono nel Word.", "Fill in the fields you need (you can add more rows). Empty fields do not appear in the Word file."], ["Compila almeno un campo.", "Fill in at least one field."], ["Compila il layout (nome del gruppo in ogni pozzetto, es. Blank, Controllo, Comp-A 10 µM) e i valori letti (assorbanza, fluorescenza…). Puoi incollare un blocco 8×12 da Excel in ciascuna griglia. Pozzetti vuoti ignorati.", "Fill in the layout (group name in each well, e.g. Blank, Control, Cmpd-A 10 µM) and the readings (absorbance, fluorescence…). You can paste an 8×12 block from Excel into each grid. Empty wells are ignored."], ["Layout (nome del gruppo)", "Layout (group name)"], ["Valori letti", "Readings"], ["Nome del bianco", "Blank name"], ["Nome del controllo", "Control name"], ["Per ogni diluizione scrivi le colonie contate sulle piastre. Diluizione: -6, 10^-6, 1e-6 o 1:1000000. Contano le piastre con 30-300 colonie. Volume piastrato in mL (di solito 0.1).", "For each dilution write the colonies counted on the plates. Dilution: -6, 10^-6, 1e-6 or 1:1000000. Plates with 30-300 colonies count. Plated volume in mL (usually 0.1)."], ["Per ogni riga indica PM e una tra massa, mmol oppure volume + densità. La resa si calcola sul reagente limitante (il primo reagente, o quello segnato «limitante»). Stechiometria 1:1 col prodotto.", "For each row give the MW and one of mass, mmol or volume + density. The yield is calculated on the limiting reagent (the first reagent, or the one marked \"limiting\"). 1:1 stoichiometry with the product."], ["Una riga per ogni concentrazione provata: composto, ceppo, concentrazione e se c'è crescita. La MIC è la concentrazione più bassa senza crescita.", "One row per concentration tested: compound, strain, concentration and whether there is growth. The MIC is the lowest concentration with no growth."], ["Una riga per gruppo e gene con i Ct delle repliche. Indica il gene di riferimento e il gruppo di controllo qui sopra: il Diario calcola ΔCt, ΔΔCt e fold change (2^-ΔΔCt).", "One row per group and gene with the replicate Ct values. Give the reference gene and the control group above: the Diary calculates ΔCt, ΔΔCt and fold change (2^-ΔΔCt)."], ["Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato. Sulla lastra puoi trascinare le macchie su e giù con il mouse; doppio clic su una corsia per aggiungerne una.", "One row per lane of the plate (e.g. SM, co-spot, mixture, product). Choose how many spots it has and enter the Rf of each (0–1). If you measure in cm, write the distance travelled and the solvent-front distance and the Rf is calculated. On the plate you can drag spots up and down with the mouse; double-click a lane to add one."], ["Eluente (es. AcOEt/esano 3:7)", "Eluent (e.g. EtOAc/hexane 3:7)"], ["Fase stazionaria", "Stationary phase"], ["Gel di silice 60 F254", "Silica gel 60 F254"], ["Rivelatore chimico (KMnO4, ninidrina, I2…)", "Chemical stain (KMnO4, ninhydrin, I2…)"], ["Inserisco l'Rf (0–1)", "I enter the Rf (0–1)"], ["Inserisco le distanze in cm", "I enter distances in cm"], ["Fronte (cm)", "Front (cm)"], ["macchie:", "spots:"], ["Nome", "Name"], ["+ Aggiungi corsia", "+ Add lane"], ["＋ Aggiungi riga", "＋ Add row"], ["Elimina la riga", "Delete row"], ["Aggiungi almeno una macchia.", "Add at least one spot."], ["N. macchie", "No. of spots"], ["fronte del solvente", "solvent front"], ["linea di base", "baseline"], ["Eluente: ", "Eluent: "], ["Fase stazionaria: ", "Stationary phase: "], ["Rivelazione: ", "Detection: "], ["Composto", "Compound"], ["Ceppo", "Strain"], ["Crescita", "Growth"], ["Campo", "Field"], ["Valore", "Value"], ["Aspetto", "Appearance"], ["Resa", "Yield"], ["Punto di fusione", "Melting point"], ["Rf (eluente)", "Rf (eluent)"], ["Massa (mg)", "Mass (mg)"], ["Equiv. / resa", "Equiv. / yield"], ["Catalizzatore / additivo", "Catalyst / additive"], ["Prodotto ", "Product "], ["Reagente limitante: ", "Limiting reagent: "], ["Concentrazione del limitante: ", "Limiting reagent concentration: "], ["Massa teorica: ", "Theoretical mass: "], ["Bersaglio / enzima", "Target / enzyme"], ["Composto (lotto)", "Compound (lot)"], ["Substrato / ligando e concentrazione", "Substrate / ligand and concentration"], ["Tampone e pH", "Buffer and pH"], ["Temperatura e tempo di incubazione", "Temperature and incubation time"], ["Metodo di rivelazione", "Detection method"], ["Controlli (positivo, negativo, veicolo)", "Controls (positive, negative, vehicle)"], ["Concentrazione di DMSO", "DMSO concentration"], ["Linea cellulare (passaggio)", "Cell line (passage)"], ["Terreno e siero", "Medium and serum"], ["Densità di semina", "Seeding density"], ["Trattamento (concentrazione, tempo)", "Treatment (concentration, time)"], ["Anticorpi primari (diluizione, lotto)", "Primary antibodies (dilution, lot)"], ["Anticorpi secondari", "Secondary antibodies"], ["Kit / reagenti (lotto)", "Kits / reagents (lot)"], ["Repliche biologiche / tecniche", "Biological / technical replicates"], ["Ceppo (codice)", "Strain (code)"], ["Terreno", "Medium"], ["Temperatura e atmosfera", "Temperature and atmosphere"], ["Inoculo (CFU/mL o OD)", "Inoculum (CFU/mL or OD)"], ["Tempo di incubazione", "Incubation time"], ["Composto / antibiotico (lotto)", "Compound / antibiotic (lot)"], ["Standard di riferimento (CLSI, EUCAST)", "Reference standard (CLSI, EUCAST)"], ["Materiale e lotto", "Material and lot"], ["Sintesi / processo (parametri)", "Synthesis / process (parameters)"], ["Strumento e modello", "Instrument and model"], ["Condizioni ambientali (T, umidità)", "Environmental conditions (T, humidity)"], ["Calibrazione", "Calibration"], ["Preparazione del campione", "Sample preparation"], ["Norma di riferimento", "Reference standard"], ["Repository e commit", "Repository and commit"], ["Versione software e librerie", "Software and library versions"], ["Seed casuale", "Random seed"], ["Dataset (versione)", "Dataset (version)"], ["Comando eseguito", "Command run"], ["Tempo di calcolo", "Computation time"], ["Gene di riferimento", "Reference gene"], ["Gruppo di controllo", "Control group"], ["Ct medio", "Mean Ct"], ["Fold change (intervallo)", "Fold change (range)"], ["Espressione relativa (2^-ΔΔCt)", "Relative expression (2^-ΔΔCt)"], ["Inserisci i valori di Ct.", "Enter the Ct values."], ["Servono almeno un gene bersaglio oltre al riferimento.", "At least one target gene besides the reference is needed."], ["Risposta (%)", "Response (%)"], ["Tempo (h)", "Time (h)"], ["Concentrazione ≤ 0 (", "Concentration ≤ 0 ("], ["Piastra 1", "Plate 1"], ["Piastra 2", "Plate 2"], ["Piastra 3", "Plate 3"], ["Serie ", "Series "], ["(unità)", "(unit)"], ["media ± DS (n)", "mean ± SD (n)"], ["Test t di Welch:", "Welch's t-test:"], ["ANOVA a una via: F(", "One-way ANOVA: F("], ["Bianco sottratto: ", "Blank subtracted: "], ["Alcuni gruppi hanno meno di 3 repliche: le statistiche sono poco affidabili.", "Some groups have fewer than 3 replicates: the statistics are not very reliable."], ["Alcuni gruppi hanno meno di 3 pozzetti.", "Some groups have fewer than 3 wells."], ["Per il test servono almeno 2 valori per gruppo.", "The test needs at least 2 values per group."], ["Per l'ANOVA servono almeno 2 valori per gruppo.", "ANOVA needs at least 2 values per group."], ["Inserisci almeno una concentrazione.", "Enter at least one concentration."], ["Inserisci layout e valori.", "Enter layout and values."], ["Errore nel calcolo: ", "Calculation error: "], ["Valore non numerico: ", "Non-numeric value: "], ["Valore non numerico in ", "Non-numeric value in "], ["Valori di x ≤ 0 non inclusi (asse logaritmico).", "x values ≤ 0 not included (log axis)."], ["Valori di y ≤ 0 non inclusi (asse y logaritmico).", "y values ≤ 0 not included (log y axis)."], ["Resa superiore al 100%: controlla PM e quantità (", "Yield above 100%: check MW and amounts ("], ["Inserisci PM e massa (o mmol) di almeno un reagente per calcolare equivalenti e resa.", "Enter MW and mass (or mmol) of at least one reagent to calculate equivalents and yield."], ["Aggiungi almeno una macchia.", "Add at least one spot."], ["Non riesco a caricare l'editor di strutture. Serve la connessione a internet (oppure scarica JSME e mettilo nella cartella «jsme» accanto a diario_web.py).", "I cannot load the structure editor. An internet connection is needed (or download JSME and put it in the \"jsme\" folder next to diario_web.py)."], ["L'editor di strutture non risponde.", "The structure editor is not responding."], ["Non riesco a convertire il disegno in immagine.", "I cannot convert the drawing to an image."], ["Immagine non creata.", "Image not created."], ["Negli appunti non c'e' nessuna struttura (usa il pulsante 📋 Incolla da ChemDraw per i dettagli)", "There is no structure on the clipboard (use the 📋 Paste from ChemDraw button for details)"], ["Non ho trovato ChemDraw tra le applicazioni.\nScrivi il nome dell'app (es. ChemDraw 23.1) oppure incolla il suo percorso completo (Mac: Finder, seleziona l'app e premi ⌥⌘C · Windows: il percorso di ChemDraw.exe).", "I could not find ChemDraw among the applications.\nType the app name (e.g. ChemDraw 23.1) or paste its full path (Mac: Finder, select the app and press ⌥⌘C · Windows: the path of ChemDraw.exe)."], ["🔬 Diario del", "🔬 Researcher's"], ["Ricercatore", "Diary"], ["🖥️ Crea icona sul Desktop", "🖥️ Create Desktop icon"], ["Crea l'icona del Diario sulla Scrivania, cosi' si apre con un doppio clic", "Create the Diary icon on the Desktop, so it opens with a double-click"], ["✅ Icona creata: ", "✅ Icon created: "], ["🧭 Settore: ", "🧭 Field: "], [" settori", " fields"], ["✨ AI su: ", "✨ AI on: "], ["Creala su ", "Create it at "], ["Creala su", "Create it at"], ["Procedura sperimentale", "Experimental procedure"], ["Obiettivo e ipotesi", "Objective and hypothesis"], ["Obiettivo", "Objective"], ["Saggio e condizioni", "Assay and conditions"], ["Materiali e metodi", "Materials and methods"], ["Preparazione e condizioni di misura", "Preparation and measurement conditions"], ["Metodo e configurazione", "Method and configuration"], ["Risultati e osservazioni", "Results and observations"], ["Risultati (IC50, Ki, inibizione)", "Results (IC50, Ki, inhibition)"], ["Risultati (conte, MIC, crescita)", "Results (counts, MIC, growth)"], ["Misure e risultati", "Measurements and results"], ["Risultati e metriche", "Results and metrics"], ["Note e prossimi passi", "Notes and next steps"], [" in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", " in ChemDraw select the structure, press ⌘C and then ⌘V on this page (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."], ["in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", "in ChemDraw select the structure, press ⌘C and then ⌘V on this page (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."], ["⚠️ Nessuna immagine associata: nel Word comparirà solo il nome. Incolla lo schema da ChemDraw (⌘C → ⌘V qui) o aggiungi un PNG con lo stesso nome.", "⚠️ No associated image: only the name will appear in Word. Paste the scheme from ChemDraw (⌘C → ⌘V here) or add a PNG with the same name."], [" — controlla e modifica prima di applicare", " — check and edit before applying"], ["✨ Proposta di ", "✨ Suggestion from "], ["Trovata: ", "Found: "], [" (clicca per usarla)", " (click to use it)"], ["Eliminare il gruppo «", "Delete the group «"], ["»?\n\nGli esperimenti NON vengono cancellati: passano al gruppo superiore (o all'elenco principale).", "»?\n\nExperiments are NOT deleted: they move to the parent group (or to the main list)."], ["» archiviato: lo trovi in 📦 Archivio", "» archived: you can find it in 📦 Archive"], ["» ripristinato", "» restored"], ["Non riesco ad aprire «", "I cannot open «"], ["». Controlla il nome o il percorso e riprova.", "». Check the name or path and try again."], ["Esperimento non trovato.", "Experiment not found."], ["Gruppo non trovato.", "Group not found."], ["Non ci sono esperimenti da unire.", "There are no experiments to merge."], ["Scegli un gruppo o un progetto.", "Choose a group or a project."], ["Scrivi prima qualcosa da tradurre.", "First write something to translate."], ["Questa voce e' gia' scritta in inglese: non serve tradurla.", "This entry is already written in English: no need to translate it."], ["La traduzione non e' arrivata in un formato leggibile: riprova.", "The translation did not arrive in a readable format: try again."], ["Una sincronizzazione e' gia' in corso.", "A sync is already in progress."], ["Il nome del gruppo non puo' essere vuoto.", "The group name cannot be empty."], ["Testo vuoto.", "Empty text."], [" · senza traduzione: ", " · without translation: "], [" esperimenti uniti in «", " experiments merged into «"], ["Conferma", "Confirm"], ["Titolo", "Title"], ["Ruolo", "Role"], ["Limitante", "Limiting"], ["limitante", "limiting"], ["Reagente", "Reagent"], ["Solvente", "Solvent"], ["Prodotto", "Product"], ["Esempio", "Example"], ["estremi fissi (top 100, bottom 0)", "fixed limits (top 100, bottom 0)"], [" estremi fissi (top 100, bottom 0)", " fixed limits (top 100, bottom 0)"], ["x logaritmico", "log x"], [" x logaritmico", " log x"], ["y logaritmico", "log y"], [" y logaritmico", " log y"], ["nessun fit", "no fit"], ["retta (regressione lineare)", "line (linear regression)"], ["polinomio di 2° grado", "2nd-degree polynomial"], ["esponenziale (k, raddoppio / emivita)", "exponential (k, doubling / half-life)"], ["legge di potenza", "power law"], ["sottrai il bianco", "subtract blank"], [" sottrai il bianco", " subtract blank"], ["normalizza sul controllo (= 100 %)", "normalise to control (= 100 %)"], [" normalizza sul controllo (= 100 %)", " normalise to control (= 100 %)"], ["Gruppo", "Group"], ["Campione", "Sample"], ["Diluizione", "Dilution"], ["crescita", "growth"], ["no crescita", "no growth"], ["Nessun pozzetto «", "No well «"], ["»: il bianco non è stato sottratto.", "»: the blank was not subtracted."], ["»: nessuna normalizzazione.", "»: no normalisation."], [", rivelazione ", ", detection "], [", eluente ", ", eluent "], ["Il gene di riferimento «", "The reference gene «"], ["Il gruppo di controllo «", "The control group «"], ["» non compare nella tabella.", "» does not appear in the table."], [": servono almeno 3 punti per la retta.", ": at least 3 points are needed for the line."], [": servono almeno 4 punti per il polinomio di 2° grado.", ": at least 4 points are needed for the 2nd-degree polynomial."], [": servono almeno 3 punti con y > 0 per l'esponenziale.", ": at least 3 points with y > 0 are needed for the exponential."], [": servono almeno 3 punti con x > 0 e y > 0 per la legge di potenza.", ": at least 3 points with x > 0 and y > 0 are needed for the power law."], [": servono almeno 4 punti su 3 valori di x diversi per Michaelis-Menten.", ": at least 4 points at 3 different x values are needed for Michaelis-Menten."], [": servono almeno 5 punti su 4 concentrazioni diverse per il fit (3 con estremi fissi).", ": at least 5 points at 4 different concentrations are needed for the fit (3 with fixed limits)."], [": alcuni punti hanno una sola replica (niente barre di errore).", ": some points have a single replicate (no error bars)."], [": intervallo di confidenza non calcolabile (pochi punti).", ": confidence interval cannot be calculated (too few points)."], [") non inclusa nel grafico e nel fit.", ") not included in the chart and fit."], [" fuori dall'intervallo di concentrazioni misurato, il valore è un'estrapolazione.", " outside the measured concentration range, the value is an extrapolation."], ["): controlla i dati o prova gli estremi fissi.", "): check the data or try fixed limits."], ["): segnale molto debole.", "): very weak signal."], ["): alcune piastre fuori dall'intervallo 30-300 sono state escluse.", "): some plates outside the 30-300 range were excluded."], ["): nessuna piastra tra 30 e 300 colonie, riga esclusa.", "): no plate between 30 and 300 colonies, row excluded."], [": risultati non monotoni (crescita a concentrazioni più alte di una senza crescita): controlla.", ": non-monotonic results (growth at concentrations higher than one without growth): check."], ["»: manca il PM (o la densità per un volume).", "»: MW missing (or density for a volume)."], ["Rf fuori da 0–1 nella corsia «", "Rf outside 0–1 in lane «"], ["Inserisci la distanza percorsa dal fronte (cm) per calcolare gli Rf.", "Enter the distance travelled by the front (cm) to calculate the Rf values."], ["fuori 30-300", "outside 30-300"], ["CFU/mL (media)", "CFU/mL (mean)"], ["📂 Documenti ▾", "📂 Documents ▾"], ["⚙️ Impostazioni ▾", "⚙️ Settings ▾"], ["⏻ Chiudi", "⏻ Close"], ["⚗️ Apri ChemDraw", "⚗️ Open ChemDraw"], ["Cartella dei documenti, documento unico di progetto, Google Drive", "Documents folder, single project document, Google Drive"], ["Settore, chiavi API, lingua, icona sul Desktop", "Field, API keys, language, Desktop icon"], ["🇬🇧 Vedi versione inglese", "🇬🇧 View English version"], ["↩ Torna al testo originale", "↩ Back to the original text"], ["🇬🇧 Stai guardando la versione inglese. Le modifiche che fai qui cambiano solo il documento «English version»; il testo originale non viene toccato.", "🇬🇧 You are viewing the English version. Edits made here only change the \"English version\" document; the original text is not touched."], ["Passa dal testo originale alla versione inglese e viceversa", "Switch between the original text and the English version"], ["✅ Tradotto. Creato «", "✅ Translated. Created «"], ["⬆️ Nuova versione: aggiorna ora", "⬆️ New version: update now"], ["⬆️ Cerca aggiornamenti", "⬆️ Check for updates"], ["Aggiorno il Diario all'ultima versione? I tuoi esperimenti non vengono toccati. Il Diario si riavvia da solo.", "Update the Diary to the latest version? Your experiments are not touched. The Diary restarts by itself."], ["⬆️ Scarico l'aggiornamento…", "⬆️ Downloading the update…"], ["✅ Hai già l'ultima versione", "✅ You already have the latest version"], ["⬆️ Cerco aggiornamenti…", "⬆️ Checking for updates…"], ["Diario aggiornato", "Diary updated"], ["Si sta riavviando: tra pochi secondi si apre una nuova scheda. Questa puoi chiuderla.", "It is restarting: a new tab will open in a few seconds. You can close this one."]];
+const EN_MAP = new Map(EN_PAIRS);
+const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(]\s?$|^\s|\s$/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
+function tx(s) {
+  if (UI_LANG !== "en" || typeof s !== "string") return s;
+  const t = s.trim(); if (!t) return s;
+  let r = EN_MAP.get(s); if (r === undefined) r = EN_MAP.get(t);
+  if (r !== undefined) return r;
+  const m = t.match(/^(\S{1,6}\s+)(.+)$/u);
+  if (m && !/[A-Za-z0-9]/.test(m[1])) { r = EN_MAP.get(m[2]); if (r !== undefined) return m[1] + r; }
+  return s;
+}
+function txf(s) {
+  if (UI_LANG !== "en" || typeof s !== "string" || !s) return s;
+  const e = tx(s); if (e !== s) return e;
+  let o = s;
+  for (const p of EN_FRAG) if (o.indexOf(p[0]) >= 0) o = o.split(p[0]).join(p[1]);
+  return o;
+}
+if (UI_LANG === "en") {
+  const FRAG_SEL = "#status, .warn, .dssum, .hint, .muted, #btnSector, #ailabel, .modal .h2";
+  const doNode = n => {
+    if (n.nodeType === 3) {
+      const par = n.parentElement; if (!par || /^(TEXTAREA|SCRIPT|STYLE)$/.test(par.tagName)) return;
+      const v = n.nodeValue, r = par.closest(FRAG_SEL) ? txf(v) : tx(v);
+      if (r !== v) n.nodeValue = r;
+    } else if (n.nodeType === 1) {
+      ["placeholder", "title"].forEach(a => { const v = n.getAttribute(a); if (v) { const r = tx(v); if (r !== v) n.setAttribute(a, r); } });
+      n.childNodes.forEach(doNode);
+    }
+  };
+  const start = () => {
+    document.documentElement.lang = "en";
+    doNode(document.body);
+    new MutationObserver(ms => ms.forEach(m => {
+      if (m.type === "characterData") doNode(m.target);
+      else if (m.type === "attributes") doNode(m.target);
+      else m.addedNodes.forEach(doNode);
+    })).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["placeholder", "title"] });
+  };
+  if (document.body) start(); else document.addEventListener("DOMContentLoaded", start);
+  const _al = window.alert.bind(window), _cf = window.confirm.bind(window), _pr = window.prompt.bind(window);
+  window.alert = s => _al(txf(String(s)));
+  window.confirm = s => _cf(txf(String(s)));
+  window.prompt = (s, d) => _pr(txf(String(s)), d);
+}
+
 let SECTIONS = [
   ["obiettivo", "🎯 Obiettivo", "Qual è lo scopo dell'esperimento?", 3],
   ["procedura", "🧪 Procedura sperimentale", "Scrivi qui appunti e procedura, anche in modo disordinato: l'AI li metterà in forma.", 10],
@@ -2447,10 +2869,28 @@ function collect() {
   return o;
 }
 
+let viewEN = false, curExp = null, curTr = null;
+function showView() {
+  const src = viewEN && curTr ? curTr : curExp; if (!src) return;
+  $("name").value = src.name || "";
+  SECTIONS.forEach(s => { const t = $("sec_" + s[0]); t.value = src[s[0]] || ""; autosize(t); });
+  $("enBanner").hidden = !viewEN;
+  const can = !!curTr && $("lang").value !== "en";
+  $("btnView").hidden = !can;
+  $("btnView").textContent = viewEN ? "↩ Torna al testo originale" : "🇬🇧 Vedi versione inglese";
+  ["date", "project", "lang", "groupsel"].forEach(id => { $(id).disabled = viewEN; });
+}
+async function setView(en) {
+  if (curId == null) return;
+  if (dirty) await saveNow();
+  const d = await api("get", { id: curId });
+  curExp = d.exp; curTr = d.translation; viewEN = !!en && !!curTr;
+  showView(); dirty = false;
+}
 async function saveNow() {
   clearTimeout(saveTimer);
   if (curId == null) return;
-  await api("save", collect());
+  await api(viewEN ? "tr_save" : "save", collect());
   dirty = false;
   status("✅ Salvato", 2000);
   await loadList();
@@ -2693,7 +3133,8 @@ async function openExp(id) {
   $("date").value = e.date || "";
   $("project").value = e.project || "";
   $("lang").value = e.lang === "en" ? "en" : "";
-  SECTIONS.forEach(s => { const t = $("sec_" + s[0]); t.value = e[s[0]] || ""; autosize(t); });
+  curExp = e; curTr = d.translation; viewEN = false;
+  showView();
   renderAtt(d.attachments);
   refreshDs().catch(() => {});
   dirty = false;
@@ -2834,8 +3275,10 @@ async function runAI(mode) {
     try {
       await saveNow();
       status("🌍 " + name + " traduce la voce…");
+      if (viewEN) { viewEN = false; }
       const d = await api("translate", { id: curId, engine });
-      status("✅ Creato «" + d.file + "» in " + d.folder, 10000);
+      await setView(true);
+      status("✅ Tradotto. Creato «" + d.file + "» in " + d.folder, 10000);
     } catch (e) {
       if ((e.message || "").startsWith("NOKEY")) openKey("Manca la chiave API di " + name + ": incollala qui sotto.");
       else alert(e.message);
@@ -3009,6 +3452,7 @@ function loadJsme() {
 function svgToPng(svg) {
   return new Promise((resolve, reject) => {
     let w = 0, h0 = 0;
+    if (UI_LANG === "en") svg = svg.replace(/>([^<>]+)</g, (m, x) => ">" + tx(x) + "<");
     const vb = svg.match(/viewBox\s*=\s*"([\d.\-eE+ ,]+)"/i);
     if (vb) { const p = vb[1].trim().split(/[\s,]+/).map(Number); w = p[2]; h0 = p[3]; }
     const mw = svg.match(/<svg[^>]*\swidth\s*=\s*"([\d.]+)/i), mh = svg.match(/<svg[^>]*\sheight\s*=\s*"([\d.]+)/i);
@@ -4048,7 +4492,7 @@ function tlcSVG(c) {
   const fl = c.vis === "uv366" ? "#16162b" : c.vis === "uv254" ? "#d6f5c9" : "#f6efe0";
   const spotCol = c.vis === "uv366" ? "#7dd3fc" : c.vis === "uv254" ? "#3a4a3a" : "#7a4a1d";
   const base = top + ph - 34, front = top + 26, rfY = rf => base - rf * (base - front);
-  let s = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '" font-family="Helvetica,Arial,sans-serif">';
+  let s = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '" font-family="Helvetica,Arial,sans-serif" data-base="' + base + '" data-front="' + front + '">';
   s += '<rect width="100%" height="100%" fill="#fff"/>';
   if (c.title) s += '<text x="' + W / 2 + '" y="26" text-anchor="middle" font-size="15" font-weight="700" fill="#111">' + X(c.title) + "</text>";
   s += '<rect x="14" y="' + top + '" width="' + (W - 28) + '" height="' + ph + '" rx="3" fill="' + fl + '" stroke="#9CA3AF"/>';
@@ -4058,10 +4502,10 @@ function tlcSVG(c) {
   s += '<text x="' + (W - 20) + '" y="' + (base + 12) + '" text-anchor="end" font-size="9" fill="#4B5563">linea di base</text>';
   lanes.forEach((ln, i) => {
     const x = left + 20 + i * pitch;
-    s += '<circle cx="' + x + '" cy="' + base + '" r="2" fill="#6B7280"/>';
+    s += '<circle cx="' + x + '" cy="' + base + '" r="2" fill="#6B7280" data-lane="' + (ln.li == null ? i : ln.li) + '"/>';
     ln.rfs.forEach(r => {
       const y = rfY(r.rf), rx = 11 * (r.size || 1), ry = 7 * (r.size || 1);
-      s += '<ellipse cx="' + x + '" cy="' + y.toFixed(1) + '" rx="' + rx.toFixed(1) + '" ry="' + ry.toFixed(1) + '" fill="' + spotCol + '" fill-opacity="' + (r.faint ? 0.45 : 0.85) + '"/>';
+      s += '<ellipse cx="' + x + '" cy="' + y.toFixed(1) + '" rx="' + rx.toFixed(1) + '" ry="' + ry.toFixed(1) + '" fill="' + spotCol + '" fill-opacity="' + (r.faint ? 0.45 : 0.85) + '" data-li="' + (ln.li == null ? i : ln.li) + '" data-si="' + (r.si == null ? 0 : r.si) + '" style="cursor:ns-resize;touch-action:none"/>';
       s += '<text x="' + (x + rx + 3).toFixed(1) + '" y="' + (y + 3).toFixed(1) + '" font-size="9" fill="#374151">' + r.rf.toFixed(2) + "</text>";
     });
     s += '<text x="' + x + '" y="' + (top + ph + 16) + '" text-anchor="middle" font-size="11" font-weight="600" fill="#111">' + X(ln.name || String(i + 1)) + "</text>";
@@ -4072,7 +4516,7 @@ function tlcSVG(c) {
 }
 
 KIND_DEFS.tlc = {
-  hint: "Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato.",
+  hint: "Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato. Sulla lastra puoi trascinare le macchie su e giù con il mouse; doppio clic su una corsia per aggiungerne una.",
   init: () => ({ eluent: "", phase: "Gel di silice 60 F254", vis: "uv254", mode: "rf", front: "", lanes: [{ name: "SM", spots: [{ rf: "0.55" }] }, { name: "Co", spots: [{ rf: "0.55" }, { rf: "0.30" }] }, { name: "Mix", spots: [{ rf: "0.55" }, { rf: "0.30" }] }] }),
   build: (st, on) => {
     const el = h("div"), eluent = h("input", { type: "text", placeholder: "Eluente (es. AcOEt/esano 3:7)" }), phase = h("input", { type: "text", placeholder: "Fase stazionaria" });
@@ -4109,7 +4553,43 @@ KIND_DEFS.tlc = {
     const add = h("button", { class: "btn grey small", onclick: () => { st.lanes.push({ name: "", spots: [{ rf: "" }] }); draw(); on(); } }, "+ Aggiungi corsia");
     draw();
     el.append(h("div", { class: "dsopt" }, eluent, phase), h("div", { class: "dsopt" }, vis, mode, front), lanesBox, add);
-    return { el, sync: () => {} };
+    return { el, sync: () => {}, redraw: draw };
+  },
+  // trascina una macchia su/giu' per cambiare l'Rf; doppio clic sulla lastra per aggiungere una macchia alla corsia piu' vicina
+  interact: (prev, st, redraw) => {
+    let drag = null;
+    const geo = () => {
+      const svg = prev.querySelector("svg"); if (!svg || !svg.dataset.base) return null;
+      const r = svg.getBoundingClientRect(), vb = svg.viewBox.baseVal;
+      return { svg, k: vb.height / r.height, kx: vb.width / r.width, top: r.top, left: r.left, base: +svg.dataset.base, front: +svg.dataset.front };
+    };
+    const rfAt = (g, cy) => Math.max(0, Math.min(1, (g.base - (cy - g.top) * g.k) / (g.base - g.front)));
+    const setRf = (li, si, rf) => {
+      const fr = nz(st.front), sp = st.lanes[li] && st.lanes[li].spots[si]; if (!sp) return;
+      if (st.mode === "cm") { if (fr > 0) sp.rf = (rf * fr).toFixed(2); } else sp.rf = rf.toFixed(2);
+    };
+    prev.addEventListener("pointerdown", e => {
+      const el = e.target; if (!el || el.tagName !== "ellipse" || el.dataset.li == null) return;
+      const g = geo(); if (!g) return;
+      e.preventDefault(); drag = { el, li: +el.dataset.li, si: +el.dataset.si, g, rf: null };
+      try { el.setPointerCapture(e.pointerId); } catch (x) {}
+    });
+    prev.addEventListener("pointermove", e => {
+      if (!drag) return;
+      const rf = rfAt(drag.g, e.clientY), y = drag.g.base - rf * (drag.g.base - drag.g.front); drag.rf = rf;
+      drag.el.setAttribute("cy", y.toFixed(1));
+      const lab = drag.el.nextElementSibling;
+      if (lab && lab.tagName === "text") { lab.setAttribute("y", (y + 3).toFixed(1)); lab.textContent = rf.toFixed(2); }
+    });
+    const end = () => { if (!drag) return; const d = drag; drag = null; if (d.rf == null) return; setRf(d.li, d.si, d.rf); redraw(); };
+    prev.addEventListener("pointerup", end); prev.addEventListener("pointercancel", end);
+    prev.addEventListener("dblclick", e => {
+      const g = geo(); if (!g) return;
+      const x = (e.clientX - g.left) * g.kx; let best = null, bd = 1e9;
+      g.svg.querySelectorAll("circle[data-lane]").forEach(c => { const d = Math.abs(+c.getAttribute("cx") - x); if (d < bd) { bd = d; best = +c.dataset.lane; } });
+      if (best == null || bd > 31 || !st.lanes[best] || st.lanes[best].spots.length >= 12) return;
+      st.lanes[best].spots.push({ rf: "" }); setRf(best, st.lanes[best].spots.length - 1, rfAt(g, e.clientY)); redraw();
+    });
   },
   analyze: st => {
     const warns = [], lanes = [], fr = nz(st.front);
@@ -4121,10 +4601,10 @@ KIND_DEFS.tlc = {
         const rf = st.mode === "cm" ? (fr > 0 ? v / fr : NaN) : v;
         if (!isFinite(rf)) return;
         if (rf < 0 || rf > 1) { warns.push("Rf fuori da 0–1 nella corsia «" + (ln.name || i + 1) + "»."); return; }
-        rfs.push({ rf });
+        rfs.push({ rf, si: ln.spots.indexOf(sp) });
       });
       rfs.sort((a, b) => b.rf - a.rf);
-      lanes.push({ name: (ln.name || "").trim(), rfs });
+      lanes.push({ name: (ln.name || "").trim(), rfs, li: i });
     });
     const withSp = lanes.filter(l => l.rfs.length || l.name);
     if (!lanes.length || !lanes.some(l => l.rfs.length)) return { chart: null, summary: "", table: [], warns: warns.concat(["Aggiungi almeno una macchia."]) };
@@ -4155,6 +4635,7 @@ function openStructured(ds, kindId) {
   };
   const on = () => { clearTimeout(timer); timer = setTimeout(refresh, 200); };
   ed = def.build(st, on);
+  if (def.interact) def.interact(prev, st, () => { if (ed.redraw) ed.redraw(); refresh(); });
   const close = () => bg.remove();
   const persist = async () => {
     refresh();
@@ -4248,6 +4729,34 @@ function build() {
   };
   setInterval(() => { fetch("/api/ping").catch(() => {}); }, 60000);
   $("btnMerge").onclick = () => openMerge(null);
+  $("btnView").onclick = () => setView(!viewEN).catch(fail);
+  const applyUpdate = async () => {
+    if (!confirm("Aggiorno il Diario all'ultima versione? I tuoi esperimenti non vengono toccati. Il Diario si riavvia da solo.")) return;
+    try {
+      if (dirty) await saveNow();
+      status("⬆️ Scarico l'aggiornamento…");
+      const d = await api("update_apply", {});
+      if (!d.updated) { status("✅ Hai già l'ultima versione", 5000); $("btnUpdateNow").hidden = true; return; }
+      document.body.innerHTML = '<div style="font-family:system-ui,sans-serif;text-align:center;padding:90px 20px"><div style="font-size:60px">⬆️</div><h2>Diario aggiornato</h2><p>Si sta riavviando: tra pochi secondi si apre una nuova scheda. Questa puoi chiuderla.</p></div>';
+    } catch (e) { status(""); fail(e); }
+  };
+  $("btnUpdateNow").onclick = applyUpdate;
+  $("btnUpdate").onclick = async () => {
+    try {
+      status("⬆️ Cerco aggiornamenti…");
+      const d = await api("update_check", {});
+      if (d.available) { status(""); $("btnUpdateNow").hidden = false; await applyUpdate(); } else status("✅ Hai già l'ultima versione", 5000);
+    } catch (e) { status(""); fail(e); }
+  };
+  setTimeout(() => { api("update_check", {}).then(d => { if (d.available) $("btnUpdateNow").hidden = false; }).catch(() => {}); }, 4000);
+  const viaBtn = id => [$(id).textContent, () => $(id).click()];
+  $("btnMenuDocs").onclick = ev => openGroupMenu(ev, ["btnDocs", "btnMerge", "btnSync", "btnReorg"].map(viaBtn), null);
+  $("btnMenuSet").onclick = ev => openGroupMenu(ev, ["btnSector", "btnKey", "btnUiLang", "btnShortcut", "btnUpdate"].map(viaBtn), null);
+  $("btnUiLang").textContent = UI_LANG === "en" ? "🌐 Italiano" : "🌐 English";
+  $("btnLangTop").textContent = UI_LANG === "en" ? "🇮🇹 Italiano" : "🇬🇧 English";
+  $("btnLangTop").onclick = () => $("btnUiLang").click();
+  $("btnUiLang").onclick = async () => { try { if (dirty) await saveNow(); await api("ui_lang", { lang: UI_LANG === "en" ? "it" : "en" }); location.reload(); } catch (e) { fail(e); } };
+  $("btnShortcut").onclick = async () => { try { const d = await api("shortcut", {}); status("✅ Icona creata: " + d.path, 9000); } catch (e) { fail(e); } };
   $("btnDocs").onclick = async () => { try { const d = await api("docs_open", {}); status("📂 " + d.cartella, 6000); } catch (e) { fail(e); } };
   $("btnReorg").onclick = async () => {
     try {
@@ -4320,7 +4829,7 @@ function build() {
   });
   window.addEventListener("pagehide", () => {
     if (dirty && curId != null) {
-      fetch("/api/save", { method: "POST", keepalive: true,
+      fetch(viewEN ? "/api/tr_save" : "/api/save", { method: "POST", keepalive: true,
         headers: { "X-Token": TOKEN, "Content-Type": "application/json" }, body: JSON.stringify(collect()) });
     }
   });
@@ -4338,6 +4847,25 @@ function build() {
 </body>
 </html>
 """
+
+
+def code_version():
+    """Impronta del file del programma: cambia quando il Diario viene aggiornato."""
+    try:
+        st = os.stat(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+        return "%d-%d" % (st.st_size, int(st.st_mtime))
+    except OSError:
+        return ""
+
+
+def running_is_old():
+    """True se c'e' un Diario attivo partito da una versione diversa del programma (va riavviato)."""
+    try:
+        with open(RUN_FILE, encoding="utf-8") as f:
+            info = json.load(f)
+        return info.get("version", "") != code_version() or os.path.abspath(info.get("script", "")) != os.path.abspath(__file__)
+    except (OSError, ValueError):
+        return False
 
 
 def running_url():
@@ -4405,7 +4933,23 @@ def main():
     if "--stop" in args:
         return stop_running()
     foreground = "--foreground" in args or getattr(sys, "frozen", False)
+    if "--icona" in args:
+        print("Icona creata:", make_shortcut())
+        return
+    if not getattr(sys, "frozen", False) and (IS_MAC or IS_WIN) and not load_cfg().get("shortcut_v2"):
+        try:
+            print("Ho creato l'icona «Diario del Ricercatore» sulla Scrivania:", make_shortcut())
+            cfg = load_cfg()
+            cfg["shortcut_v2"] = True
+            save_cfg(cfg)
+        except Exception:
+            pass
     url = running_url()
+    if url and running_is_old():
+        print("Il Diario e' stato aggiornato: chiudo la versione vecchia e avvio quella nuova…")
+        stop_running()
+        time.sleep(1.5)
+        url = None
     if url:
         print("Il Diario e' gia' aperto: lo riporto in primo piano nel browser.")
         webbrowser.open(url)
@@ -4437,7 +4981,7 @@ def main():
     url = "http://127.0.0.1:%d/" % srv.server_port
     os.makedirs(APP_DIR, exist_ok=True)
     with open(RUN_FILE, "w", encoding="utf-8") as f:
-        json.dump({"pid": os.getpid(), "url": url, "started": now()}, f)
+        json.dump({"pid": os.getpid(), "url": url, "started": now(), "version": code_version(), "script": os.path.abspath(__file__)}, f)
     print("🔬 Diario del Ricercatore attivo su", url)
     sys.stdout.flush()
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()

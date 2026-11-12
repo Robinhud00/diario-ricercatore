@@ -28,6 +28,14 @@ Quaderno di laboratorio digitale per **Mac e Windows**. Si apre nel browser ma g
 
 In tutti i casi il Diario **parte in background**: la finestra nera si chiude da sola (o si può chiudere senza paura, non ferma niente). Fare di nuovo doppio clic non lo avvia due volte: riapre solo la scheda del browser. Per spegnerlo usa il pulsante **⏻ Chiudi il Diario** nella barra a sinistra (da terminale: `python3 diario_web.py --stop`). Se nessuno lo usa per 8 ore si spegne da solo. Eventuali errori sono nel file `~/DiarioRicercatore/diario.log`.
 
+**Icona sul Desktop.** Al primo avvio il Diario crea da solo sulla Scrivania l'icona **«Diario del Ricercatore»** (su Mac una piccola app, su Windows un collegamento): da lì in poi basta il doppio clic sull'icona, senza Terminale. Si può ricreare con il pulsante **🖥️ Crea icona sul Desktop** (o `python3 diario_web.py --icona`). L'icona punta alla cartella dove si trova `diario_web.py`: se sposti la cartella, ricreala.
+
+**Interfaccia in inglese.** Il pulsante **🌐 English** nella barra a sinistra mette tutta l'interfaccia in inglese (e **🌐 Italiano** la riporta in italiano). È indipendente dalla «Lingua della voce».
+
+**Niente più `chmod` per chi scarica da GitHub.** Il workflow `.github/workflows/permessi.yml` rimette da solo il permesso di esecuzione a `Avvia Diario.command` a ogni caricamento: chi scarica lo ZIP da GitHub su Mac fa solo doppio clic (la prima volta: tasto destro → Apri).
+
+**Aggiornamenti con un clic.** All'avvio il Diario controlla se su GitHub c'è una versione più nuova di `diario_web.py`: se c'è, compare il pulsante verde **⬆️ Nuova versione: aggiorna ora** (oppure ⚙️ Impostazioni → «⬆️ Cerca aggiornamenti»). Un clic: scarica il file, tiene una copia di quello vecchio in `~/DiarioRicercatore/versioni_precedenti/`, e si riavvia da solo. I dati non vengono toccati. Se invece sostituisci il file a mano, al prossimo avvio il Diario si accorge che la versione accesa è vecchia e la riavvia da solo. (Con l'app pronta .exe/.app l'aggiornamento si fa scaricando la nuova release.)
+
 ### Creare le app pronte (una volta, per chi distribuisce)
 Su GitHub: **Actions → «Crea app pronte» → Run workflow** (oppure crea una release con un tag, es. `v1.0`). Dopo qualche minuto trovi gli zip in *Artifacts* (e nella release). Le app Mac sono per i chip Apple (M1–M4); sui Mac Intel usa l'opzione B.
 

@@ -25,7 +25,7 @@ p = os.path.join(d, "mol.png"); open(p, "wb").write(png)
 con = dw.db(); con.execute("INSERT INTO attachments(exp_id,filename,path) VALUES(?,?,?)", (eid, "mol.png", p)); con.commit(); con.close()
 r = dw.api_drive_sync({}); print(r)
 root = os.path.join(drive, "Diario del Ricercatore")
-docs = os.listdir(os.path.join(root, "Esperimenti")); assert len(docs) == 1 and docs[0].endswith(".docx"), docs
+dr = [os.path.join(a, f) for a, _, fs in os.walk(os.path.join(root, "Documenti")) for f in fs if f.endswith(".docx")]; assert len(dr) == 1, dr
 assert os.path.exists(os.path.join(root, "Backup", "allegati", str(eid), "mol.png"))
 bk = sqlite3.connect(os.path.join(root, "Backup", "diario.db")); assert bk.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1; bk.close()
 r2 = dw.api_drive_sync({}); assert r2["documenti"] == 0 and r2["allegati"] == 0, r2   # niente da rifare

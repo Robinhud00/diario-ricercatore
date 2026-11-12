@@ -46,4 +46,14 @@ assert seen["k"].get("encoding") == "utf-8"
 # --- Drive su Windows: usa la cartella impostata a mano con percorso di tipo Windows (qui simulato)
 d = os.path.join(home, "G", "My Drive"); os.makedirs(d)
 assert dw.check_sync_dir(d) == d
+# --- appunti Windows: lo script PowerShell restituisce JSON con PNG + CDX
+import json as _j
+def fake_ps(cmd, **k):
+    out = cmd[-1]
+    open(out, "wb").write(b"\x89PNG\r\n\x1a\nfake"); open(out + ".cdx", "wb").write(b"VjCD0100xxxxxxxx")
+    return types.SimpleNamespace(returncode=0, stdout=_j.dumps({"types": ["EnhancedMetafile", "ChemDraw Interchange Format"], "png": out, "cdx": out + ".cdx", "how": "emf"}) + "\n", stderr="")
+dw.subprocess.run = fake_ps
+tmpd = tempfile.mkdtemp(); r = dw.read_system_clipboard(tmpd)
+assert r["png"].startswith(b"\x89PNG") and r["cdx"].startswith(b"VjCD") and r["dpi"] == 384 and r["how"] == "emf", r
+assert "ChemDraw Interchange Format" in r["types"]
 print("TUTTI I TEST WINDOWS OK")

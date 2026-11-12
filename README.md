@@ -19,17 +19,38 @@ py -3 diario_web.py          # Windows — oppure doppio clic su "Avvia Diario.b
 
 Quaderno di laboratorio digitale per **Mac e Windows**. Si apre nel browser ma gira tutto sul tuo computer: nessuna libreria da installare, serve solo Python 3.
 
-## Avvio
-**Mac**
-1. Tieni nella stessa cartella `diario_web.py` e `Avvia Diario.command`.
-2. Una sola volta, da Terminale: `chmod +x ` (con lo spazio) e trascina dentro il file `Avvia Diario.command`, poi Invio.
-3. Doppio clic su `Avvia Diario.command`: nel browser si apre il Diario.
+## Avvio (il più semplice possibile)
+**Opzione A – app già pronta (consigliata per chi non è esperto).** Nella pagina *Releases* di GitHub (o dal workflow «Crea app pronte», vedi sotto) ci sono `Diario-Windows.zip` e `Diario-Mac-Apple-Silicon.zip`: scarica, estrai, doppio clic. Non serve installare Python. La prima volta Windows (SmartScreen: «Ulteriori informazioni» → «Esegui comunque») e Mac (tasto destro → «Apri») mostrano un avviso perché l'app non è firmata: è normale.
 
-**Windows**
-1. Tieni nella stessa cartella `diario_web.py` e `Avvia Diario.bat`.
-2. Doppio clic su `Avvia Diario.bat`: nel browser si apre il Diario. Se Windows avvisa che l'app non è riconosciuta, clicca «Ulteriori informazioni» → «Esegui comunque». Se dice che Python non c'è, installalo come sopra.
+**Opzione B – con Python (tutti i computer).**
+- **Windows:** doppio clic su `Avvia Diario.bat`. Se Python non c'è lo installa da solo (winget); se non può, apre la pagina di download con le istruzioni.
+- **Mac:** una sola volta `chmod +x ` + trascina `Avvia Diario.command` nel Terminale + Invio; poi doppio clic. In alternativa: `python3 diario_web.py`.
 
-In entrambi i casi lascia aperta la finestra nera (Terminale / Prompt dei comandi) mentre lavori. Per fermare il Diario chiudila (o Ctrl+C). Per riaprirlo rifai doppio clic sul file: non riaprire una vecchia scheda del browser. Se Windows Defender Firewall chiede il permesso, il Diario ascolta solo su questo computer: puoi anche negarlo.
+In tutti i casi il Diario **parte in background**: la finestra nera si chiude da sola (o si può chiudere senza paura, non ferma niente). Fare di nuovo doppio clic non lo avvia due volte: riapre solo la scheda del browser. Per spegnerlo usa il pulsante **⏻ Chiudi il Diario** nella barra a sinistra (da terminale: `python3 diario_web.py --stop`). Se nessuno lo usa per 8 ore si spegne da solo. Eventuali errori sono nel file `~/DiarioRicercatore/diario.log`.
+
+### Creare le app pronte (una volta, per chi distribuisce)
+Su GitHub: **Actions → «Crea app pronte» → Run workflow** (oppure crea una release con un tag, es. `v1.0`). Dopo qualche minuto trovi gli zip in *Artifacts* (e nella release). Le app Mac sono per i chip Apple (M1–M4); sui Mac Intel usa l'opzione B.
+
+## Documenti Word automatici
+Ogni volta che scrivi o modifichi un esperimento il Diario crea/aggiorna da solo il suo Word nella cartella `~/DiarioRicercatore/Documenti/`, organizzata come nella barra a sinistra:
+
+```
+Documenti/
+  Gruppo/
+    Sottogruppo/
+      Nome esperimento (n.12)/
+        Nome esperimento (n.12).docx
+        Allegati/   (immagini, file, .cdx…)
+```
+Se rinomini o sposti un gruppo o un esperimento, le cartelle si spostano di conseguenza; un esperimento eliminato finisce in `Documenti/_Eliminati` (mai cancellato). Con la cartella Google Drive impostata la stessa struttura viene copiata su Drive: **condividi con il supervisore la cartella «Diario del Ricercatore» di Drive e lui vede i Word sempre aggiornati**.
+Al primo avvio dopo l'aggiornamento i vecchi Word «piatti» (`esportazioni/` e `Esperimenti/` su Drive) vengono messi in ordine e archiviati in `_gia_riordinati` / `Esperimenti_vecchi` (nulla viene cancellato). Puoi rifarlo quando vuoi con **🗂️ Riordina documenti**; **📂 Cartella documenti** apre la cartella.
+
+## Lingua delle voci e versione inglese
+In alto, accanto alla scelta Claude/Gemini, c'è **«Lingua della voce»**: *nativa* o *English*. L'AI (Stila, Correggi, Titolo) scrive nella lingua scelta e il Word ha titoli ed etichette in quella lingua. La scelta si ricorda per le nuove voci.
+Il pulsante **🌍 Versione inglese (nuovo Word)** traduce titolo e sezioni e crea un secondo documento nella stessa cartella: `Nome (n.12) - English version.docx`, senza toccare il testo originale. Per aggiornarlo dopo modifiche, premilo di nuovo. (Le tabelle di dati restano come le hai scritte.)
+
+## Documento unico di progetto
+A fine progetto: menu **⋯ del gruppo → 📚 Unisci tutto in un documento…** (oppure il pulsante **📚 Documento di progetto**, che permette di scegliere anche un *progetto* invece di un gruppo). Il Diario crea un solo Word con indice e tutti gli esperimenti in ordine di data (sottogruppi compresi), ciascuno su una pagina nuova con le sue figure, tabelle e allegati. Lo trovi in `Documenti/_Riepiloghi/` (e su Drive); è un file a parte, i Word dei singoli esperimenti non cambiano. Con «in inglese» usa le versioni inglesi già create; gli esperimenti senza traduzione vengono segnalati.
 
 ## Uso
 - **＋ Nuovo esperimento**: nome, data, progetto/molecola target.
@@ -68,7 +89,7 @@ Al primo avvio scegli il tuo settore (anche più di uno); il pulsante **🧭 Set
 
 | Settore | Strumenti |
 |---|---|
-| **Chimica (sintesi)** | Reagenti e rese (mmol, equivalenti, concentrazione, resa dal reagente limitante), scheda di caratterizzazione (aspetto, p.f., Rf, NMR, MS, HPLC, IR, [α]D), disegno molecole e ChemDraw |
+| **Chimica (sintesi)** | Reagenti e rese (mmol, equivalenti, concentrazione, resa dal reagente limitante), scheda di caratterizzazione (aspetto, p.f., Rf, NMR, MS, HPLC, IR, [α]D), **lastra TLC** (numero di macchie e Rf di ognuna, disegnata e allegabile al Word), disegno molecole e ChemDraw |
 | **Farmacologia / biochimica** | Dose-risposta con IC50/EC50 e intervallo di confidenza al 95% (fit a 4 parametri), cinetica enzimatica (Km, Vmax), scheda del saggio, confronto tra gruppi |
 | **Biologia molecolare e cellulare** | Piastra a 96 pozzetti (layout e valori, sottrazione del bianco, normalizzazione, test), qPCR (ΔCt, ΔΔCt, fold change), scheda campioni e reagenti (linea cellulare, anticorpi e lotti) |
 | **Microbiologia** | Conte CFU (30-300 colonie, diluizioni), MIC, curva di crescita (tempo di raddoppio), scheda ceppo e condizioni |
@@ -102,6 +123,7 @@ L'AI è istruita a non inventare dati e a segnalare con [da completare: …] ci�
 ## File del repository
 - `diario_web.py` — l'applicazione (server locale + pagina nel browser), un solo file.
 - `Avvia Diario.command` — avvio con doppio clic su Mac.
+- `.github/workflows/build.yml` — crea le app pronte per Windows e Mac.
 - `Avvia Diario.bat` — avvio con doppio clic su Windows.
 - `legacy/diario_finestra_nativa.py` — vecchia versione con finestra nativa (richiede `customtkinter`); non più mantenuta.
 

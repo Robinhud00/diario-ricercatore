@@ -23,6 +23,7 @@ import io
 import struct
 import zipfile
 import urllib.parse
+import urllib.request
 import mimetypes
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -268,6 +269,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             exp_id INTEGER, filename TEXT, path TEXT
         );
+        CREATE TABLE IF NOT EXISTS doc_index(exp_id INTEGER PRIMARY KEY, dir TEXT);
         CREATE TABLE IF NOT EXISTS datasets(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             exp_id INTEGER, title TEXT, kind TEXT, payload TEXT, updated TEXT
@@ -283,6 +285,9 @@ def init_db():
     cols = [r["name"] for r in con.execute("PRAGMA table_info(experiments)")]
     if "group_id" not in cols:
         con.execute("ALTER TABLE experiments ADD COLUMN group_id INTEGER")
+    if "lang" not in cols:
+        con.execute("ALTER TABLE experiments ADD COLUMN lang TEXT DEFAULT ''")
+    con.execute("CREATE TABLE IF NOT EXISTS translations(exp_id INTEGER PRIMARY KEY, name TEXT, obiettivo TEXT, procedura TEXT, risultati TEXT, note TEXT, updated TEXT)")
     con.commit()
     con.close()
 
@@ -330,8 +335,8 @@ def api_new(d):
         else:
             con.execute("UPDATE exp_groups SET collapsed=0 WHERE id=?", (gid,))
     cur = con.execute(
-        "INSERT INTO experiments(name,date,project,updated,group_id) VALUES(?,?,?,?,?)",
-        ("Nuovo esperimento", datetime.date.today().strftime("%d/%m/%Y"), "", now(), gid),
+        "INSERT INTO experiments(name,date,project,updated,group_id,lang) VALUES(?,?,?,?,?,?)",
+        ("Nuovo esperimento", datetime.date.today().strftime("%d/%m/%Y"), "", now(), gid, load_cfg().get("lang_default") or ""),
     )
     con.commit()
     new_id = cur.lastrowid
@@ -342,13 +347,18 @@ def api_new(d):
 def api_save(d):
     con = db()
     con.execute(
-        "UPDATE experiments SET name=?,date=?,project=?,obiettivo=?,procedura=?,risultati=?,note=?,updated=? WHERE id=?",
+        "UPDATE experiments SET name=?,date=?,project=?,obiettivo=?,procedura=?,risultati=?,note=?,lang=?,updated=? WHERE id=?",
         (s(d.get("name")).strip(), s(d.get("date")).strip(), s(d.get("project")).strip(),
          s(d.get("obiettivo")), s(d.get("procedura")), s(d.get("risultati")), s(d.get("note")),
-         now(), int(d["id"])),
+         "en" if d.get("lang") == "en" else "", now(), int(d["id"])),
     )
     con.commit()
     con.close()
+    lg = "en" if d.get("lang") == "en" else ""
+    cfg = load_cfg()
+    if (cfg.get("lang_default") or "") != lg:
+        cfg["lang_default"] = lg
+        save_cfg(cfg)
     return {}
 
 
@@ -590,11 +600,63 @@ function run(argv) {
 }
 """
 
-PS_CLIP = (
-    "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
-    "$i=[System.Windows.Forms.Clipboard]::GetImage(); "
-    "if($i){$i.Save($args[0],[System.Drawing.Imaging.ImageFormat]::Png); Write-Output 'ok'}"
-)
+PS_CLIP = r"""
+param([string]$out)
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$ErrorActionPreference = 'SilentlyContinue'
+$do = [System.Windows.Forms.Clipboard]::GetDataObject()
+$res = @{ types = @(); png = ''; cdx = ''; how = '' }
+if ($do) { $res.types = @($do.GetFormats($false)) }
+function Save-Bmp($bmp, $path) { $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png) }
+function Read-Bytes($obj) {
+  if ($obj -is [byte[]]) { return $obj }
+  if ($obj -is [System.IO.Stream]) { $ms = New-Object System.IO.MemoryStream; $obj.CopyTo($ms); return $ms.ToArray() }
+  return $null
+}
+if ($do) {
+  # 1) struttura ChemDraw nativa (CDX)
+  foreach ($f in @('ChemDraw Interchange Format','CDX','ChemDraw Drawing')) {
+    if ($do.GetDataPresent($f)) {
+      $b = Read-Bytes ($do.GetData($f))
+      if ($b -and $b.Length -gt 8) { [System.IO.File]::WriteAllBytes($out + '.cdx', $b); $res.cdx = $out + '.cdx'; break }
+    }
+  }
+  # 2) PNG gia' pronto negli appunti
+  foreach ($f in @('PNG','image/png','Portable Network Graphics')) {
+    if (-not $res.png -and $do.GetDataPresent($f)) {
+      $b = Read-Bytes ($do.GetData($f))
+      if ($b -and $b.Length -gt 8) { [System.IO.File]::WriteAllBytes($out, $b); $res.png = $out; $res.how = 'png' }
+    }
+  }
+  # 3) metafile (la cosa migliore che ChemDraw offre per Word): lo disegno a 4x su fondo trasparente
+  if (-not $res.png) {
+    $fmt = 'EnhancedMetafile'
+    if ($do.GetDataPresent($fmt)) {
+      $mf = $do.GetData($fmt)
+      if ($mf -is [System.Drawing.Imaging.Metafile]) {
+        $w = [math]::Max(1, $mf.Width); $h = [math]::Max(1, $mf.Height)
+        $k = [math]::Min(4, [math]::Floor(4000 / [math]::Max($w, $h))); if ($k -lt 1) { $k = 1 }
+        $bmp = New-Object System.Drawing.Bitmap ([int]($w * $k)), ([int]($h * $k))
+        $bmp.SetResolution(96 * $k, 96 * $k)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.Clear([System.Drawing.Color]::White)
+        $g.SmoothingMode = 'AntiAlias'; $g.InterpolationMode = 'HighQualityBicubic'
+        $g.DrawImage($mf, 0, 0, [int]($w * $k), [int]($h * $k))
+        $g.Dispose()
+        Save-Bmp $bmp $out; $bmp.Dispose()
+        if (Test-Path $out) { $res.png = $out; $res.how = 'emf' }
+      }
+    }
+  }
+}
+# 4) immagine normale (DIB/bitmap)
+if (-not $res.png) {
+  $i = [System.Windows.Forms.Clipboard]::GetImage()
+  if ($i) { Save-Bmp $i $out; $res.png = $out; $res.how = 'bitmap' }
+}
+$res | ConvertTo-Json -Compress
+"""
 
 
 def png_set_dpi(data, dpi):
@@ -639,14 +701,29 @@ def read_system_clipboard(tmpdir):
                     res[key] = f.read()
     elif IS_WIN:
         out = os.path.join(tmpdir, "clip.png")
-        r = subprocess.run(["powershell", "-STA", "-NoProfile", "-Command", PS_CLIP, out],
-                           capture_output=True, text=True, timeout=40)
-        if os.path.exists(out):
-            with open(out, "rb") as f:
-                res["png"] = f.read()
-            res["how"] = "windows"
-        elif r.returncode != 0:
+        script = os.path.join(tmpdir, "clip.ps1")
+        with open(script, "w", encoding="utf-8-sig") as f:
+            f.write(PS_CLIP)
+        r = subprocess.run(["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, out],
+                           capture_output=True, text=True, timeout=60)
+        info = {}
+        for line in reversed((r.stdout or "").strip().splitlines()):
+            try:
+                info = json.loads(line)
+                break
+            except ValueError:
+                continue
+        if not info and r.returncode != 0:
             raise RuntimeError("Non riesco a leggere gli appunti: " + (r.stderr or "").strip()[:300])
+        res["types"] = [str(x) for x in (info.get("types") or [])]
+        res["how"] = info.get("how") or ""
+        if info.get("png") and os.path.exists(info["png"]):
+            with open(info["png"], "rb") as f:
+                res["png"] = f.read()
+            res["dpi"] = 384 if res["how"] == "emf" else 0
+        if info.get("cdx") and os.path.exists(info["cdx"]):
+            with open(info["cdx"], "rb") as f:
+                res["cdx"] = f.read()
     else:
         raise RuntimeError("L'incolla dagli appunti di sistema e' disponibile solo su Mac e Windows.")
     return res
@@ -742,6 +819,7 @@ def base_rules():
 
 def api_ai(d):
     mode = s(d.get("mode"))
+    en = d.get("lang") == "en"
     text = s(d.get("text"))
     if not text.strip():
         raise RuntimeError("Testo vuoto.")
@@ -755,6 +833,8 @@ def api_ai(d):
         if mode == "stila":
             body = SECTOR_AI[primary_sector()][1] + " Mantieni la lingua del testo originale."
         system = base_rules() + " " + body
+        if en and mode in ("stila", "correggi", "titolo"):
+            system += " IMPORTANT: write the result in scientific English, even if the input is in another language."
     else:
         raise RuntimeError("Modalita' sconosciuta.")
     engine = s(d.get("engine") or "claude")
@@ -783,9 +863,31 @@ SECTION_SETS = {
 }
 
 
-def sec_titles():
+SECTION_EN = {
+    "chimica": ("Objective", "Experimental procedure", "Results and observations"),
+    "farmaco": ("Objective and hypothesis", "Assay and conditions", "Results (IC50, Ki, inhibition)"),
+    "biologia": ("Objective and hypothesis", "Materials and methods", "Results and observations"),
+    "micro": ("Objective and hypothesis", "Materials and methods", "Results (counts, MIC, growth)"),
+    "materiali": ("Objective", "Sample preparation and measurement conditions", "Measurements and results"),
+    "dati": ("Objective and hypothesis", "Method and configuration", "Results and metrics"),
+}
+LABELS = {
+    "it": {"untitled": "Esperimento senza nome", "date": "Data", "project": "Progetto", "fig": "Figura", "data": "Dati e grafici", "dataset": "Dati",
+           "att": "Allegati", "inserted": "  (immagine inserita nel documento)", "cdx_ok": "  (originale ChemDraw, schema inserito nel documento)",
+           "cdx_no": "  (originale ChemDraw: nessuna immagine associata, non visibile nel documento)", "exported": "Esportato dal Diario del Ricercatore il ", "group": "Gruppo", "schemes": "Schema di reazione e strutture", "merged": "Documento riepilogativo", "count": "%d esperimenti"},
+    "en": {"untitled": "Untitled experiment", "date": "Date", "project": "Project", "fig": "Figure", "data": "Data and charts", "dataset": "Data",
+           "att": "Attachments", "inserted": "  (image included in the document)", "cdx_ok": "  (original ChemDraw file, structure included in the document)",
+           "cdx_no": "  (original ChemDraw file: no associated image, not visible in the document)", "exported": "Exported from the Researcher's Diary on ", "group": "Group", "schemes": "Reaction scheme and structures", "merged": "Summary document", "count": "%d experiments"},
+}
+
+
+def sec_titles(lang="it"):
     st = SECTION_SETS[primary_sector()]
-    return [(k, re.sub(r"^[^\w]+", "", st[k][0]).strip()) for k in ("obiettivo", "procedura", "risultati", "note")]
+    out = [(k, re.sub(r"^[^\w]+", "", st[k][0]).strip()) for k in ("obiettivo", "procedura", "risultati", "note")]
+    if lang == "en":
+        en = SECTION_EN[primary_sector()]
+        out = [(k, en[i] if i < 3 else "Notes and next steps") for i, (k, _) in enumerate(out)]
+    return out
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
@@ -927,102 +1029,118 @@ def w_table(rows):
     return "".join(out)
 
 
-def make_docx(exp, atts, datasets=None):
+def make_docx(exp, atts, datasets=None, lang="it", merged=None, merged_title=""):
     """Crea un file .docx (Word) con la sola libreria standard."""
-    body = [w_par(exp.get("name") or "Esperimento senza nome", style="Title")]
-    media, media_rels, images = [], [], []
-    for a in atts:
-        if not (is_image(a["filename"]) and a.get("path") and os.path.exists(a["path"])):
-            continue
-        try:
-            with open(a["path"], "rb") as f:
-                data = f.read()
-        except OSError:
-            continue
-        info = img_info(data)
-        if info:
-            images.append({"att": a, "data": data, "info": info,
-                           "ext": IMG_EXT[os.path.splitext(a["filename"].lower())[1]][0]})
-    meta = []
-    if s(exp.get("date")).strip():
-        meta.append("Data: " + s(exp["date"]).strip())
-    if s(exp.get("project")).strip():
-        meta.append("Progetto: " + s(exp["project"]).strip())
-    if meta:
-        body.append(w_par("   ·   ".join(meta), color="6B7280"))
-    chart_images = [im for im in images if im["att"]["filename"].lower().startswith("grafico-")]
-    images = [im for im in images if im not in chart_images]
+    LB = LABELS["en" if lang == "en" else "it"]
+    H1, H2 = ("Heading2", "Heading3") if merged else ("Heading1", "Heading2")
+    body, media, media_rels = [], [], []
 
-    def emit_images(lst):
-        for im in lst:
-            n = len(media) + 1
-            name = "image%d.%s" % (n, im["ext"])
-            media.append((name, im["data"]))
-            media_rels.append(
-                '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/%s"/>'
-                % (n + 1, name))
-            fname = im["att"]["filename"]
-            if fname.lower().startswith("grafico-"):
-                cw, ch = fit_cm(im["info"][0], im["info"][1], 200.0, max_h=10.5)
-            else:
-                cw, ch = fit_cm(*im["info"])
-            body.append(w_image("rId%d" % (n + 1), n, int(cw * 360000), int(ch * 360000), fname))
-            base = os.path.splitext(fname)[0]
-            base = re.sub(r"-\d{8}-\d{6}$", "", base)
-            base = re.sub(r"^(grafico|molecola)-", "", base)
-            auto = base.lower() in ("incollata", "chemdraw", "molecola", "grafico")
-            cap = "Figura %d" % n + ("" if auto else ". " + base.replace("_", " "))
-            body.append(
-                '<w:p><w:pPr><w:spacing w:after="240"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:color w:val="6B7280"/>'
-                '<w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % xml_esc(cap))
-
-    for key, title in sec_titles():
-        if key == "procedura" and images:
-            body.append(w_par("Schema di reazione e strutture", style="Heading1"))
-            emit_images(images)
-        txt = s(exp.get(key)).strip()
-        if txt:
-            body.append(w_par(title, style="Heading1"))
-            for line in txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-                line = line.rstrip()
-                if not line.strip():
-                    continue
-                m = re.match(r"^\s*([-*\u2022\u2013]|\d+[.)])\s+(.*)$", line)
-                if m:
-                    mark = "\u2022" if m.group(1) in "-*\u2022\u2013" else m.group(1)
-                    body.append(w_par(mark + "\t" + m.group(2), jc="both", ind=(567, 283), style="ListLine"))
-                else:
-                    body.append(w_par(line.strip(), jc="both"))
-        if key == "risultati" and (datasets or chart_images):
-            body.append(w_par("Dati e grafici", style="Heading1"))
-            for ds in datasets or []:
-                pl = ds.get("payload") or {}
-                body.append(w_par(s(ds.get("title")) or "Dati", style="Heading2"))
-                if s(pl.get("summary")).strip():
-                    for ln in s(pl["summary"]).split("\n"):
-                        if ln.strip():
-                            body.append(w_par(ln.strip(), jc="both"))
-                if pl.get("table"):
-                    body.append(w_table(pl["table"]))
-                    body.append(w_par(""))
-            emit_images(chart_images)
-    if atts:
-        body.append(w_par("Allegati", style="Heading1"))
-        in_doc = set(im["att"]["filename"] for im in images)
-        img_stems = set(os.path.splitext(f)[0].lower() for f in in_doc)
+    def emit_exp(exp, atts, datasets):
+        body.append(w_par(exp.get("name") or LB["untitled"], style="ExpTitle" if merged else "Title"))
+        images = []
         for a in atts:
-            fn = a["filename"]
-            note = ""
-            if fn in in_doc:
-                note = "  (immagine inserita nel documento)"
-            elif fn.lower().endswith(CHEM_EXT):
-                if os.path.splitext(fn)[0].lower() in img_stems:
-                    note = "  (originale ChemDraw, schema inserito nel documento)"
+            if not (is_image(a["filename"]) and a.get("path") and os.path.exists(a["path"])):
+                continue
+            try:
+                with open(a["path"], "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            info = img_info(data)
+            if info:
+                images.append({"att": a, "data": data, "info": info,
+                               "ext": IMG_EXT[os.path.splitext(a["filename"].lower())[1]][0]})
+        meta = []
+        if s(exp.get("_group")).strip():
+            meta.append(LB["group"] + ": " + s(exp["_group"]).strip())
+        if s(exp.get("date")).strip():
+            meta.append(LB["date"] + ": " + s(exp["date"]).strip())
+        if s(exp.get("project")).strip():
+            meta.append(LB["project"] + ": " + s(exp["project"]).strip())
+        if meta:
+            body.append(w_par("   ·   ".join(meta), color="6B7280"))
+        chart_images = [im for im in images if im["att"]["filename"].lower().startswith("grafico-")]
+        images = [im for im in images if im not in chart_images]
+
+        def emit_images(lst):
+            for im in lst:
+                n = len(media) + 1
+                name = "image%d.%s" % (n, im["ext"])
+                media.append((name, im["data"]))
+                media_rels.append(
+                    '<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/%s"/>'
+                    % (n + 1, name))
+                fname = im["att"]["filename"]
+                if fname.lower().startswith("grafico-"):
+                    cw, ch = fit_cm(im["info"][0], im["info"][1], 200.0, max_h=10.5)
                 else:
-                    note = "  (originale ChemDraw: nessuna immagine associata, non visibile nel documento)"
-            body.append(w_par("•  " + fn + note))
+                    cw, ch = fit_cm(*im["info"])
+                body.append(w_image("rId%d" % (n + 1), n, int(cw * 360000), int(ch * 360000), fname))
+                base = os.path.splitext(fname)[0]
+                base = re.sub(r"-\d{8}-\d{6}$", "", base)
+                base = re.sub(r"^(grafico|molecola)-", "", base)
+                auto = base.lower() in ("incollata", "chemdraw", "molecola", "grafico")
+                cap = "%s %d" % (LB["fig"], n) + ("" if auto else ". " + base.replace("_", " "))
+                body.append(
+                    '<w:p><w:pPr><w:spacing w:after="240"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:i/><w:color w:val="6B7280"/>'
+                    '<w:sz w:val="18"/></w:rPr><w:t xml:space="preserve">%s</w:t></w:r></w:p>' % xml_esc(cap))
+
+        for key, title in sec_titles(lang):
+            if key == "procedura" and images:
+                body.append(w_par(LB["schemes"], style=H1))
+                emit_images(images)
+            txt = s(exp.get(key)).strip()
+            if txt:
+                body.append(w_par(title, style=H1))
+                for line in txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                    line = line.rstrip()
+                    if not line.strip():
+                        continue
+                    m = re.match(r"^\s*([-*\u2022\u2013]|\d+[.)])\s+(.*)$", line)
+                    if m:
+                        mark = "\u2022" if m.group(1) in "-*\u2022\u2013" else m.group(1)
+                        body.append(w_par(mark + "\t" + m.group(2), jc="both", ind=(567, 283), style="ListLine"))
+                    else:
+                        body.append(w_par(line.strip(), jc="both"))
+            if key == "risultati" and (datasets or chart_images):
+                body.append(w_par(LB["data"], style=H1))
+                for ds in datasets or []:
+                    pl = ds.get("payload") or {}
+                    body.append(w_par(s(ds.get("title")) or LB["dataset"], style=H2))
+                    if s(pl.get("summary")).strip():
+                        for ln in s(pl["summary"]).split("\n"):
+                            if ln.strip():
+                                body.append(w_par(ln.strip(), jc="both"))
+                    if pl.get("table"):
+                        body.append(w_table(pl["table"]))
+                        body.append(w_par(""))
+                emit_images(chart_images)
+        if atts:
+            body.append(w_par(LB["att"], style=H1))
+            in_doc = set(im["att"]["filename"] for im in images)
+            img_stems = set(os.path.splitext(f)[0].lower() for f in in_doc)
+            for a in atts:
+                fn = a["filename"]
+                note = ""
+                if fn in in_doc:
+                    note = LB["inserted"]
+                elif fn.lower().endswith(CHEM_EXT):
+                    if os.path.splitext(fn)[0].lower() in img_stems:
+                        note = LB["cdx_ok"]
+                    else:
+                        note = LB["cdx_no"]
+                body.append(w_par("•  " + fn + note))
+    if merged:
+        body.append(w_par(merged_title or LB["merged"], style="Title"))
+        body.append(w_par(LB["count"] % len(merged), color="6B7280"))
+        for e in merged:
+            body.append(w_par("\u2022\t" + (s(e[0].get("name")) or LB["untitled"]) + (" (" + s(e[0].get("date")) + ")" if s(e[0].get("date")).strip() else ""), style="ListLine", ind=(567, 283)))
+        for e in merged:
+            emit_exp(*e)
+    else:
+        emit_exp(exp, atts, datasets)
     body.append(w_par(""))
-    body.append(w_par("Esportato dal Diario del Ricercatore il " +
+    body.append(w_par(LB["exported"] +
                       datetime.datetime.now().strftime("%d/%m/%Y %H:%M"),
                       italic=True, color="9CA3AF", size=18))
 
@@ -1051,10 +1169,18 @@ def make_docx(exp, atts, datasets=None):
         '<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/>'
         '<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="200" w:after="80"/>'
         '<w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:b/><w:color w:val="5B21B6"/><w:sz w:val="24"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="ExpTitle"><w:name w:val="Experiment title"/><w:basedOn w:val="Normal"/>'
+        '<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:pageBreakBefore/><w:spacing w:after="80"/><w:outlineLvl w:val="0"/></w:pPr>'
+        '<w:rPr><w:b/><w:color w:val="5B21B6"/><w:sz w:val="34"/></w:rPr></w:style>'
+        '<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/>'
+        '<w:next w:val="Normal"/><w:qFormat/><w:pPr><w:keepNext/><w:spacing w:before="160" w:after="60"/>'
+        '<w:outlineLvl w:val="2"/></w:pPr><w:rPr><w:b/><w:color w:val="6D28D9"/><w:sz w:val="22"/></w:rPr></w:style>'
         '<w:style w:type="paragraph" w:styleId="ListLine"><w:name w:val="List Line"/><w:basedOn w:val="Normal"/>'
         '<w:pPr><w:tabs><w:tab w:val="left" w:pos="567"/></w:tabs><w:spacing w:after="60"/></w:pPr></w:style>'
         "</w:styles>"
     )
+    if lang == "en":
+        styles = styles.replace('w:val="it-IT"', 'w:val="en-GB"')
     footer = (
         head + '<w:ftr xmlns:w="%s"><w:p><w:pPr><w:jc w:val="center"/></w:pPr>'
         '<w:r><w:rPr><w:color w:val="9CA3AF"/><w:sz w:val="18"/></w:rPr><w:fldChar w:fldCharType="begin"/></w:r>'
@@ -1107,24 +1233,13 @@ def safe_name(t):
 
 def api_export(d):
     exp_id = int(d["id"])
-    con = db()
-    row = con.execute("SELECT * FROM experiments WHERE id=?", (exp_id,)).fetchone()
-    atts = con.execute("SELECT filename,path FROM attachments WHERE exp_id=? ORDER BY id", (exp_id,)).fetchall()
-    dsets = ds_for(con, exp_id)
-    con.close()
-    if not row:
+    path = export_exp(exp_id, force=True)
+    if not path:
         raise RuntimeError("Esperimento non trovato.")
-    os.makedirs(EXPORT_DIR, exist_ok=True)
-    path = os.path.join(EXPORT_DIR, "%s (n.%d).docx" % (safe_name(row["name"]), exp_id))
-    with open(path, "wb") as f:
-        f.write(make_docx(dict(row), [dict(a) for a in atts], dsets))
     drive = False
-    base = sync_base()
-    if base:
+    if sync_base():
         try:
-            dest = os.path.join(base, DRIVE_SUBDIR, "Esperimenti")
-            os.makedirs(dest, exist_ok=True)
-            shutil.copy2(path, os.path.join(dest, os.path.basename(path)))
+            mirror_docs_to_drive(os.path.join(sync_base(), DRIVE_SUBDIR))
             drive = True
         except OSError:
             drive = False
@@ -1132,7 +1247,8 @@ def api_export(d):
         open_path(path)
     except OSError:
         pass
-    return {"file": os.path.basename(path), "folder": os.path.join("~", "DiarioRicercatore", "esportazioni"), "drive": drive}
+    rel = os.path.relpath(os.path.dirname(path), APP_DIR)
+    return {"file": os.path.basename(path), "folder": os.path.join("~", "DiarioRicercatore", rel), "drive": drive}
 
 
 def find_chemdraw():
@@ -1319,6 +1435,450 @@ def _copy_if_changed(src, dst):
         return False
 
 
+# ---------------- Documenti automatici (Gruppo / Sottogruppo / Esperimento) ----------------
+DOC_DIR = os.path.join(APP_DIR, "Documenti")
+_docs_lock = threading.RLock()
+_docs_event = threading.Event()
+_docs_state = {"last": 0.0}
+RUN_FILE = os.path.join(APP_DIR, "running.json")
+LOG_FILE = os.path.join(APP_DIR, "diario.log")
+IDLE_HOURS = 8
+_last_req = {"t": time.time()}
+_server = {"srv": None}
+
+
+def api_ping(d):
+    return {"app": "diario-ricercatore"}
+
+
+def _finish_and_exit():
+    try:
+        docs_sync_all()
+        if sync_base():
+            sync_to_drive()
+    except Exception:
+        pass
+    try:
+        os.remove(RUN_FILE)
+    except OSError:
+        pass
+    srv = _server["srv"]
+    if srv is not None:
+        srv.shutdown()
+    else:
+        os._exit(0)
+
+
+def api_quit(d):
+    threading.Timer(0.3, _finish_and_exit).start()
+    return {"ok": True}
+
+
+READONLY_ROUTES = {"/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
+
+
+def docs_kick():
+    _docs_event.set()
+
+
+def group_parts(con, gid):
+    """Nomi dei gruppi dalla radice fino a gid (gruppo, sottogruppo, ...)."""
+    parts, seen = [], set()
+    while gid is not None and gid not in seen:
+        seen.add(gid)
+        r = con.execute("SELECT name,parent_id FROM exp_groups WHERE id=?", (gid,)).fetchone()
+        if not r:
+            break
+        parts.append(safe_name(r["name"])[:50] or "gruppo")
+        gid = r["parent_id"]
+    return list(reversed(parts))
+
+
+def exp_folder_name(row):
+    return "%s (n.%d)" % (safe_name(row["name"])[:60], row["id"])
+
+
+def exp_target_dir(con, row):
+    parts = group_parts(con, row["group_id"]) if row["group_id"] is not None else []
+    if not parts:
+        parts = ["Senza gruppo"]
+    return os.path.join(DOC_DIR, *parts, exp_folder_name(row))
+
+
+def _inside(path, base):
+    a, b = os.path.realpath(path), os.path.realpath(base)
+    return a != b and a.startswith(b + os.sep)
+
+
+def _prune_empty(path):
+    """Toglie le cartelle vuote risalendo fino a Documenti (esclusa)."""
+    while path and _inside(path, DOC_DIR):
+        try:
+            os.rmdir(path)
+        except OSError:
+            break
+        path = os.path.dirname(path)
+
+
+def _doc_mtime_needed(con, row, atts, dsets):
+    try:
+        upd = datetime.datetime.fromisoformat(s(row["updated"])).timestamp()
+    except ValueError:
+        upd = time.time()
+    for a in atts:
+        try:
+            upd = max(upd, os.path.getmtime(a["path"]))
+        except OSError:
+            pass
+    for ds in dsets:
+        try:
+            upd = max(upd, datetime.datetime.fromisoformat(s(ds["updated"])).timestamp())
+        except ValueError:
+            pass
+    return upd
+
+
+def export_exp(exp_id, force=False):
+    """Scrive (o aggiorna) il Word dell'esperimento e copia gli allegati nella sua cartella. Ritorna il percorso del Word."""
+    with _docs_lock:
+        con = db()
+        try:
+            row = con.execute("SELECT * FROM experiments WHERE id=?", (int(exp_id),)).fetchone()
+            if not row:
+                return None
+            atts = [dict(a) for a in con.execute("SELECT filename,path FROM attachments WHERE exp_id=? ORDER BY id", (row["id"],)).fetchall()]
+            dsets = ds_for(con, row["id"])
+            target = exp_target_dir(con, row)
+            old = con.execute("SELECT dir FROM doc_index WHERE exp_id=?", (row["id"],)).fetchone()
+            moved = False
+            if old and old["dir"] and os.path.normpath(old["dir"]) != os.path.normpath(target) and os.path.isdir(old["dir"]) and _inside(old["dir"], DOC_DIR):
+                if not os.path.exists(target):
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    shutil.move(old["dir"], target)
+                    moved = True
+                _prune_empty(os.path.dirname(old["dir"]))
+            os.makedirs(target, exist_ok=True)
+            en_native = (row["lang"] or "") == "en"
+            docx = os.path.join(target, exp_folder_name(row) + ".docx")
+            tr = con.execute("SELECT * FROM translations WHERE exp_id=?", (row["id"],)).fetchone() if not en_native else None
+            docx_en = os.path.join(target, exp_folder_name(row) + " - English version.docx") if tr else None
+            keep_docs = {docx, docx_en}
+            # Word con un altro nome (esperimento rinominato): via il vecchio
+            for fn in os.listdir(target):
+                if fn.lower().endswith(".docx") and re.search(r"\(n\.%d\)( - English version)?\.docx$" % row["id"], fn) and os.path.join(target, fn) not in keep_docs:
+                    try:
+                        os.remove(os.path.join(target, fn))
+                    except OSError:
+                        pass
+            need = force or moved or not os.path.exists(docx) or os.path.getmtime(docx) < _doc_mtime_needed(con, row, atts, dsets)
+            if need:
+                tmp = docx + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(make_docx(dict(row), atts, dsets, lang="en" if en_native else "it"))
+                os.replace(tmp, docx)
+            if tr:
+                rtr = dict(row)
+                rtr.update({k: tr[k] for k in ("name", "obiettivo", "procedura", "risultati", "note")})
+                rtr["updated"] = tr["updated"]
+                need_en = force or moved or not os.path.exists(docx_en) or os.path.getmtime(docx_en) < _doc_mtime_needed(con, rtr, atts, dsets)
+                if need_en:
+                    tmp = docx_en + ".tmp"
+                    with open(tmp, "wb") as f:
+                        f.write(make_docx(rtr, atts, dsets, lang="en"))
+                    os.replace(tmp, docx_en)
+            # allegati accanto al documento
+            adir = os.path.join(target, "Allegati")
+            keep = set()
+            for a in atts:
+                if os.path.isfile(a["path"]):
+                    keep.add(a["filename"])
+                    _copy_if_changed(a["path"], os.path.join(adir, a["filename"]))
+            if os.path.isdir(adir):
+                for fn in os.listdir(adir):
+                    if fn not in keep:
+                        try:
+                            os.remove(os.path.join(adir, fn))
+                        except OSError:
+                            pass
+                if not os.listdir(adir):
+                    os.rmdir(adir)
+            con.execute("INSERT OR REPLACE INTO doc_index(exp_id,dir) VALUES(?,?)", (row["id"], target))
+            con.commit()
+            return docx
+        finally:
+            con.close()
+
+
+def api_translate(d):
+    """Traduce titolo e sezioni in inglese e crea un secondo Word «… - English version.docx»."""
+    exp_id = int(d["id"])
+    engine = s(d.get("engine") or "claude")
+    fn = {"claude": ask_claude, "gemini": ask_gemini}.get(engine)
+    if not fn:
+        raise RuntimeError("Motore AI sconosciuto.")
+    con = db()
+    row = con.execute("SELECT * FROM experiments WHERE id=?", (exp_id,)).fetchone()
+    con.close()
+    if not row:
+        raise RuntimeError("Esperimento non trovato.")
+    if (row["lang"] or "") == "en":
+        raise RuntimeError("Questa voce e' gia' scritta in inglese: non serve tradurla.")
+    keys = ("name", "obiettivo", "procedura", "risultati", "note")
+    src = {k: s(row[k]) for k in keys if s(row[k]).strip()}
+    if not src:
+        raise RuntimeError("Scrivi prima qualcosa da tradurre.")
+    system = (base_rules() + " Translate the values of the JSON object into scientific English "
+              "(experimental-section style: past tense, impersonal). Keep the keys unchanged, keep numbers, units, "
+              "chemical names, abbreviations and line breaks. Reply ONLY with a valid JSON object, no markdown.")
+    raw = fn(system, json.dumps(src, ensure_ascii=False))
+    m = re.search(r"\{.*\}", raw, re.S)
+    try:
+        out = json.loads(m.group(0)) if m else {}
+    except ValueError:
+        out = {}
+    if not isinstance(out, dict) or not out:
+        raise RuntimeError("La traduzione non e' arrivata in un formato leggibile: riprova.")
+    con = db()
+    con.execute("INSERT OR REPLACE INTO translations(exp_id,name,obiettivo,procedura,risultati,note,updated) VALUES(?,?,?,?,?,?,?)",
+                (exp_id, *[s(out.get(k)) if k in src else "" for k in keys], now()))
+    con.commit()
+    con.close()
+    path = export_exp(exp_id, force=True)
+    en = [f for f in os.listdir(os.path.dirname(path)) if f.endswith("English version.docx")]
+    full = os.path.join(os.path.dirname(path), en[0]) if en else path
+    try:
+        open_path(full)
+    except OSError:
+        pass
+    return {"file": os.path.basename(full), "folder": os.path.relpath(os.path.dirname(full), APP_DIR)}
+
+
+def api_merge(d):
+    """Unisce tutti gli esperimenti di un gruppo (con i sottogruppi) o di un progetto in un unico Word."""
+    english = bool(d.get("english"))
+    con = db()
+    if d.get("group_id") is not None:
+        gid = int(d["group_id"])
+        g = con.execute("SELECT name FROM exp_groups WHERE id=?", (gid,)).fetchone()
+        if not g:
+            con.close()
+            raise RuntimeError("Gruppo non trovato.")
+        ids = [gid] + sorted(group_descendants(con, gid))
+        rows = con.execute("SELECT * FROM experiments WHERE group_id IN (%s)" % ",".join("?" * len(ids)), ids).fetchall()
+        base_depth = len(group_parts(con, gid)) - 1
+        title = " / ".join(group_parts(con, gid))
+        label = title
+    else:
+        proj = s(d.get("project")).strip()
+        if not proj:
+            con.close()
+            raise RuntimeError("Scegli un gruppo o un progetto.")
+        rows = con.execute("SELECT * FROM experiments WHERE project=?", (proj,)).fetchall()
+        base_depth = 0
+        title = label = proj
+    if not rows:
+        con.close()
+        raise RuntimeError("Non ci sono esperimenti da unire.")
+
+    def dkey(r):
+        m = re.match(r"^\s*(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})", s(r["date"]))
+        if m:
+            y = int(m.group(3)); y += 2000 if y < 100 else 0
+            return (y, int(m.group(2)), int(m.group(1)), r["id"])
+        return (9999, 0, 0, r["id"])
+    rows = sorted(rows, key=dkey)
+    entries, missing = [], []
+    for r in rows:
+        exp = dict(r)
+        parts = group_parts(con, r["group_id"]) if r["group_id"] is not None else []
+        exp["_group"] = " / ".join(parts[base_depth:]) if d.get("group_id") is not None else " / ".join(parts)
+        if english and (r["lang"] or "") != "en":
+            tr = con.execute("SELECT * FROM translations WHERE exp_id=?", (r["id"],)).fetchone()
+            if tr:
+                exp.update({k: tr[k] for k in ("name", "obiettivo", "procedura", "risultati", "note")})
+            else:
+                missing.append(s(r["name"]))
+        atts = [dict(a) for a in con.execute("SELECT filename,path FROM attachments WHERE exp_id=? ORDER BY id", (r["id"],)).fetchall()]
+        entries.append((exp, atts, ds_for(con, r["id"])))
+    con.close()
+    out_dir = os.path.join(DOC_DIR, "_Riepiloghi")
+    os.makedirs(out_dir, exist_ok=True)
+    name = safe_name(label)[:80] + (" - complete project (English).docx" if english else " - progetto completo.docx")
+    path = os.path.join(out_dir, name)
+    with open(path, "wb") as f:
+        f.write(make_docx({}, [], None, lang="en" if english else "it", merged=entries, merged_title=title))
+    drive = False
+    if sync_base():
+        try:
+            mirror_docs_to_drive(os.path.join(sync_base(), DRIVE_SUBDIR))
+            drive = True
+        except OSError:
+            pass
+    try:
+        open_path(path)
+    except OSError:
+        pass
+    return {"file": name, "folder": os.path.relpath(out_dir, APP_DIR), "n": len(entries), "senza_traduzione": missing, "drive": drive}
+
+
+def api_projects(d):
+    con = db()
+    r = [x["project"] for x in con.execute("SELECT project, COUNT(*) c FROM experiments WHERE TRIM(IFNULL(project,''))<>'' GROUP BY project ORDER BY project")]
+    con.close()
+    return {"projects": r}
+
+
+def docs_sync_all(force=False):
+    """Allinea la cartella Documenti al database: crea/aggiorna/sposta i Word e gli allegati."""
+    with _docs_lock:
+        con = db()
+        ids = [r["id"] for r in con.execute("SELECT id FROM experiments ORDER BY id").fetchall()]
+        gone = [(r["exp_id"], r["dir"]) for r in con.execute("SELECT exp_id,dir FROM doc_index").fetchall() if r["exp_id"] not in set(ids)]
+        con.close()
+        n = 0
+        for i in ids:
+            try:
+                before = None
+                p = export_exp(i, force=force)
+                n += 1 if p else 0
+            except OSError:
+                continue
+        # esperimenti eliminati: la cartella va in «_Eliminati», non si cancella
+        if gone:
+            con = db()
+            for eid, d in gone:
+                if d and os.path.isdir(d) and _inside(d, DOC_DIR):
+                    dest = os.path.join(DOC_DIR, "_Eliminati", os.path.basename(d))
+                    try:
+                        os.makedirs(os.path.dirname(dest), exist_ok=True)
+                        if os.path.exists(dest):
+                            dest += "_" + str(int(time.time()))
+                        shutil.move(d, dest)
+                        _prune_empty(os.path.dirname(d))
+                    except OSError:
+                        pass
+                con.execute("DELETE FROM doc_index WHERE exp_id=?", (eid,))
+            con.commit()
+            con.close()
+        _docs_state["last"] = time.time()
+        return n
+
+
+def docs_loop():
+    while True:
+        _docs_event.wait(30)
+        triggered = _docs_event.is_set()
+        _docs_event.clear()
+        if triggered:
+            time.sleep(2)  # raggruppa piu' salvataggi ravvicinati
+            _docs_event.clear()
+        try:
+            docs_sync_all()
+        except Exception:
+            pass
+
+
+def docs_migrate_legacy():
+    """Sposta i vecchi Word «piatti» (esportazioni/ e Drive/Esperimenti) in cartelle di archivio: non cancella nulla."""
+    moved = {"locali": 0, "drive": 0}
+    pat = re.compile(r"\(n\.\d+\)\.docx$", re.I)
+    if os.path.isdir(EXPORT_DIR):
+        dest = os.path.join(EXPORT_DIR, "_gia_riordinati")
+        for fn in os.listdir(EXPORT_DIR):
+            p = os.path.join(EXPORT_DIR, fn)
+            if os.path.isfile(p) and pat.search(fn):
+                os.makedirs(dest, exist_ok=True)
+                try:
+                    shutil.move(p, os.path.join(dest, fn))
+                    moved["locali"] += 1
+                except OSError:
+                    pass
+    base = sync_base()
+    if base:
+        old = os.path.join(base, DRIVE_SUBDIR, "Esperimenti")
+        if os.path.isdir(old):
+            dest = os.path.join(base, DRIVE_SUBDIR, "Esperimenti_vecchi")
+            for fn in os.listdir(old):
+                p = os.path.join(old, fn)
+                if os.path.isfile(p) and pat.search(fn):
+                    os.makedirs(dest, exist_ok=True)
+                    try:
+                        shutil.move(p, os.path.join(dest, fn))
+                        moved["drive"] += 1
+                    except OSError:
+                        pass
+    return moved
+
+
+def api_docs_reorganize(d):
+    n = docs_sync_all(force=True)
+    mv = docs_migrate_legacy()
+    cfg = load_cfg()
+    cfg["docs_v2"] = True
+    save_cfg(cfg)
+    synced = False
+    if sync_base():
+        try:
+            sync_to_drive()
+            synced = True
+        except Exception:
+            synced = False
+    return {"esperimenti": n, "spostati_locali": mv["locali"], "spostati_drive": mv["drive"], "drive": synced, "cartella": DOC_DIR}
+
+
+def api_docs_open(d):
+    os.makedirs(DOC_DIR, exist_ok=True)
+    docs_sync_all()
+    if d.get("id"):
+        p = export_exp(int(d["id"]))
+        if p:
+            reveal_path(p)
+            return {"cartella": os.path.dirname(p)}
+    open_path(DOC_DIR)
+    return {"cartella": DOC_DIR}
+
+
+def mirror_docs_to_drive(root):
+    """Copia l'albero Documenti nella cartella Drive; toglie dal Drive solo i file che aveva copiato lui e che non esistono piu'."""
+    dst_root = os.path.join(root, "Documenti")
+    manifest_path = os.path.join(dst_root, ".diario_manifest.json")
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            old = set(json.load(f))
+    except (OSError, ValueError):
+        old = set()
+    cur, n = set(), 0
+    for r, _dirs, files in os.walk(DOC_DIR):
+        for fn in files:
+            if fn.endswith(".tmp"):
+                continue
+            sp = os.path.join(r, fn)
+            rel = os.path.relpath(sp, DOC_DIR)
+            cur.add(rel.replace(os.sep, "/"))
+            if _copy_if_changed(sp, os.path.join(dst_root, rel)):
+                n += 1
+    for rel in old - cur:
+        p = os.path.join(dst_root, *rel.split("/"))
+        try:
+            os.remove(p)
+            _prune_dirs_up(os.path.dirname(p), dst_root)
+        except OSError:
+            pass
+    os.makedirs(dst_root, exist_ok=True)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(sorted(cur), f)
+    return n
+
+
+def _prune_dirs_up(path, stop):
+    while path and os.path.realpath(path) != os.path.realpath(stop) and os.path.realpath(path).startswith(os.path.realpath(stop) + os.sep):
+        try:
+            os.rmdir(path)
+        except OSError:
+            break
+        path = os.path.dirname(path)
+
+
 def sync_to_drive():
     """Copia nella cartella Drive: un Word per ogni esperimento + copia di sicurezza di database e allegati."""
     base = sync_base()
@@ -1328,9 +1888,7 @@ def sync_to_drive():
         raise RuntimeError("Una sincronizzazione e' gia' in corso.")
     try:
         root = os.path.join(base, DRIVE_SUBDIR)
-        dir_exp = os.path.join(root, "Esperimenti")
         dir_bak = os.path.join(root, "Backup")
-        os.makedirs(dir_exp, exist_ok=True)
         os.makedirs(dir_bak, exist_ok=True)
         # 1) copia coerente del database (anche mentre il Diario e' in uso)
         tmp = os.path.join(dir_bak, "diario.db.tmp")
@@ -1349,33 +1907,11 @@ def sync_to_drive():
                 sp = os.path.join(r, fn)
                 if _copy_if_changed(sp, os.path.join(dir_bak, "allegati", os.path.relpath(sp, ATT_DIR))):
                     n_att += 1
-        # 3) un Word per esperimento (solo quelli nuovi o modificati)
-        n_doc = 0
+        # 3) i Word e gli allegati, nella stessa struttura Gruppo / Sottogruppo / Esperimento
+        docs_sync_all()
+        n_doc = mirror_docs_to_drive(root)
         con = db()
-        rows = con.execute("SELECT * FROM experiments ORDER BY id").fetchall()
-        for row in rows:
-            atts = con.execute("SELECT filename,path FROM attachments WHERE exp_id=? ORDER BY id", (row["id"],)).fetchall()
-            path = os.path.join(dir_exp, "%s (n.%d).docx" % (safe_name(row["name"]), row["id"]))
-            try:
-                upd = datetime.datetime.fromisoformat(s(row["updated"])).timestamp()
-            except ValueError:
-                upd = time.time()
-            for a in atts:
-                try:
-                    upd = max(upd, os.path.getmtime(a["path"]))
-                except OSError:
-                    pass
-            dsets = ds_for(con, row["id"])
-            for ds in dsets:
-                try:
-                    upd = max(upd, datetime.datetime.fromisoformat(s(ds["updated"])).timestamp())
-                except ValueError:
-                    pass
-            if os.path.exists(path) and os.path.getmtime(path) >= upd:
-                continue
-            with open(path, "wb") as f:
-                f.write(make_docx(dict(row), [dict(a) for a in atts], dsets))
-            n_doc += 1
+        rows = con.execute("SELECT id FROM experiments").fetchall()
         con.close()
         _sync_state.update({"time": now(), "error": "", "last_ts": time.time()})
         return {"documenti": n_doc, "allegati": n_att, "esperimenti": len(rows), "cartella": root}
@@ -1521,7 +2057,7 @@ def api_set_keys(d):
 ROUTES = {
     "/api/list": api_list, "/api/get": api_get, "/api/new": api_new, "/api/save": api_save,
     "/api/delete": api_delete, "/api/att_open": api_att_open, "/api/att_reveal": api_att_reveal,
-    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/sector_set": api_sector_set,
+    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/docs_reorganize": api_docs_reorganize, "/api/docs_open": api_docs_open, "/api/translate": api_translate, "/api/merge": api_merge, "/api/projects": api_projects, "/api/ping": api_ping, "/api/quit": api_quit, "/api/sector_set": api_sector_set,
     "/api/ds_list": api_ds_list, "/api/ds_save": api_ds_save, "/api/ds_delete": api_ds_delete, "/api/ai": api_ai, "/api/key_status": api_key_status,
     "/api/set_keys": api_set_keys, "/api/export": api_export,
     "/api/chemdraw_open": api_chemdraw_open, "/api/chemdraw_set": api_chemdraw_set,
@@ -1557,6 +2093,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error(403)
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        _last_req["t"] = time.time()
+        if path == "/api/ping":
+            return self.send_json({"app": "diario-ricercatore"})
         if path == "/att":
             return self.serve_attachment(parsed.query)
         if path.startswith("/jsme/"):
@@ -1640,6 +2179,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.host_ok() or not secrets.compare_digest(self.headers.get("X-Token") or "", TOKEN):
             return self.send_json({"error": "non autorizzato"}, 403)
         parsed = urllib.parse.urlparse(self.path)
+        _last_req["t"] = time.time()
         n = int(self.headers.get("Content-Length") or 0)
         try:
             if parsed.path == "/api/upload":
@@ -1650,6 +2190,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not fn:
                     return self.send_json({"error": "rotta sconosciuta"}, 404)
                 res = fn(json.loads(raw.decode("utf-8") or "{}"))
+            if parsed.path not in READONLY_ROUTES:
+                docs_kick()
             self.send_json(res)
         except RuntimeError as ex:
             self.send_json({"error": str(ex)}, 400)
@@ -1759,8 +2301,10 @@ table.plate{border-collapse:collapse;font-size:11px}
 table.plate th{color:#6B7280;font-weight:600;padding:2px 4px}
 table.plate td{padding:1px}
 table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:4px;font:inherit;font-size:11px;text-align:center;background:#fff}
-.modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(30,20,60,.45);display:flex;align-items:center;justify-content:center;z-index:10}
-.modal{background:#fff;border-radius:18px;padding:20px;width:min(760px,92vw);max-height:90vh;display:flex;flex-direction:column;gap:10px}
+.modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(30,20,60,.45);display:flex;align-items:center;justify-content:center;z-index:10;padding:12px;box-sizing:border-box;overflow:auto}
+.modal{background:#fff;border-radius:18px;padding:20px;width:min(760px,92vw);max-width:100%;max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px);overflow-y:auto;box-sizing:border-box;display:flex;flex-direction:column;gap:10px;margin:auto}
+.modal>*{flex-shrink:0}
+.modal .btns{position:sticky;bottom:-20px;background:#fff;padding:10px 0 4px;margin-bottom:-4px}
 .modal textarea{min-height:300px}
 .modal input{border:1px solid #DDD6FE;border-radius:10px;padding:10px 12px;outline:none}
 .modal .btns{display:flex;gap:8px;justify-content:flex-end}
@@ -1779,6 +2323,10 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
     <button class="btn ghost" id="btnSector">🧭 Settore</button>
     <button class="btn ghost" id="btnArchive">📦 Archivio</button>
     <button class="btn ghost" id="btnSync" title="Salva Word e copia di sicurezza nella cartella di Google Drive">☁️ Sincronizza con Drive</button>
+    <button class="btn ghost" id="btnMerge" title="Crea un unico Word con tutti gli esperimenti di un gruppo o di un progetto">📚 Documento di progetto</button>
+    <button class="btn ghost" id="btnDocs" title="Apre la cartella con i Word e gli allegati, ordinati per gruppo e sottogruppo">📂 Cartella documenti</button>
+    <button class="btn ghost" id="btnReorg" title="Rimette in ordine tutti i documenti gia' esistenti (gruppo / sottogruppo / esperimento). Non cancella nulla.">🗂️ Riordina documenti</button>
+    <button class="btn ghost" id="btnQuit" title="Salva e ferma il Diario">⏻ Chiudi il Diario</button>
     <button class="btn ghost" id="btnKey">🔑 Chiavi API e impostazioni</button>
   </aside>
   <main>
@@ -1798,6 +2346,10 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
       </div>
     </div>
     <div class="card bar" id="aibar"><span class="ailabel" id="ailabel"></span>
+      <select id="lang" title="Lingua in cui scrivi questa voce (l'AI e il Word la useranno)">
+        <option value="">🌐 Lingua della voce: nativa</option>
+        <option value="en">🇬🇧 Lingua della voce: English</option>
+      </select>
       <select id="engine" title="Quale intelligenza artificiale usare">
         <option value="claude">🟣 Claude</option>
         <option value="gemini">🔵 Gemini</option>
@@ -1840,7 +2392,7 @@ let SECTIONS = [
 const AIBTNS = [
   ["✨ Stila", "violet", "stila"],
   ["🔤 Correggi", "green", "correggi"],
-  ["🌍 In inglese", "blue", "inglese"],
+  ["🌍 Versione inglese (nuovo Word)", "blue", "translate"],
   ["💡 Suggerisci titolo", "orange", "titolo"],
   ["🪄 Istruzione libera", "pink", "libera"]
 ];
@@ -1890,7 +2442,7 @@ function autosize(t) {
 }
 
 function collect() {
-  const o = { id: curId, name: $("name").value, date: $("date").value, project: $("project").value };
+  const o = { id: curId, name: $("name").value, date: $("date").value, project: $("project").value, lang: $("lang").value };
   SECTIONS.forEach(s => { o[s[0]] = $("sec_" + s[0]).value; });
   return o;
 }
@@ -1985,6 +2537,7 @@ function renderGroup(g, arch) {
     items = [
       ["🧪  Nuovo esperimento in questo gruppo", () => newExp(g.id)],
       ["📁  Nuovo sottogruppo", () => newGroup(g.id)],
+      ["📚  Unisci tutto in un documento…", () => openMerge(g.id)],
       ["✎  Rinomina", () => renameGroup(g)],
       ["📦  Archivia (scompare dall'elenco)", () => archiveGroup(g)],
       ["🗑  Elimina il gruppo…", () => deleteGroup(g), true]];
@@ -2139,6 +2692,7 @@ async function openExp(id) {
   $("name").value = e.name || "";
   $("date").value = e.date || "";
   $("project").value = e.project || "";
+  $("lang").value = e.lang === "en" ? "en" : "";
   SECTIONS.forEach(s => { const t = $("sec_" + s[0]); t.value = e[s[0]] || ""; autosize(t); });
   renderAtt(d.attachments);
   refreshDs().catch(() => {});
@@ -2204,6 +2758,33 @@ async function delAtt(id) {
   renderAtt(d.attachments);
 }
 
+async function openMerge(gid) {
+  const pr = (await api("projects", {})).projects;
+  const opts = [];
+  TREE.groups.filter(g => !g.archived).forEach(g => opts.push(h("option", { value: "g" + g.id }, "📁 Gruppo: " + groupPath(g.id))));
+  pr.forEach(p => opts.push(h("option", { value: "p" + p }, "🏷️ Progetto: " + p)));
+  if (!opts.length) { alert("Non ci sono ancora gruppi o progetti."); return; }
+  const sel = h("select", null, opts); if (gid != null) sel.value = "g" + gid;
+  const en = h("input", { type: "checkbox" });
+  const go = h("button", { class: "btn green", onclick: async () => {
+    try {
+      if (dirty) await saveNow();
+      status("📚 Unisco gli esperimenti…"); bg.remove();
+      const v = sel.value, body = { english: en.checked };
+      if (v[0] === "g") body.group_id = parseInt(v.slice(1), 10); else body.project = v.slice(1);
+      const d = await api("merge", body);
+      status("✅ " + d.n + " esperimenti uniti in «" + d.file + "» (" + d.folder + ")" + (d.senza_traduzione.length ? " · senza traduzione: " + d.senza_traduzione.join(", ") : ""), 12000);
+    } catch (e) { status(""); fail(e); }
+  } }, "📚 Crea il documento");
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, "📚 Un unico documento per il progetto"),
+    h("div", { class: "hint" }, "Unisce in ordine di data tutti gli esperimenti del gruppo (sottogruppi compresi) o del progetto. È un file a parte: i Word dei singoli esperimenti non cambiano."),
+    sel,
+    h("label", null, en, " in inglese (usa le versioni inglesi già create con «Versione inglese»)"),
+    h("div", { class: "btns" }, go, h("button", { class: "btn grey", onclick: () => bg.remove() }, "Annulla"))
+  ]);
+}
+
 async function pasteChem(silent) {
   if (curId == null) return;
   status("📋 Leggo gli appunti…");
@@ -2246,6 +2827,21 @@ function setBusy(b) {
 
 async function runAI(mode) {
   let text, target, instr = "";
+  if (mode === "translate") {
+    if ($("lang").value === "en") { alert("Questa voce è già scritta in inglese."); return; }
+    const engine = $("engine").value, name = engineName();
+    setBusy(true);
+    try {
+      await saveNow();
+      status("🌍 " + name + " traduce la voce…");
+      const d = await api("translate", { id: curId, engine });
+      status("✅ Creato «" + d.file + "» in " + d.folder, 10000);
+    } catch (e) {
+      if ((e.message || "").startsWith("NOKEY")) openKey("Manca la chiave API di " + name + ": incollala qui sotto.");
+      else alert(e.message);
+    } finally { setBusy(false); }
+    return;
+  }
   if (mode === "titolo") {
     text = SECTIONS.map(s => s[1] + ":\n" + $("sec_" + s[0]).value).join("\n\n");
     target = "name";
@@ -2261,7 +2857,7 @@ async function runAI(mode) {
   const engine = $("engine").value, name = engineName();
   setBusy(true);
   try {
-    const d = await api("ai", { mode, text, instr, engine });
+    const d = await api("ai", { mode, text, instr, engine, lang: $("lang").value });
     showPreview(d.result, target, name);
   } catch (e) {
     if ((e.message || "").startsWith("NOKEY")) openKey("Manca la chiave API di " + name + ": incollala qui sotto.");
@@ -2888,6 +3484,7 @@ function niceTicks(lo, hi, n) {
   return t;
 }
 function chartSVG(c) {
+  if (c.kind === "tlc") return tlcSVG(c);
   const W = 680, H = 440, many = c.kind !== "bars" && c.series.length > 1;
   const L = 74, R = many ? 20 : 24, T = c.title ? 44 : 22, B = 64, pw = W - L - R, ph = H - T - B;
   let xmin, xmax, ymin = Infinity, ymax = -Infinity, cats = [];
@@ -3093,6 +3690,7 @@ function openDataset(ds, preset) {
 // preset = tipo di tabella di testo con le opzioni gia' pronte; kind = finestra strutturata
 const TOOLS = {
   reag:      { label: "Reagenti e rese", icon: "⚗️", sectors: ["chimica"], kind: "reag" },
+  tlc:       { label: "Lastra TLC (Rf)", icon: "🧫", sectors: ["chimica"], kind: "tlc" },
   char:      { label: "Caratterizzazione", icon: "🔬", sectors: ["chimica"], kind: "char" },
   dr:        { label: "Dose-risposta (IC50)", icon: "📈", sectors: ["farmaco"], text: "dr" },
   mm:        { label: "Cinetica enzimatica (Km, Vmax)", icon: "🧪", sectors: ["farmaco"], text: "xy", opts: { fit: "mm" }, unit: "µM" },
@@ -3111,7 +3709,7 @@ const TOOLS = {
   env:       { label: "Ambiente e riproducibilità", icon: "💻", sectors: ["dati"], kind: "env" },
 };
 const SECTOR_TOOLS = {
-  chimica: ["reag", "char", "bars", "xy"],
+  chimica: ["reag", "tlc", "char", "bars", "xy"],
   farmaco: ["dr", "mm", "assay", "bars"],
   biologia: ["plate", "qpcr", "samples", "bars"],
   micro: ["cfu", "mic", "growth", "strain"],
@@ -3126,7 +3724,7 @@ const CARD_TEMPLATES = {
   materials: ["Materiale e lotto", "Sintesi / processo (parametri)", "Strumento e modello", "Condizioni ambientali (T, umidità)", "Calibrazione", "Preparazione del campione", "Norma di riferimento"],
   env: ["Repository e commit", "Versione software e librerie", "Seed casuale", "Hardware", "Dataset (versione)", "Comando eseguito", "Tempo di calcolo"]
 };
-const STRUCT_KINDS = { reag: "Reagenti e rese", char: "Caratterizzazione", assay: "Scheda del saggio", plate: "Piastra a 96 pozzetti", qpcr: "qPCR (ΔΔCt)", samples: "Campioni e reagenti", cfu: "Conte CFU", mic: "MIC", strain: "Ceppo e condizioni", materials: "Materiale e condizioni di misura", env: "Ambiente e riproducibilità" };
+const STRUCT_KINDS = { reag: "Reagenti e rese", char: "Caratterizzazione", tlc: "Lastra TLC (Rf)", assay: "Scheda del saggio", plate: "Piastra a 96 pozzetti", qpcr: "qPCR (ΔΔCt)", samples: "Campioni e reagenti", cfu: "Conte CFU", mic: "MIC", strain: "Ceppo e condizioni", materials: "Materiale e condizioni di misura", env: "Ambiente e riproducibilità" };
 Object.assign(DS_KINDS, STRUCT_KINDS);
 
 function toolsForSectors() {
@@ -3442,6 +4040,102 @@ KIND_DEFS.plate = {
   }
 };
 
+// --- TLC (lastra per cromatografia su strato sottile)
+function tlcSVG(c) {
+  const X = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const lanes = c.lanes, n = Math.max(lanes.length, 1), pitch = 62, left = 44, pw = left * 2 + pitch * (n - 1) + 40;
+  const W = Math.max(pw, 300), top = c.title ? 44 : 20, ph = 300, H = top + ph + 96;
+  const fl = c.vis === "uv366" ? "#16162b" : c.vis === "uv254" ? "#d6f5c9" : "#f6efe0";
+  const spotCol = c.vis === "uv366" ? "#7dd3fc" : c.vis === "uv254" ? "#3a4a3a" : "#7a4a1d";
+  const base = top + ph - 34, front = top + 26, rfY = rf => base - rf * (base - front);
+  let s = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '" font-family="Helvetica,Arial,sans-serif">';
+  s += '<rect width="100%" height="100%" fill="#fff"/>';
+  if (c.title) s += '<text x="' + W / 2 + '" y="26" text-anchor="middle" font-size="15" font-weight="700" fill="#111">' + X(c.title) + "</text>";
+  s += '<rect x="14" y="' + top + '" width="' + (W - 28) + '" height="' + ph + '" rx="3" fill="' + fl + '" stroke="#9CA3AF"/>';
+  s += '<line x1="22" x2="' + (W - 22) + '" y1="' + base + '" y2="' + base + '" stroke="#6B7280" stroke-width="1" stroke-dasharray="4 3"/>';
+  s += '<line x1="22" x2="' + (W - 22) + '" y1="' + front + '" y2="' + front + '" stroke="#6B7280" stroke-width="1" stroke-dasharray="4 3"/>';
+  s += '<text x="' + (W - 20) + '" y="' + (front - 4) + '" text-anchor="end" font-size="9" fill="#4B5563">fronte del solvente</text>';
+  s += '<text x="' + (W - 20) + '" y="' + (base + 12) + '" text-anchor="end" font-size="9" fill="#4B5563">linea di base</text>';
+  lanes.forEach((ln, i) => {
+    const x = left + 20 + i * pitch;
+    s += '<circle cx="' + x + '" cy="' + base + '" r="2" fill="#6B7280"/>';
+    ln.rfs.forEach(r => {
+      const y = rfY(r.rf), rx = 11 * (r.size || 1), ry = 7 * (r.size || 1);
+      s += '<ellipse cx="' + x + '" cy="' + y.toFixed(1) + '" rx="' + rx.toFixed(1) + '" ry="' + ry.toFixed(1) + '" fill="' + spotCol + '" fill-opacity="' + (r.faint ? 0.45 : 0.85) + '"/>';
+      s += '<text x="' + (x + rx + 3).toFixed(1) + '" y="' + (y + 3).toFixed(1) + '" font-size="9" fill="#374151">' + r.rf.toFixed(2) + "</text>";
+    });
+    s += '<text x="' + x + '" y="' + (top + ph + 16) + '" text-anchor="middle" font-size="11" font-weight="600" fill="#111">' + X(ln.name || String(i + 1)) + "</text>";
+  });
+  const info = [c.eluent ? "Eluente: " + c.eluent : "", c.phase ? "Fase stazionaria: " + c.phase : "", c.visLabel ? "Rivelazione: " + c.visLabel : ""].filter(Boolean);
+  info.forEach((t, k) => { s += '<text x="' + W / 2 + '" y="' + (top + ph + 40 + k * 15) + '" text-anchor="middle" font-size="11" fill="#374151">' + X(t) + "</text>"; });
+  return s + "</svg>";
+}
+
+KIND_DEFS.tlc = {
+  hint: "Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato.",
+  init: () => ({ eluent: "", phase: "Gel di silice 60 F254", vis: "uv254", mode: "rf", front: "", lanes: [{ name: "SM", spots: [{ rf: "0.55" }] }, { name: "Co", spots: [{ rf: "0.55" }, { rf: "0.30" }] }, { name: "Mix", spots: [{ rf: "0.55" }, { rf: "0.30" }] }] }),
+  build: (st, on) => {
+    const el = h("div"), eluent = h("input", { type: "text", placeholder: "Eluente (es. AcOEt/esano 3:7)" }), phase = h("input", { type: "text", placeholder: "Fase stazionaria" });
+    eluent.value = st.eluent || ""; phase.value = st.phase || "";
+    eluent.addEventListener("input", () => { st.eluent = eluent.value; on(); }); phase.addEventListener("input", () => { st.phase = phase.value; on(); });
+    const vis = h("select", null, [["uv254", "UV 254 nm"], ["uv366", "UV 366 nm"], ["stain", "Rivelatore chimico (KMnO4, ninidrina, I2…)"]].map(o => h("option", { value: o[0] }, o[1]))); vis.value = st.vis || "uv254";
+    vis.addEventListener("change", () => { st.vis = vis.value; on(); });
+    const mode = h("select", null, [["rf", "Inserisco l'Rf (0–1)"], ["cm", "Inserisco le distanze in cm"]].map(o => h("option", { value: o[0] }, o[1]))); mode.value = st.mode || "rf";
+    const front = h("input", { type: "text", placeholder: "Fronte (cm)", style: "width:110px" }); front.value = st.front || "";
+    front.addEventListener("input", () => { st.front = front.value; on(); });
+    const lanesBox = h("div");
+    const unit = () => st.mode === "cm" ? "cm" : "Rf";
+    const draw = () => {
+      lanesBox.innerHTML = ""; front.style.display = st.mode === "cm" ? "" : "none";
+      st.lanes.forEach((ln, li) => {
+        const name = h("input", { type: "text", placeholder: "Nome", style: "width:90px" }); name.value = ln.name || "";
+        name.addEventListener("input", () => { ln.name = name.value; on(); });
+        const cnt = h("input", { type: "number", min: "0", max: "12", step: "1", style: "width:60px" }); cnt.value = String(ln.spots.length);
+        cnt.addEventListener("change", () => {
+          const k = Math.max(0, Math.min(12, parseInt(cnt.value, 10) || 0));
+          while (ln.spots.length < k) ln.spots.push({ rf: "" });
+          ln.spots.length = k; draw(); on();
+        });
+        const spots = h("span", { style: "display:inline-flex;gap:4px;flex-wrap:wrap;align-items:center" }, ln.spots.map((sp, si) => {
+          const i = h("input", { type: "text", placeholder: unit() + " " + (si + 1), style: "width:64px" }); i.value = sp.rf || "";
+          i.addEventListener("input", () => { sp.rf = i.value; on(); });
+          return i;
+        }));
+        const del = h("button", { class: "btn red small", onclick: () => { st.lanes.splice(li, 1); draw(); on(); } }, "✕");
+        lanesBox.append(h("div", { class: "dsopt", style: "align-items:center" }, h("b", null, (li + 1) + "."), name, h("span", { class: "muted" }, "macchie:"), cnt, spots, del));
+      });
+    };
+    mode.addEventListener("change", () => { st.mode = mode.value; draw(); on(); });
+    const add = h("button", { class: "btn grey small", onclick: () => { st.lanes.push({ name: "", spots: [{ rf: "" }] }); draw(); on(); } }, "+ Aggiungi corsia");
+    draw();
+    el.append(h("div", { class: "dsopt" }, eluent, phase), h("div", { class: "dsopt" }, vis, mode, front), lanesBox, add);
+    return { el, sync: () => {} };
+  },
+  analyze: st => {
+    const warns = [], lanes = [], fr = nz(st.front);
+    if (st.mode === "cm" && !(fr > 0)) warns.push("Inserisci la distanza percorsa dal fronte (cm) per calcolare gli Rf.");
+    st.lanes.forEach((ln, i) => {
+      const rfs = [];
+      ln.spots.forEach(sp => {
+        const v = nz(sp.rf); if (!isFinite(v)) { if ((sp.rf || "").trim()) warns.push("Valore non numerico: «" + sp.rf + "»."); return; }
+        const rf = st.mode === "cm" ? (fr > 0 ? v / fr : NaN) : v;
+        if (!isFinite(rf)) return;
+        if (rf < 0 || rf > 1) { warns.push("Rf fuori da 0–1 nella corsia «" + (ln.name || i + 1) + "»."); return; }
+        rfs.push({ rf });
+      });
+      rfs.sort((a, b) => b.rf - a.rf);
+      lanes.push({ name: (ln.name || "").trim(), rfs });
+    });
+    const withSp = lanes.filter(l => l.rfs.length || l.name);
+    if (!lanes.length || !lanes.some(l => l.rfs.length)) return { chart: null, summary: "", table: [], warns: warns.concat(["Aggiungi almeno una macchia."]) };
+    const visLabel = { uv254: "UV 254 nm", uv366: "UV 366 nm", stain: "rivelatore chimico" }[st.vis] || "";
+    const chart = { kind: "tlc", title: "", lanes: withSp, eluent: (st.eluent || "").trim(), phase: (st.phase || "").trim(), vis: st.vis, visLabel };
+    const table = [["Corsia", "N. macchie", "Rf"]].concat(withSp.map(l => [l.name || "–", String(l.rfs.length), l.rfs.map(r => r.rf.toFixed(2)).join(", ") || "–"]));
+    const head = ["TLC" + (chart.phase ? " su " + chart.phase : "") + (chart.eluent ? ", eluente " + chart.eluent : "") + (visLabel ? ", rivelazione " + visLabel : "") + "."];
+    return { chart, summary: head.concat(withSp.filter(l => l.rfs.length).map(l => (l.name || "Corsia") + ": Rf " + l.rfs.map(r => r.rf.toFixed(2)).join(", ") + ".")).join("\n"), table, warns: Array.from(new Set(warns)) };
+  }
+};
+
 // ---------- Finestra per i tipi strutturati ----------
 function openStructured(ds, kindId) {
   if (curId == null) return;
@@ -3484,7 +4178,7 @@ function openStructured(ds, kindId) {
       await refreshDs();
     } catch (e) { fail(e); }
   } }, "🖼️ Salva e allega il grafico");
-  const hasChart = ["plate", "qpcr", "cfu", "mic"].indexOf(kindId) >= 0;
+  const hasChart = ["plate", "qpcr", "cfu", "mic", "tlc"].indexOf(kindId) >= 0;
   const bg = modal([
     h("div", { class: "h2", style: "margin:0" }, TOOLS[kindId] ? TOOLS[kindId].icon + " " + TOOLS[kindId].label : STRUCT_KINDS[kindId]),
     h("div", { class: "dsgrid" }, h("div", { class: "dsleft" + (hasChart ? "" : " full"), style: hasChart ? "" : "flex-basis:100%" }, title, h("div", { class: "hint" }, def.hint), ed.el), hasChart ? h("div", { class: "dsright" }, prev, warnBox, summ) : h("div", { class: "dsright", style: "flex-basis:100%" }, warnBox, summ)),
@@ -3543,6 +4237,25 @@ function build() {
   $("btnKey").onclick = () => openKey();
   $("btnDraw").onclick = () => openMolEditor().catch(fail);
   $("btnSync").onclick = () => syncDrive(false).catch(fail);
+  $("lang").addEventListener("change", scheduleSave);
+  $("btnQuit").onclick = async () => {
+    if (!confirm("Chiudere il Diario? I dati sono salvati. Per riaprirlo basta fare di nuovo doppio clic sull'icona.")) return;
+    try {
+      await saveNow();
+      await api("quit", {});
+    } catch (e) {}
+    document.body.innerHTML = '<div style="font-family:system-ui,sans-serif;text-align:center;padding:90px 20px"><div style="font-size:60px">✅</div><h2>Diario chiuso</h2><p>Puoi chiudere questa scheda. Per riaprirlo: doppio clic su «Avvia Diario».</p></div>';
+  };
+  setInterval(() => { fetch("/api/ping").catch(() => {}); }, 60000);
+  $("btnMerge").onclick = () => openMerge(null);
+  $("btnDocs").onclick = async () => { try { const d = await api("docs_open", {}); status("📂 " + d.cartella, 6000); } catch (e) { fail(e); } };
+  $("btnReorg").onclick = async () => {
+    try {
+      status("🗂️ Riordino i documenti…");
+      const d = await api("docs_reorganize", {});
+      status("✅ Riordinati " + d.esperimenti + " esperimenti in " + d.cartella + (d.spostati_locali + d.spostati_drive ? " · vecchi file archiviati (" + (d.spostati_locali + d.spostati_drive) + "), nulla cancellato" : "") + (d.drive ? " · Drive aggiornato" : ""), 12000);
+    } catch (e) { fail(e); }
+  };
   $("btnChem").onclick = () => openChemDraw().catch(fail);
   $("btnPasteChem").onclick = () => pasteChem(false).catch(fail);
   $("btnSector").onclick = () => openSectors(false);
@@ -3588,7 +4301,8 @@ function build() {
       // ChemDraw (soprattutto su Mac) non mette un'immagine "normale" negli appunti del browser:
       // se non c'e' testo da incollare, la legge il programma direttamente dagli appunti di sistema.
       const hasText = items.some(x => x.kind === "string" && x.type === "text/plain");
-      if (!hasText && curId != null) { e.preventDefault(); pasteChem(true).catch(() => {}); }
+      const ae = document.activeElement, inField = ae && /^(INPUT|TEXTAREA)$/.test(ae.tagName);
+      if ((!hasText || !inField) && curId != null) { e.preventDefault(); pasteChem(true).catch(() => {}); }
       return;
     }
     const f = it.getAsFile();
@@ -3626,8 +4340,89 @@ function build() {
 """
 
 
+def running_url():
+    """URL di un Diario gia' attivo (dalla stessa cartella dati), oppure None."""
+    try:
+        with open(RUN_FILE, encoding="utf-8") as f:
+            info = json.load(f)
+        r = urllib.request.urlopen(info["url"] + "api/ping", timeout=2)
+        if json.loads(r.read().decode("utf-8")).get("app") == "diario-ricercatore":
+            return info["url"]
+    except Exception:
+        pass
+    return None
+
+
+def stop_running():
+    try:
+        with open(RUN_FILE, encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        print("Il Diario non e' in esecuzione.")
+        return
+    try:
+        if IS_WIN:
+            subprocess.run(["taskkill", "/PID", str(info["pid"]), "/F"], capture_output=True)
+        else:
+            os.kill(int(info["pid"]), 15)
+        print("Diario fermato.")
+    except OSError:
+        print("Il Diario non era piu' in esecuzione.")
+    try:
+        os.remove(RUN_FILE)
+    except OSError:
+        pass
+
+
+def start_detached():
+    """Rilancia il Diario in background (senza finestra), cosi' chiudere il Terminale non lo ferma."""
+    os.makedirs(APP_DIR, exist_ok=True)
+    exe = sys.executable
+    kw = {}
+    if IS_WIN:
+        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(pyw):
+            exe = pyw
+        kw["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_GROUP | NO_WINDOW
+    else:
+        kw["start_new_session"] = True
+    log = open(LOG_FILE, "ab")
+    try:
+        os.remove(RUN_FILE)
+    except OSError:
+        pass
+    subprocess.Popen([exe, os.path.abspath(__file__), "--foreground"], stdin=subprocess.DEVNULL, stdout=log, stderr=log, **kw)
+    for _ in range(60):
+        time.sleep(0.5)
+        if running_url():
+            return True
+    return False
+
+
 def main():
+    args = sys.argv[1:]
     init_db()
+    if "--stop" in args:
+        return stop_running()
+    foreground = "--foreground" in args or getattr(sys, "frozen", False)
+    url = running_url()
+    if url:
+        print("Il Diario e' gia' aperto: lo riporto in primo piano nel browser.")
+        webbrowser.open(url)
+        return
+    if not foreground:
+        print("Avvio il Diario…")
+        if start_detached():
+            print("✅ Il Diario e' aperto nel browser. Puoi chiudere questa finestra: il Diario resta attivo.")
+            print("   Per chiuderlo davvero usa il pulsante «Chiudi il Diario» nella barra a sinistra.")
+            return
+        print("⚠️  Il Diario non e' partito. Ultime righe del registro (%s):" % LOG_FILE)
+        try:
+            with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+                print("".join(f.readlines()[-15:]))
+        except OSError:
+            pass
+        sys.exit(1)
     srv = None
     for port in range(8765, 8785):
         try:
@@ -3638,18 +4433,44 @@ def main():
     if srv is None:
         print("Nessuna porta libera tra 8765 e 8784.")
         sys.exit(1)
+    _server["srv"] = srv
     url = "http://127.0.0.1:%d/" % srv.server_port
+    os.makedirs(APP_DIR, exist_ok=True)
+    with open(RUN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"pid": os.getpid(), "url": url, "started": now()}, f)
     print("🔬 Diario del Ricercatore attivo su", url)
-    print("Si apre nel browser. Per fermarlo chiudi questa finestra del Terminale (o premi Ctrl+C).")
     sys.stdout.flush()
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    def _first_docs():
+        try:
+            if not load_cfg().get("docs_v2"):
+                api_docs_reorganize({})
+            else:
+                docs_sync_all()
+        except Exception:
+            pass
+
+    def _idle():
+        while True:
+            time.sleep(300)
+            if time.time() - _last_req["t"] > IDLE_HOURS * 3600:
+                _finish_and_exit()
+                return
+    threading.Thread(target=_first_docs, daemon=True).start()
+    threading.Thread(target=docs_loop, daemon=True).start()
     threading.Thread(target=auto_sync_loop, daemon=True).start()
+    threading.Thread(target=_idle, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         srv.server_close()
+        try:
+            os.remove(RUN_FILE)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

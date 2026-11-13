@@ -39,6 +39,10 @@ for _st in (sys.stdout, sys.stderr):
         pass
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
+# Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
+APP_VERSION = "2026.11.12.4"
+# Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
+INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
 DB_PATH = os.path.join(APP_DIR, "diario.db")
 CFG_PATH = os.path.join(APP_DIR, "config.json")
@@ -347,7 +351,7 @@ def api_new(d):
             con.execute("UPDATE exp_groups SET collapsed=0 WHERE id=?", (gid,))
     cur = con.execute(
         "INSERT INTO experiments(name,date,project,updated,group_id,lang) VALUES(?,?,?,?,?,?)",
-        ("Nuovo esperimento", datetime.date.today().strftime("%d/%m/%Y"), "", now(), gid, load_cfg().get("lang_default") or ""),
+        ("New experiment" if load_cfg().get("ui_lang") == "en" else "Nuovo esperimento", datetime.date.today().strftime("%d/%m/%Y"), "", now(), gid, load_cfg().get("lang_default") or ""),
     )
     con.commit()
     new_id = cur.lastrowid
@@ -1678,7 +1682,7 @@ def make_shortcut():
     """Crea sulla Scrivania l'icona del Diario (Mac: una vera .app; Windows: un collegamento). Ritorna il percorso."""
     if getattr(sys, "frozen", False):
         raise RuntimeError("Stai gia' usando l'app pronta: trascinala dove preferisci.")
-    script = os.path.abspath(__file__)
+    script = ensure_installed()
     name = "Diario del Ricercatore"
     if IS_MAC:
         app = os.path.join(os.path.expanduser("~/Desktop"), name + ".app")
@@ -1694,10 +1698,20 @@ def make_shortcut():
                     '<key>CFBundleIdentifier</key><string>com.scifail.diario</string><key>CFBundlePackageType</key><string>APPL</string>'
                     '<key>CFBundleVersion</key><string>1</string><key>LSUIElement</key><true/></dict></plist>\n' % name)
         launcher = os.path.join(macos, "diario")
+        log = os.path.join(APP_DIR, "diario.log")
         with open(launcher, "w", encoding="utf-8") as f:
-            f.write('#!/bin/bash\nPY="%s"\n[ -x "$PY" ] || PY="$(command -v python3)"\n'
-                    'if [ ! -f "%s" ]; then osascript -e \'display dialog "Diario non trovato: la cartella risulta spostata. Apri di nuovo Avvia Diario dalla nuova posizione e ricrea la sua icona." buttons {"OK"}\'; exit 1; fi\n'
-                    'exec "$PY" "%s"\n' % (sys.executable, script, script))
+            f.write("#!/bin/bash\n"
+                    "# Avvia il Diario del Ricercatore (creato dal Diario stesso)\n"
+                    'export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"\n'
+                    'SCRIPT="%s"\nLOG="%s"\nPY="%s"\n'
+                    '[ -x "$PY" ] || PY="$(command -v python3)"\n'
+                    'if [ ! -f "$SCRIPT" ] || [ -z "$PY" ]; then\n'
+                    "  osascript -e 'display dialog \"Diario non trovato. Apri di nuovo Avvia Diario dalla cartella scaricata: l icona verra ricreata.\" buttons {\"OK\"} with title \"Diario del Ricercatore\"'\n"
+                    "  exit 1\nfi\n"
+                    'cd "$HOME"\n'
+                    'if ! "$PY" "$SCRIPT" >>"$LOG" 2>&1; then\n'
+                    "  osascript -e 'display dialog \"Il Diario non si e avviato. Il motivo e scritto nel file diario.log dentro la cartella DiarioRicercatore.\" buttons {\"OK\"} with title \"Diario del Ricercatore\"'\n"
+                    "  exit 1\nfi\n" % (script, log, sys.executable))
         os.chmod(launcher, 0o755)
         try:  # fa rileggere l'icona al Finder
             os.utime(app, None)
@@ -1726,7 +1740,7 @@ def make_shortcut():
 def api_shortcut(d):
     p = make_shortcut()
     cfg = load_cfg()
-    cfg["shortcut_v2"] = True
+    cfg["shortcut_v3"] = True
     save_cfg(cfg)
     return {"path": p}
 
@@ -1821,7 +1835,7 @@ def api_quit(d):
     return {"ok": True}
 
 
-READONLY_ROUTES = {"/api/update_check", "/api/update_apply", "/api/ui_lang", "/api/shortcut", "/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
+READONLY_ROUTES = {"/api/lab_get", "/api/lab_add", "/api/lab_remove", "/api/lab_exp", "/api/lab_seen", "/api/lab_open", "/api/pick_folder", "/api/update_check", "/api/update_apply", "/api/ui_lang", "/api/shortcut", "/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
 
 
 def docs_kick():
@@ -2226,6 +2240,263 @@ def _prune_dirs_up(path, stop):
         path = os.path.dirname(path)
 
 
+# ---------------- Laboratorio (supervisore e studenti, tramite le cartelle Drive condivise) ----------------
+LAB_COLORS = ["#7C3AED", "#2563EB", "#059669", "#D97706", "#DC2626", "#DB2777", "#0891B2", "#4F46E5", "#65A30D", "#9333EA"]
+_lab_notified = {}
+_lab_lock = threading.Lock()
+
+
+def owner_name():
+    n = s(load_cfg().get("owner_name")).strip()
+    if n:
+        return n
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:
+        return ""
+
+
+def write_lab_state(root):
+    """Scrive in Drive «stato.json»: l'elenco degli esperimenti con il testo, che il Diario del supervisore legge."""
+    with _docs_lock:
+        con = db()
+        exps = []
+        for r in con.execute("SELECT * FROM experiments ORDER BY id").fetchall():
+            di = con.execute("SELECT dir FROM doc_index WHERE exp_id=?", (r["id"],)).fetchone()
+            docx = ""
+            if di and di["dir"] and _inside(di["dir"], DOC_DIR):
+                docx = os.path.join(os.path.relpath(di["dir"], DOC_DIR), exp_folder_name(r) + ".docx").replace(os.sep, "/")
+            exps.append({
+                "id": r["id"], "name": s(r["name"]), "date": s(r["date"]), "project": s(r["project"]), "updated": s(r["updated"]),
+                "group": group_parts(con, r["group_id"]) if r["group_id"] is not None else [],
+                "docx": docx, "lang": s(r["lang"]),
+                "n_att": con.execute("SELECT COUNT(*) FROM attachments WHERE exp_id=?", (r["id"],)).fetchone()[0],
+                "n_data": con.execute("SELECT COUNT(*) FROM datasets WHERE exp_id=?", (r["id"],)).fetchone()[0],
+                "sections": {k: s(r[k]) for k in ("obiettivo", "procedura", "risultati", "note")},
+            })
+        con.close()
+    data = {"format": 1, "owner": owner_name(), "updated": now(), "app_version": APP_VERSION, "sector": primary_sector(),
+            "titles": dict(sec_titles()), "experiments": exps}
+    tmp = os.path.join(root, "stato.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, os.path.join(root, "stato.json"))
+
+
+def lab_cfg():
+    lab = load_cfg().get("lab")
+    if not isinstance(lab, dict):
+        lab = {}
+    lab.setdefault("members", [])
+    lab.setdefault("seen", {})
+    return lab
+
+
+def lab_save(lab):
+    cfg = load_cfg()
+    cfg["lab"] = lab
+    save_cfg(cfg)
+
+
+def lab_root(path):
+    """Accetta sia la cartella «Diario del Ricercatore» dello studente sia quella che la contiene."""
+    p = os.path.expanduser(s(path).strip())
+    for cand in (p, os.path.join(p, DRIVE_SUBDIR)):
+        if os.path.isfile(os.path.join(cand, "stato.json")):
+            return cand
+    return None
+
+
+def lab_read(member):
+    root = lab_root(member.get("path"))
+    if not root:
+        return None, None
+    try:
+        with open(os.path.join(root, "stato.json"), encoding="utf-8") as f:
+            st = json.load(f)
+        return (st if isinstance(st, dict) else None), root
+    except (OSError, ValueError):
+        return None, root
+
+
+def lab_member_view(member, seen):
+    st, root = lab_read(member)
+    out = {"id": member["id"], "name": member.get("name", ""), "color": member.get("color", LAB_COLORS[0]), "path": member.get("path", ""),
+           "ok": bool(st), "owner": "", "updated": "", "experiments": [], "news": 0}
+    if not st:
+        out["error"] = "Cartella non trovata o non ancora sincronizzata (manca stato.json)." if not root else "Il file stato.json non si legge: riprova tra poco."
+        return out
+    sm = seen.get(member["id"], {})
+    out["owner"], out["updated"] = s(st.get("owner")), s(st.get("updated"))
+    for e in st.get("experiments", []):
+        prev = sm.get(str(e.get("id")))
+        state = "new" if prev is None else ("changed" if prev != e.get("updated") else "seen")
+        if state != "seen":
+            out["news"] += 1
+        out["experiments"].append({"id": e.get("id"), "name": e.get("name"), "date": e.get("date"), "project": e.get("project"),
+                                   "updated": e.get("updated"), "group": e.get("group") or [], "state": state,
+                                   "n_att": e.get("n_att", 0), "n_data": e.get("n_data", 0), "has_doc": bool(e.get("docx"))})
+    return out
+
+
+def api_lab_get(d):
+    lab = lab_cfg()
+    return {"owner_name": owner_name(), "sync": bool(sync_base()),
+            "members": [lab_member_view(m, lab["seen"]) for m in lab["members"]]}
+
+
+def api_lab_name(d):
+    cfg = load_cfg()
+    cfg["owner_name"] = s(d.get("name")).strip()[:60]
+    save_cfg(cfg)
+    return {}
+
+
+def api_lab_add(d):
+    name, path = s(d.get("name")).strip()[:60], s(d.get("path")).strip()
+    if not name:
+        raise RuntimeError("Scrivi il nome dello studente.")
+    if not path or not os.path.isdir(os.path.expanduser(path)):
+        raise RuntimeError("La cartella indicata non esiste su questo computer.")
+    lab = lab_cfg()
+    mid = "m%d" % (max([int(m["id"][1:]) for m in lab["members"]] + [0]) + 1)
+    lab["members"].append({"id": mid, "name": name, "path": path, "color": LAB_COLORS[len(lab["members"]) % len(LAB_COLORS)]})
+    lab_save(lab)
+    return {"id": mid, "found": bool(lab_root(path))}
+
+
+def api_lab_remove(d):
+    lab = lab_cfg()
+    lab["members"] = [m for m in lab["members"] if m["id"] != d.get("id")]
+    lab["seen"].pop(s(d.get("id")), None)
+    lab_save(lab)
+    return {}
+
+
+def _lab_find(lab, mid):
+    for m in lab["members"]:
+        if m["id"] == mid:
+            return m
+    raise RuntimeError("Studente non trovato.")
+
+
+def api_lab_exp(d):
+    """Testo di un esperimento dello studente (sola lettura) e lo segna come visto."""
+    lab = lab_cfg()
+    m = _lab_find(lab, d.get("member"))
+    st, root = lab_read(m)
+    if not st:
+        raise RuntimeError("Non riesco a leggere i dati dello studente.")
+    for e in st.get("experiments", []):
+        if str(e.get("id")) == str(d.get("exp")):
+            lab["seen"].setdefault(m["id"], {})[str(e.get("id"))] = e.get("updated")
+            lab_save(lab)
+            return {"exp": e, "titles": st.get("titles") or dict(sec_titles())}
+    raise RuntimeError("Esperimento non trovato.")
+
+
+def api_lab_seen(d):
+    lab = lab_cfg()
+    m = _lab_find(lab, d.get("member"))
+    st, root = lab_read(m)
+    if st:
+        lab["seen"][m["id"]] = {str(e.get("id")): e.get("updated") for e in st.get("experiments", [])}
+        lab_save(lab)
+    return {}
+
+
+def api_lab_open(d):
+    lab = lab_cfg()
+    m = _lab_find(lab, d.get("member"))
+    st, root = lab_read(m)
+    if not st:
+        raise RuntimeError("Non riesco a leggere i dati dello studente.")
+    if d.get("exp") is None:
+        open_path(os.path.join(root, "Documenti") if os.path.isdir(os.path.join(root, "Documenti")) else root)
+        return {}
+    for e in st.get("experiments", []):
+        if str(e.get("id")) == str(d.get("exp")) and e.get("docx"):
+            p = os.path.realpath(os.path.join(root, "Documenti", *s(e["docx"]).split("/")))
+            if p.startswith(os.path.realpath(root) + os.sep) and os.path.isfile(p):
+                open_path(p)
+                return {}
+    raise RuntimeError("Il Word di questo esperimento non e' ancora arrivato nella cartella condivisa.")
+
+
+def api_pick_folder(d):
+    """Finestra di sistema per scegliere una cartella."""
+    try:
+        if IS_MAC:
+            r = subprocess.run(["osascript", "-e", 'POSIX path of (choose folder with prompt "Scegli la cartella «Diario del Ricercatore» dello studente")'],
+                               capture_output=True, text=True, timeout=300)
+            return {"path": (r.stdout or "").strip()}
+        if IS_WIN:
+            ps = ("Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                  "$f.Description = 'Scegli la cartella Diario del Ricercatore dello studente'; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }")
+            r = subprocess.run(["powershell", "-STA", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=300)
+            return {"path": (r.stdout or "").strip()}
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"path": ""}
+
+
+def notify(title, text):
+    """Notifica di sistema (Mac e Windows); se non riesce, pazienza."""
+    try:
+        if IS_MAC:
+            q = lambda x: s(x).replace("\\", " ").replace('"', "'")
+            subprocess.run(["osascript", "-e", 'display notification "%s" with title "%s"' % (q(text), q(title))], capture_output=True, timeout=15)
+        elif IS_WIN:
+            q = lambda x: s(x).replace("'", "''")
+            ps = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $n = New-Object System.Windows.Forms.NotifyIcon; "
+                  "$n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; "
+                  "$n.ShowBalloonTip(8000, '%s', '%s', 'Info'); Start-Sleep -Seconds 9; $n.Dispose()" % (q(title), q(text)))
+            subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], creationflags=0x08000000)
+    except Exception:
+        pass
+
+
+def lab_scan(first=False):
+    """Controlla le cartelle degli studenti: ritorna le novita' non ancora notificate."""
+    lab = lab_cfg()
+    news = []
+    with _lab_lock:
+        for m in lab["members"]:
+            st, root = lab_read(m)
+            if not st:
+                continue
+            known = _lab_notified.setdefault(m["id"], None)
+            cur = {str(e.get("id")): e.get("updated") for e in st.get("experiments", [])}
+            if known is not None:
+                for e in st.get("experiments", []):
+                    k = str(e.get("id"))
+                    if known.get(k) != e.get("updated"):
+                        news.append((m.get("name", ""), s(e.get("name")), k not in known))
+            _lab_notified[m["id"]] = cur
+    return news
+
+
+def lab_loop():
+    lab_scan(first=True)
+    while True:
+        time.sleep(60)
+        try:
+            news = lab_scan()
+            if not news:
+                continue
+            en = load_cfg().get("ui_lang") == "en"
+            if len(news) == 1:
+                who, what, is_new = news[0]
+                msg = ("%s added «%s»" if is_new else "%s updated «%s»") % (who, what) if en else ("%s ha aggiunto «%s»" if is_new else "%s ha aggiornato «%s»") % (who, what)
+            else:
+                names = ", ".join(sorted({n[0] for n in news}))
+                msg = ("%d updates from %s" % (len(news), names)) if en else ("%d novità da %s" % (len(news), names))
+            notify("Researcher's Diary · Lab" if en else "Diario del Ricercatore · Laboratorio", msg)
+        except Exception:
+            pass
+
+
 def sync_to_drive():
     """Copia nella cartella Drive: un Word per ogni esperimento + copia di sicurezza di database e allegati."""
     base = sync_base()
@@ -2257,6 +2528,7 @@ def sync_to_drive():
         # 3) i Word e gli allegati, nella stessa struttura Gruppo / Sottogruppo / Esperimento
         docs_sync_all()
         n_doc = mirror_docs_to_drive(root)
+        write_lab_state(root)
         con = db()
         rows = con.execute("SELECT id FROM experiments").fetchall()
         con.close()
@@ -2279,9 +2551,9 @@ def api_drive_sync(d):
 
 
 def auto_sync_loop():
-    """Ogni 5 minuti, se la cartella Drive e' impostata e ci sono modifiche, sincronizza da sola."""
+    """Ogni minuto, se la cartella Drive e' impostata e ci sono modifiche, sincronizza da sola."""
     while True:
-        time.sleep(300)
+        time.sleep(60)
         try:
             if sync_base() and os.path.getmtime(DB_PATH) > _sync_state["last_ts"]:
                 sync_to_drive()
@@ -2404,7 +2676,7 @@ def api_set_keys(d):
 ROUTES = {
     "/api/list": api_list, "/api/get": api_get, "/api/new": api_new, "/api/save": api_save,
     "/api/delete": api_delete, "/api/att_open": api_att_open, "/api/att_reveal": api_att_reveal,
-    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/docs_reorganize": api_docs_reorganize, "/api/docs_open": api_docs_open, "/api/translate": api_translate, "/api/tr_save": api_tr_save, "/api/merge": api_merge, "/api/ui_lang": api_ui_lang, "/api/update_check": api_update_check, "/api/update_apply": api_update_apply, "/api/shortcut": api_shortcut, "/api/projects": api_projects, "/api/ping": api_ping, "/api/quit": api_quit, "/api/sector_set": api_sector_set,
+    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/docs_reorganize": api_docs_reorganize, "/api/docs_open": api_docs_open, "/api/translate": api_translate, "/api/tr_save": api_tr_save, "/api/merge": api_merge, "/api/lab_get": api_lab_get, "/api/lab_name": api_lab_name, "/api/lab_add": api_lab_add, "/api/lab_remove": api_lab_remove, "/api/lab_exp": api_lab_exp, "/api/lab_seen": api_lab_seen, "/api/lab_open": api_lab_open, "/api/pick_folder": api_pick_folder, "/api/ui_lang": api_ui_lang, "/api/update_check": api_update_check, "/api/update_apply": api_update_apply, "/api/shortcut": api_shortcut, "/api/projects": api_projects, "/api/ping": api_ping, "/api/quit": api_quit, "/api/sector_set": api_sector_set,
     "/api/ds_list": api_ds_list, "/api/ds_save": api_ds_save, "/api/ds_delete": api_ds_delete, "/api/ai": api_ai, "/api/key_status": api_key_status,
     "/api/set_keys": api_set_keys, "/api/export": api_export,
     "/api/chemdraw_open": api_chemdraw_open, "/api/chemdraw_set": api_chemdraw_set,
@@ -2628,6 +2900,29 @@ select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px
 .gbody{margin:3px 0 0 9px;padding-left:6px;border-left:3px solid}
 .thumb{width:84px;height:60px;object-fit:contain;flex-shrink:0;border-radius:8px;background:#fff;border:1px solid #DDD6FE;cursor:zoom-in}
 .att .nm{min-width:0;overflow-wrap:anywhere}
+.labgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;margin:6px 0}
+.labcard{border:1.5px solid #DDD6FE;border-radius:16px;padding:14px 10px;text-align:center;cursor:pointer;background:#FAF8FF;display:flex;flex-direction:column;align-items:center;gap:5px}
+.labcard:hover{border-color:#7C3AED;background:#F3EEFF}
+.labcard.off{opacity:.65}
+.labav{border-radius:50%;color:#fff;font-weight:800;display:flex;align-items:center;justify-content:center;position:relative;flex-shrink:0}
+.labbadge{position:absolute;top:-4px;right:-6px;background:#EF4444;color:#fff;border-radius:999px;font-size:12px;font-weight:800;min-width:20px;height:20px;line-height:20px;padding:0 5px;box-sizing:border-box;text-align:center}
+.labname{font-weight:700;color:#1F2937}
+.labnew{background:#FEE2E2;color:#B91C1C;border-radius:999px;padding:2px 10px;font-size:12px;font-weight:700}
+.labadd{border:1.5px dashed #C4B5FD;border-radius:14px;padding:10px 12px}
+.labme{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
+.labsplit{display:grid;grid-template-columns:minmax(230px,330px) 1fr;gap:14px;min-height:300px}
+@media(max-width:760px){.labsplit{grid-template-columns:1fr}}
+.lablist{max-height:56vh;overflow:auto;border:1px solid #E5E7EB;border-radius:12px;padding:6px}
+.labgroup{font-weight:700;color:#5B21B6;font-size:13px;padding:8px 6px 3px}
+.labrow{padding:8px 10px;border-radius:10px;cursor:pointer;position:relative}
+.labrow:hover{background:#F3EEFF}.labrow.on{background:#EDE9FE}
+.labrname{font-weight:600;padding-right:74px;overflow-wrap:anywhere}
+.labchip{position:absolute;right:8px;top:8px;border-radius:999px;font-size:11px;font-weight:800;padding:2px 8px;color:#fff;background:#EF4444}
+.labchip.changed{background:#F59E0B}
+.labread-box{border:1px solid #E5E7EB;border-radius:12px;padding:14px;max-height:56vh;overflow:auto;background:#fff}
+.labtitle{font-size:19px;font-weight:800;color:#1F2937}
+.labsec{font-weight:700;color:#5B21B6;margin-top:12px}
+.labtext{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
 .viewer{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,10,35,.88);z-index:50;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:16px;box-sizing:border-box;cursor:zoom-out}
 .viewer img{max-width:100%;max-height:calc(100% - 60px);object-fit:contain;background:#fff;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
 .viewer .cap{color:#fff;font-weight:600;display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:center}
@@ -2685,6 +2980,7 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
     </div>
     <input id="search" placeholder="🔍 Cerca esperimento…">
     <div id="list"></div>
+    <button class="btn ghost" id="btnLab" style="width:100%;margin-top:8px;position:relative" title="Gli studenti del tuo laboratorio e il loro lavoro">🏛️ Laboratorio <span id="labCount" class="labbadge" hidden style="position:static;display:inline-block;margin-left:6px"></span></button>
     <div class="sbrow" style="margin-top:8px">
       <button class="btn ghost" id="btnMenuDocs" style="flex:1" title="Cartella dei documenti, documento unico di progetto, Google Drive">📂 Documenti ▾</button>
       <button class="btn ghost" id="btnMenuSet" style="flex:1" title="Settore, chiavi API, lingua, icona sul Desktop">⚙️ Impostazioni ▾</button>
@@ -2763,9 +3059,9 @@ const TOKEN = "__TOKEN__";
 const JSME_URL = "__JSME__";
 // ---------- Interfaccia in inglese ----------
 const UI_LANG = "__UILANG__";
-const EN_PAIRS = [["🔬 Diario del Ricercatore", "🔬 Researcher's Diary"], ["＋ Esperimento", "＋ Experiment"], ["📁＋ Gruppo", "📁＋ Group"], ["Crea un gruppo per raggruppare gli esperimenti", "Create a group to organise experiments"], ["🔍 Cerca esperimento…", "🔍 Search experiments…"], ["🧭 Settore", "🧭 Field"], ["☁️ Sincronizza con Drive", "☁️ Sync with Drive"], ["Salva Word e copia di sicurezza nella cartella di Google Drive", "Save Word files and a backup copy to the Google Drive folder"], ["📚 Documento di progetto", "📚 Project document"], ["Crea un unico Word con tutti gli esperimenti di un gruppo o di un progetto", "Create a single Word file with all experiments of a group or project"], ["📂 Cartella documenti", "📂 Documents folder"], ["Apre la cartella con i Word e gli allegati, ordinati per gruppo e sottogruppo", "Opens the folder with Word files and attachments, organised by group and subgroup"], ["🗂️ Riordina documenti", "🗂️ Reorganise documents"], ["Rimette in ordine tutti i documenti gia' esistenti (gruppo / sottogruppo / esperimento). Non cancella nulla.", "Reorganises all existing documents (group / subgroup / experiment). Nothing is deleted."], ["⏻ Chiudi il Diario", "⏻ Close the Diary"], ["Salva e ferma il Diario", "Save and stop the Diary"], ["🔑 Chiavi API e impostazioni", "🔑 API keys and settings"], ["Nome dell'esperimento (es. NG012 – step 3)", "Experiment name (e.g. NG012 – step 3)"], ["Data", "Date"], ["Progetto / molecola target", "Project / target molecule"], ["💾 Salva", "💾 Save"], ["Apre l'app ChemDraw", "Opens the ChemDraw app"], ["📄 Esporta in Word", "📄 Export to Word"], ["Crea un documento Word di questo esperimento", "Create a Word document of this experiment"], ["Elimina esperimento", "Delete experiment"], ["📁 Gruppo:", "📁 Group:"], ["🌐 Lingua della voce: nativa", "🌐 Entry language: native"], ["🇬🇧 Lingua della voce: English", "🇬🇧 Entry language: English"], ["Lingua in cui scrivi questa voce (l'AI e il Word la useranno)", "Language you write this entry in (AI and Word will use it)"], ["Quale intelligenza artificiale usare", "Which AI to use"], ["📈 Dati e grafici", "📈 Data and charts"], ["📎 Allegati (ChemDraw e altri file)", "📎 Attachments (ChemDraw and other files)"], ["📋 Incolla da ChemDraw", "📋 Paste from ChemDraw"], ["Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)", "Paste the structure copied from ChemDraw into the experiment (Cmd+C / Ctrl+C in ChemDraw)"], ["🧪 Disegna molecola", "🧪 Draw molecule"], ["Disegna una molecola o uno schema e allegalo all'esperimento", "Draw a molecule or scheme and attach it to the experiment"], ["＋ Aggiungi file", "＋ Add file"], ["🎯 Obiettivo", "🎯 Objective"], ["🎯 Obiettivo e ipotesi", "🎯 Objective and hypothesis"], ["Qual è lo scopo dell'esperimento?", "What is the purpose of the experiment?"], ["Domanda biologica e ipotesi da verificare.", "Biological question and hypothesis to test."], ["Bersaglio, composti, domanda a cui risponde il saggio.", "Target, compounds, question the assay answers."], ["Ceppi, composti e domanda a cui risponde l'esperimento.", "Strains, compounds and question the experiment answers."], ["Domanda di ricerca, ipotesi, metrica di successo.", "Research question, hypothesis, success metric."], ["🧪 Procedura sperimentale", "🧪 Experimental procedure"], ["Scrivi qui appunti e procedura, anche in modo disordinato: l'AI li metterà in forma.", "Write your notes and procedure here, even messily: the AI will put them in shape."], ["🧫 Saggio e condizioni", "🧫 Assay and conditions"], ["Bersaglio/enzima, composti e concentrazioni, tampone, incubazione, rivelazione, controlli…", "Target/enzyme, compounds and concentrations, buffer, incubation, detection, controls…"], ["🧬 Materiali e metodi", "🧬 Materials and methods"], ["Linee cellulari e passaggio, trattamenti, anticorpi (diluizioni, lotti), kit, protocollo…", "Cell lines and passage, treatments, antibodies (dilutions, lots), kits, protocol…"], ["🦠 Materiali e metodi", "🦠 Materials and methods"], ["Ceppi, terreni, condizioni di crescita, inoculo, metodo (CFU, MIC, curve), controlli…", "Strains, media, growth conditions, inoculum, method (CFU, MIC, curves), controls…"], ["🔧 Preparazione e condizioni di misura", "🔧 Preparation and measurement conditions"], ["Materiale e lotto, processo, parametri, strumento e calibrazione, condizioni ambientali…", "Material and lot, process, parameters, instrument and calibration, environmental conditions…"], ["💻 Metodo e configurazione", "💻 Method and configuration"], ["Dati e versione, modello, iperparametri, seed, hardware, comando eseguito…", "Data and version, model, hyperparameters, seed, hardware, command run…"], ["📊 Risultati e osservazioni", "📊 Results and observations"], ["Rese, aspetto, TLC, NMR, osservazioni…", "Yields, appearance, TLC, NMR, observations…"], ["📊 Risultati (IC50, Ki, inibizione)", "📊 Results (IC50, Ki, inhibition)"], ["Valori ottenuti, confronto con i riferimenti, osservazioni…", "Values obtained, comparison with references, observations…"], ["Espressione, bande, immagini, repliche, osservazioni…", "Expression, bands, images, replicates, observations…"], ["📊 Risultati (conte, MIC, crescita)", "📊 Results (counts, MIC, growth)"], ["Conte, MIC, tempi di raddoppio, osservazioni…", "Counts, MIC, doubling times, observations…"], ["📊 Misure e risultati", "📊 Measurements and results"], ["Valori misurati, incertezze, confronto con le attese…", "Measured values, uncertainties, comparison with expectations…"], ["📊 Risultati e metriche", "📊 Results and metrics"], ["Metriche, confronti con la baseline, osservazioni…", "Metrics, comparison with baseline, observations…"], ["📝 Note e prossimi passi", "📝 Notes and next steps"], ["✨ Stila", "✨ Draft"], ["🔤 Correggi", "🔤 Proofread"], ["🌍 Versione inglese (nuovo Word)", "🌍 English version (new Word file)"], ["💡 Suggerisci titolo", "💡 Suggest title"], ["🪄 Istruzione libera", "🪄 Free instruction"], ["Nessun allegato. Aggiungi o trascina qui i tuoi schemi ChemDraw.", "No attachments. Add or drag your ChemDraw schemes here."], ["💡 Per vedere gli schemi nel Word:", "💡 To see the schemes in Word:"], ["Per vedere gli schemi nel Word:", "To see the schemes in Word:"], ["Nessuna tabella di dati. Aggiungi misure, curve dose-risposta o confronti tra gruppi: compaiono anche nel Word.", "No data tables. Add measurements, dose-response curves or group comparisons: they also appear in the Word file."], ["＋ Scegli lo strumento", "＋ Choose a tool"], ["＋ Altri strumenti…", "＋ More tools…"], ["Apri", "Open"], ["Chiudi", "Close"], ["Annulla", "Cancel"], ["Salva", "Save"], ["💾 Salva i dati", "💾 Save data"], ["🖼️ Salva e allega il grafico", "🖼️ Save and attach chart"], ["✅ Sostituisci", "✅ Replace"], ["➕ Aggiungi sotto", "➕ Add below"], ["Nessun esperimento.", "No experiments."], ["Nessun risultato", "No results"], ["Vuoto: trascina qui degli esperimenti", "Empty: drag experiments here"], ["(senza nome)", "(untitled)"], ["Senza nome", "Untitled"], ["(archiviato)", "(archived)"], ["Azioni del gruppo", "Group actions"], ["🧪  Nuovo esperimento in questo gruppo", "🧪  New experiment in this group"], ["📁  Nuovo sottogruppo", "📁  New subgroup"], ["📚  Unisci tutto in un documento…", "📚  Merge everything into one document…"], ["✎  Rinomina", "✎  Rename"], ["📦  Archivia (scompare dall'elenco)", "📦  Archive (disappears from the list)"], ["🗑  Elimina il gruppo…", "🗑  Delete group…"], ["↩  Ripristina nell'elenco", "↩  Restore to the list"], ["📦 Archivio", "📦 Archive"], ["← Torna ai miei esperimenti", "← Back to my experiments"], ["📦 Archivio: qui ci sono i gruppi archiviati. Per rimetterne uno nell'elenco clicca ⋯ → Ripristina.", "📦 Archive: archived groups are here. To put one back in the list click ⋯ → Restore."], ["Nessun gruppo archiviato.", "No archived groups."], ["— nessun gruppo —", "— no group —"], ["Nome del gruppo:", "Group name:"], ["Nome del sottogruppo:", "Subgroup name:"], ["Nome del nuovo gruppo (es. Progetto NG012):", "New group name (e.g. Project NG012):"], ["Eliminare questo esperimento e i suoi allegati?", "Delete this experiment and its attachments?"], ["Eliminare questa tabella di dati?", "Delete this data table?"], ["Rimuovere l'allegato?", "Remove the attachment?"], ["Chiudere il Diario? I dati sono salvati. Per riaprirlo basta fare di nuovo doppio clic sull'icona.", "Close the Diary? Your data is saved. To reopen it just double-click the icon again."], ["Diario chiuso", "Diary closed"], ["Puoi chiudere questa scheda. Per riaprirlo: doppio clic su «Avvia Diario».", "You can close this tab. To reopen it: double-click \"Avvia Diario\"."], ["Sessione scaduta: chiudi questa scheda e riapri il Diario dal file «Avvia Diario.command».", "Session expired: close this tab and reopen the Diary from the \"Avvia Diario\" file."], ["✅ Salvato", "✅ Saved"], ["✅ Dati salvati", "✅ Data saved"], ["✅ Allegati caricati", "✅ Attachments uploaded"], ["✅ Esperimento spostato", "✅ Experiment moved"], ["✅ Impostazioni salvate", "✅ Settings saved"], ["✅ Chiave rimossa", "✅ Key removed"], ["✅ ChemDraw aperto", "✅ ChemDraw opened"], ["⚗️ Apro ChemDraw…", "⚗️ Opening ChemDraw…"], ["📄 Creo il documento Word…", "📄 Creating the Word document…"], ["✅ Word salvato: ", "✅ Word saved: "], [" — cartella ", " — folder "], [" · copiato anche su Drive", " · also copied to Drive"], [" · Drive aggiornato", " · Drive updated"], ["✅ Struttura incollata: ", "✅ Structure pasted: "], ["📋 Leggo gli appunti…", "📋 Reading the clipboard…"], ["⬆️ Carico ", "⬆️ Uploading "], ["Errore nel caricamento di ", "Upload error: "], ["Errore ", "Error "], ["☁️ Sincronizzo con Drive…", "☁️ Syncing with Drive…"], ["✅ Drive aggiornato: ", "✅ Drive updated: "], ["Word nuovi/aggiornati, ", "Word files new/updated, "], ["allegati copiati (", "attachments copied ("], ["🗂️ Riordino i documenti…", "🗂️ Reorganising documents…"], ["✅ Riordinati ", "✅ Reorganised "], [" esperimenti in ", " experiments in "], [" · vecchi file archiviati (", " · old files archived ("], ["), nulla cancellato", "), nothing deleted"], ["📚 Un unico documento per il progetto", "📚 One document for the whole project"], ["Unisce in ordine di data tutti gli esperimenti del gruppo (sottogruppi compresi) o del progetto. È un file a parte: i Word dei singoli esperimenti non cambiano.", "Merges all experiments of the group (subgroups included) or project in date order. It is a separate file: the Word files of single experiments do not change."], [" in inglese (usa le versioni inglesi già create con «Versione inglese»)", " in English (uses English versions already created with \"English version\")"], ["📚 Crea il documento", "📚 Create the document"], ["📚 Unisco gli esperimenti…", "📚 Merging experiments…"], ["Non ci sono ancora gruppi o progetti.", "There are no groups or projects yet."], ["📁 Gruppo: ", "📁 Group: "], ["🏷️ Progetto: ", "🏷️ Project: "], ["Questa voce è già scritta in inglese.", "This entry is already written in English."], [" traduce la voce…", " is translating the entry…"], [" sta lavorando…", " is working…"], ["Scrivi prima qualcosa nella sezione selezionata.", "First write something in the selected section."], ["Manca la chiave API di ", "Missing API key for "], ["Cosa vuoi che faccia ", "What do you want "], ["🖼️ Creo l'immagine del grafico…", "🖼️ Creating the chart image…"], ["🧭 In che settore lavori?", "🧭 What field do you work in?"], ["Puoi sceglierne più di uno. Il Diario mostra gli strumenti del tuo settore (per esempio il disegno delle molecole per chi fa chimica o farmacologia). Si può cambiare in qualsiasi momento.", "You can pick more than one. The Diary shows the tools for your field (for example molecule drawing for chemistry or pharmacology). You can change it at any time."], ["Scegli il tuo settore di ricerca", "Choose your research field"], ["Chimica (sintesi)", "Chemistry (synthesis)"], ["Farmacologia / biochimica", "Pharmacology / biochemistry"], ["Biologia molecolare e cellulare", "Molecular and cell biology"], ["Microbiologia", "Microbiology"], ["Materiali / fisica / ingegneria", "Materials / physics / engineering"], ["Informatica e dati", "Computer science and data"], ["🔑 Chiavi API e impostazioni", "🔑 API keys and settings"], ["incolla la chiave Gemini", "paste the Gemini key"], ["✅ già salvata (lascia vuoto per non cambiarla)", "✅ already saved (leave empty to keep it)"], ["Modello Gemini (facoltativo, es. gemini-2.5-flash):", "Gemini model (optional, e.g. gemini-2.5-flash):"], ["Le chiavi vengono salvate solo sul tuo computer, in ~/DiarioRicercatore/config.json.", "Keys are saved only on your computer, in ~/DiarioRicercatore/config.json."], ["☁️ Cartella di Google Drive (facoltativa)", "☁️ Google Drive folder (optional)"], ["🔎 Cerca Google Drive", "🔎 Find Google Drive"], ["Il Word di ogni esperimento e una copia di sicurezza (database e allegati) vengono salvati qui, in «Diario del Ricercatore». Serve l'app Google Drive per desktop, che poi sincronizza online da sola. Si aggiorna da sola ogni 5 minuti se hai fatto modifiche, oppure con «☁️ Sincronizza con Drive».", "The Word file of each experiment and a backup copy (database and attachments) are saved here, in \"Diario del Ricercatore\". Requires the Google Drive for desktop app, which then syncs online by itself. It updates automatically every 5 minutes if you made changes, or with \"☁️ Sync with Drive\"."], ["Scegli prima la cartella di Google Drive qui sotto.", "First choose the Google Drive folder below."], ["Non ho trovato Google Drive per desktop su questo computer: installalo da google.com/drive/download oppure scrivi tu il percorso della cartella.", "I could not find Google Drive for desktop on this computer: install it from google.com/drive/download or type the folder path yourself."], ["Ultima sincronizzazione: ", "Last sync: "], ["Ultimo errore di sincronizzazione: ", "Last sync error: "], ["Di solito si trova da sola. Se serve, scrivi il nome (es. ChemDraw 23.1) o il percorso dell'app.", "It is usually found automatically. If needed, type the name (e.g. ChemDraw 23.1) or the app path."], ["⚗️ App ChemDraw", "⚗️ ChemDraw app"], ["Disegna la struttura o lo schema. Verrà allegata come immagine (compare nel Word) insieme al file .mol modificabile, che si apre anche con ChemDraw.", "Draw the structure or scheme. It will be attached as an image (shown in Word) together with the editable .mol file, which also opens in ChemDraw."], ["Carico l'editor di strutture…", "Loading the structure editor…"], ["Disegna prima almeno una molecola.", "First draw at least one molecule."], ["Nome della molecola (es. NG012)", "Molecule name (e.g. NG012)"], ["🧪 Creo l'immagine…", "🧪 Creating the image…"], ["✅ Creato «", "✅ Created «"], ["🧪 Disegna una molecola", "🧪 Draw a molecule"], ["Scegli il tuo settore di ricerca", "Choose your research field"], ["Dose-risposta (IC50)", "Dose-response (IC50)"], ["Dose-risposta (IC50 / EC50)", "Dose-response (IC50 / EC50)"], ["Cinetica enzimatica (Km, Vmax)", "Enzyme kinetics (Km, Vmax)"], ["Scheda del saggio", "Assay sheet"], ["Piastra a 96 pozzetti", "96-well plate"], ["Campioni e reagenti", "Samples and reagents"], ["Conte CFU", "CFU counts"], ["Curva di crescita", "Growth curve"], ["Ceppo e condizioni", "Strain and conditions"], ["Misure x-y con fit", "x-y measurements with fit"], ["Tabella con grafico", "Table with chart"], ["Gruppi: media ± DS e test", "Groups: mean ± SD and test"], ["Materiale e condizioni di misura", "Material and measurement conditions"], ["Ambiente e riproducibilità", "Environment and reproducibility"], ["Reagenti e rese", "Reagents and yields"], ["Caratterizzazione", "Characterisation"], ["Lastra TLC (Rf)", "TLC plate (Rf)"], ["Grafico x-y (con fit)", "x-y chart (with fit)"], ["Barre: gruppi, media ± DS e test", "Bars: groups, mean ± SD and test"], ["Tabella libera con grafico", "Free table with chart"], ["Titolo (es. Inibizione di NLRP3 – composti A e B)", "Title (e.g. NLRP3 inhibition – compounds A and B)"], ["Incolla qui da Excel…", "Paste here from Excel…"], ["Tabella dei dati (puoi incollare da Excel)", "Data table (you can paste from Excel)"], ["Etichetta asse x", "x-axis label"], ["Etichetta asse y", "y-axis label"], ["IC50/EC50 automatico", "Automatic IC50/EC50"], ["Aggiungi all'esperimento", "Add to experiment"], ["Inserisci i dati nella tabella.", "Enter the data in the table."], ["Compila prima i dati.", "Fill in the data first."], ["Inserisci prima i dati.", "Enter the data first."], ["Scrivi la riga di intestazione e almeno una riga di dati.", "Write the header row and at least one data row."], ["Servono almeno due colonne.", "At least two columns are needed."], ["Colonna da rappresentare:", "Column to plot:"], ["La colonna scelta per il grafico non contiene numeri.", "The column chosen for the chart contains no numbers."], ["Una riga per concentrazione: concentrazione, poi le repliche della risposta. Più composti: separali con una riga «# Nome». Il fit è a 4 parametri.", "One row per concentration: concentration, then the response replicates. Several compounds: separate them with a \"# Name\" row. The fit is 4-parameter."], ["Una riga per punto: x, poi le repliche di y. Più serie: separale con una riga «# Nome».", "One row per point: x, then the y replicates. Several series: separate them with a \"# Name\" row."], ["Una riga per gruppo: nome, poi i valori delle repliche (separati da tab, «;» o spazio). Con 2 gruppi fa il test t di Welch, con 3 o più l'ANOVA.", "One row per group: name, then replicate values (separated by tab, \";\" or space). With 2 groups it runs Welch's t-test, with 3 or more ANOVA."], ["La prima riga è l'intestazione, poi una riga per prova. Se la prima colonna è numerica fa un grafico x-y (con fit a scelta), altrimenti un grafico a barre.", "The first row is the header, then one row per run. If the first column is numeric it makes an x-y chart (with a fit of your choice), otherwise a bar chart."], ["Compila i campi che servono (puoi aggiungere altre righe). I campi vuoti non compaiono nel Word.", "Fill in the fields you need (you can add more rows). Empty fields do not appear in the Word file."], ["Compila almeno un campo.", "Fill in at least one field."], ["Compila il layout (nome del gruppo in ogni pozzetto, es. Blank, Controllo, Comp-A 10 µM) e i valori letti (assorbanza, fluorescenza…). Puoi incollare un blocco 8×12 da Excel in ciascuna griglia. Pozzetti vuoti ignorati.", "Fill in the layout (group name in each well, e.g. Blank, Control, Cmpd-A 10 µM) and the readings (absorbance, fluorescence…). You can paste an 8×12 block from Excel into each grid. Empty wells are ignored."], ["Layout (nome del gruppo)", "Layout (group name)"], ["Valori letti", "Readings"], ["Nome del bianco", "Blank name"], ["Nome del controllo", "Control name"], ["Per ogni diluizione scrivi le colonie contate sulle piastre. Diluizione: -6, 10^-6, 1e-6 o 1:1000000. Contano le piastre con 30-300 colonie. Volume piastrato in mL (di solito 0.1).", "For each dilution write the colonies counted on the plates. Dilution: -6, 10^-6, 1e-6 or 1:1000000. Plates with 30-300 colonies count. Plated volume in mL (usually 0.1)."], ["Per ogni riga indica PM e una tra massa, mmol oppure volume + densità. La resa si calcola sul reagente limitante (il primo reagente, o quello segnato «limitante»). Stechiometria 1:1 col prodotto.", "For each row give the MW and one of mass, mmol or volume + density. The yield is calculated on the limiting reagent (the first reagent, or the one marked \"limiting\"). 1:1 stoichiometry with the product."], ["Una riga per ogni concentrazione provata: composto, ceppo, concentrazione e se c'è crescita. La MIC è la concentrazione più bassa senza crescita.", "One row per concentration tested: compound, strain, concentration and whether there is growth. The MIC is the lowest concentration with no growth."], ["Una riga per gruppo e gene con i Ct delle repliche. Indica il gene di riferimento e il gruppo di controllo qui sopra: il Diario calcola ΔCt, ΔΔCt e fold change (2^-ΔΔCt).", "One row per group and gene with the replicate Ct values. Give the reference gene and the control group above: the Diary calculates ΔCt, ΔΔCt and fold change (2^-ΔΔCt)."], ["Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato. Sulla lastra puoi trascinare le macchie su e giù con il mouse; doppio clic su una corsia per aggiungerne una.", "One row per lane of the plate (e.g. SM, co-spot, mixture, product). Choose how many spots it has and enter the Rf of each (0–1). If you measure in cm, write the distance travelled and the solvent-front distance and the Rf is calculated. On the plate you can drag spots up and down with the mouse; double-click a lane to add one."], ["Eluente (es. AcOEt/esano 3:7)", "Eluent (e.g. EtOAc/hexane 3:7)"], ["Fase stazionaria", "Stationary phase"], ["Gel di silice 60 F254", "Silica gel 60 F254"], ["Rivelatore chimico (KMnO4, ninidrina, I2…)", "Chemical stain (KMnO4, ninhydrin, I2…)"], ["Inserisco l'Rf (0–1)", "I enter the Rf (0–1)"], ["Inserisco le distanze in cm", "I enter distances in cm"], ["Fronte (cm)", "Front (cm)"], ["macchie:", "spots:"], ["Nome", "Name"], ["+ Aggiungi corsia", "+ Add lane"], ["＋ Aggiungi riga", "＋ Add row"], ["Elimina la riga", "Delete row"], ["Aggiungi almeno una macchia.", "Add at least one spot."], ["N. macchie", "No. of spots"], ["fronte del solvente", "solvent front"], ["linea di base", "baseline"], ["Eluente: ", "Eluent: "], ["Fase stazionaria: ", "Stationary phase: "], ["Rivelazione: ", "Detection: "], ["Composto", "Compound"], ["Ceppo", "Strain"], ["Crescita", "Growth"], ["Campo", "Field"], ["Valore", "Value"], ["Aspetto", "Appearance"], ["Resa", "Yield"], ["Punto di fusione", "Melting point"], ["Rf (eluente)", "Rf (eluent)"], ["Massa (mg)", "Mass (mg)"], ["Equiv. / resa", "Equiv. / yield"], ["Catalizzatore / additivo", "Catalyst / additive"], ["Prodotto ", "Product "], ["Reagente limitante: ", "Limiting reagent: "], ["Concentrazione del limitante: ", "Limiting reagent concentration: "], ["Massa teorica: ", "Theoretical mass: "], ["Bersaglio / enzima", "Target / enzyme"], ["Composto (lotto)", "Compound (lot)"], ["Substrato / ligando e concentrazione", "Substrate / ligand and concentration"], ["Tampone e pH", "Buffer and pH"], ["Temperatura e tempo di incubazione", "Temperature and incubation time"], ["Metodo di rivelazione", "Detection method"], ["Controlli (positivo, negativo, veicolo)", "Controls (positive, negative, vehicle)"], ["Concentrazione di DMSO", "DMSO concentration"], ["Linea cellulare (passaggio)", "Cell line (passage)"], ["Terreno e siero", "Medium and serum"], ["Densità di semina", "Seeding density"], ["Trattamento (concentrazione, tempo)", "Treatment (concentration, time)"], ["Anticorpi primari (diluizione, lotto)", "Primary antibodies (dilution, lot)"], ["Anticorpi secondari", "Secondary antibodies"], ["Kit / reagenti (lotto)", "Kits / reagents (lot)"], ["Repliche biologiche / tecniche", "Biological / technical replicates"], ["Ceppo (codice)", "Strain (code)"], ["Terreno", "Medium"], ["Temperatura e atmosfera", "Temperature and atmosphere"], ["Inoculo (CFU/mL o OD)", "Inoculum (CFU/mL or OD)"], ["Tempo di incubazione", "Incubation time"], ["Composto / antibiotico (lotto)", "Compound / antibiotic (lot)"], ["Standard di riferimento (CLSI, EUCAST)", "Reference standard (CLSI, EUCAST)"], ["Materiale e lotto", "Material and lot"], ["Sintesi / processo (parametri)", "Synthesis / process (parameters)"], ["Strumento e modello", "Instrument and model"], ["Condizioni ambientali (T, umidità)", "Environmental conditions (T, humidity)"], ["Calibrazione", "Calibration"], ["Preparazione del campione", "Sample preparation"], ["Norma di riferimento", "Reference standard"], ["Repository e commit", "Repository and commit"], ["Versione software e librerie", "Software and library versions"], ["Seed casuale", "Random seed"], ["Dataset (versione)", "Dataset (version)"], ["Comando eseguito", "Command run"], ["Tempo di calcolo", "Computation time"], ["Gene di riferimento", "Reference gene"], ["Gruppo di controllo", "Control group"], ["Ct medio", "Mean Ct"], ["Fold change (intervallo)", "Fold change (range)"], ["Espressione relativa (2^-ΔΔCt)", "Relative expression (2^-ΔΔCt)"], ["Inserisci i valori di Ct.", "Enter the Ct values."], ["Servono almeno un gene bersaglio oltre al riferimento.", "At least one target gene besides the reference is needed."], ["Risposta (%)", "Response (%)"], ["Tempo (h)", "Time (h)"], ["Concentrazione ≤ 0 (", "Concentration ≤ 0 ("], ["Piastra 1", "Plate 1"], ["Piastra 2", "Plate 2"], ["Piastra 3", "Plate 3"], ["Serie ", "Series "], ["(unità)", "(unit)"], ["media ± DS (n)", "mean ± SD (n)"], ["Test t di Welch:", "Welch's t-test:"], ["ANOVA a una via: F(", "One-way ANOVA: F("], ["Bianco sottratto: ", "Blank subtracted: "], ["Alcuni gruppi hanno meno di 3 repliche: le statistiche sono poco affidabili.", "Some groups have fewer than 3 replicates: the statistics are not very reliable."], ["Alcuni gruppi hanno meno di 3 pozzetti.", "Some groups have fewer than 3 wells."], ["Per il test servono almeno 2 valori per gruppo.", "The test needs at least 2 values per group."], ["Per l'ANOVA servono almeno 2 valori per gruppo.", "ANOVA needs at least 2 values per group."], ["Inserisci almeno una concentrazione.", "Enter at least one concentration."], ["Inserisci layout e valori.", "Enter layout and values."], ["Errore nel calcolo: ", "Calculation error: "], ["Valore non numerico: ", "Non-numeric value: "], ["Valore non numerico in ", "Non-numeric value in "], ["Valori di x ≤ 0 non inclusi (asse logaritmico).", "x values ≤ 0 not included (log axis)."], ["Valori di y ≤ 0 non inclusi (asse y logaritmico).", "y values ≤ 0 not included (log y axis)."], ["Resa superiore al 100%: controlla PM e quantità (", "Yield above 100%: check MW and amounts ("], ["Inserisci PM e massa (o mmol) di almeno un reagente per calcolare equivalenti e resa.", "Enter MW and mass (or mmol) of at least one reagent to calculate equivalents and yield."], ["Aggiungi almeno una macchia.", "Add at least one spot."], ["Non riesco a caricare l'editor di strutture. Serve la connessione a internet (oppure scarica JSME e mettilo nella cartella «jsme» accanto a diario_web.py).", "I cannot load the structure editor. An internet connection is needed (or download JSME and put it in the \"jsme\" folder next to diario_web.py)."], ["L'editor di strutture non risponde.", "The structure editor is not responding."], ["Non riesco a convertire il disegno in immagine.", "I cannot convert the drawing to an image."], ["Immagine non creata.", "Image not created."], ["Negli appunti non c'e' nessuna struttura (usa il pulsante 📋 Incolla da ChemDraw per i dettagli)", "There is no structure on the clipboard (use the 📋 Paste from ChemDraw button for details)"], ["Non ho trovato ChemDraw tra le applicazioni.\nScrivi il nome dell'app (es. ChemDraw 23.1) oppure incolla il suo percorso completo (Mac: Finder, seleziona l'app e premi ⌥⌘C · Windows: il percorso di ChemDraw.exe).", "I could not find ChemDraw among the applications.\nType the app name (e.g. ChemDraw 23.1) or paste its full path (Mac: Finder, select the app and press ⌥⌘C · Windows: the path of ChemDraw.exe)."], ["🔬 Diario del", "🔬 Researcher's"], ["Ricercatore", "Diary"], ["🖥️ Crea icona sul Desktop", "🖥️ Create Desktop icon"], ["Crea l'icona del Diario sulla Scrivania, cosi' si apre con un doppio clic", "Create the Diary icon on the Desktop, so it opens with a double-click"], ["✅ Icona creata: ", "✅ Icon created: "], ["🧭 Settore: ", "🧭 Field: "], [" settori", " fields"], ["✨ AI su: ", "✨ AI on: "], ["Creala su ", "Create it at "], ["Creala su", "Create it at"], ["Procedura sperimentale", "Experimental procedure"], ["Obiettivo e ipotesi", "Objective and hypothesis"], ["Obiettivo", "Objective"], ["Saggio e condizioni", "Assay and conditions"], ["Materiali e metodi", "Materials and methods"], ["Preparazione e condizioni di misura", "Preparation and measurement conditions"], ["Metodo e configurazione", "Method and configuration"], ["Risultati e osservazioni", "Results and observations"], ["Risultati (IC50, Ki, inibizione)", "Results (IC50, Ki, inhibition)"], ["Risultati (conte, MIC, crescita)", "Results (counts, MIC, growth)"], ["Misure e risultati", "Measurements and results"], ["Risultati e metriche", "Results and metrics"], ["Note e prossimi passi", "Notes and next steps"], [" in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", " in ChemDraw select the structure, press ⌘C and then ⌘V on this page (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."], ["in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", "in ChemDraw select the structure, press ⌘C and then ⌘V on this page (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."], ["⚠️ Nessuna immagine associata: nel Word comparirà solo il nome. Incolla lo schema da ChemDraw (⌘C → ⌘V qui) o aggiungi un PNG con lo stesso nome.", "⚠️ No associated image: only the name will appear in Word. Paste the scheme from ChemDraw (⌘C → ⌘V here) or add a PNG with the same name."], [" — controlla e modifica prima di applicare", " — check and edit before applying"], ["✨ Proposta di ", "✨ Suggestion from "], ["Trovata: ", "Found: "], [" (clicca per usarla)", " (click to use it)"], ["Eliminare il gruppo «", "Delete the group «"], ["»?\n\nGli esperimenti NON vengono cancellati: passano al gruppo superiore (o all'elenco principale).", "»?\n\nExperiments are NOT deleted: they move to the parent group (or to the main list)."], ["» archiviato: lo trovi in 📦 Archivio", "» archived: you can find it in 📦 Archive"], ["» ripristinato", "» restored"], ["Non riesco ad aprire «", "I cannot open «"], ["». Controlla il nome o il percorso e riprova.", "». Check the name or path and try again."], ["Esperimento non trovato.", "Experiment not found."], ["Gruppo non trovato.", "Group not found."], ["Non ci sono esperimenti da unire.", "There are no experiments to merge."], ["Scegli un gruppo o un progetto.", "Choose a group or a project."], ["Scrivi prima qualcosa da tradurre.", "First write something to translate."], ["Questa voce e' gia' scritta in inglese: non serve tradurla.", "This entry is already written in English: no need to translate it."], ["La traduzione non e' arrivata in un formato leggibile: riprova.", "The translation did not arrive in a readable format: try again."], ["Una sincronizzazione e' gia' in corso.", "A sync is already in progress."], ["Il nome del gruppo non puo' essere vuoto.", "The group name cannot be empty."], ["Testo vuoto.", "Empty text."], [" · senza traduzione: ", " · without translation: "], [" esperimenti uniti in «", " experiments merged into «"], ["Conferma", "Confirm"], ["Titolo", "Title"], ["Ruolo", "Role"], ["Limitante", "Limiting"], ["limitante", "limiting"], ["Reagente", "Reagent"], ["Solvente", "Solvent"], ["Prodotto", "Product"], ["Esempio", "Example"], ["estremi fissi (top 100, bottom 0)", "fixed limits (top 100, bottom 0)"], [" estremi fissi (top 100, bottom 0)", " fixed limits (top 100, bottom 0)"], ["x logaritmico", "log x"], [" x logaritmico", " log x"], ["y logaritmico", "log y"], [" y logaritmico", " log y"], ["nessun fit", "no fit"], ["retta (regressione lineare)", "line (linear regression)"], ["polinomio di 2° grado", "2nd-degree polynomial"], ["esponenziale (k, raddoppio / emivita)", "exponential (k, doubling / half-life)"], ["legge di potenza", "power law"], ["sottrai il bianco", "subtract blank"], [" sottrai il bianco", " subtract blank"], ["normalizza sul controllo (= 100 %)", "normalise to control (= 100 %)"], [" normalizza sul controllo (= 100 %)", " normalise to control (= 100 %)"], ["Gruppo", "Group"], ["Campione", "Sample"], ["Diluizione", "Dilution"], ["crescita", "growth"], ["no crescita", "no growth"], ["Nessun pozzetto «", "No well «"], ["»: il bianco non è stato sottratto.", "»: the blank was not subtracted."], ["»: nessuna normalizzazione.", "»: no normalisation."], [", rivelazione ", ", detection "], [", eluente ", ", eluent "], ["Il gene di riferimento «", "The reference gene «"], ["Il gruppo di controllo «", "The control group «"], ["» non compare nella tabella.", "» does not appear in the table."], [": servono almeno 3 punti per la retta.", ": at least 3 points are needed for the line."], [": servono almeno 4 punti per il polinomio di 2° grado.", ": at least 4 points are needed for the 2nd-degree polynomial."], [": servono almeno 3 punti con y > 0 per l'esponenziale.", ": at least 3 points with y > 0 are needed for the exponential."], [": servono almeno 3 punti con x > 0 e y > 0 per la legge di potenza.", ": at least 3 points with x > 0 and y > 0 are needed for the power law."], [": servono almeno 4 punti su 3 valori di x diversi per Michaelis-Menten.", ": at least 4 points at 3 different x values are needed for Michaelis-Menten."], [": servono almeno 5 punti su 4 concentrazioni diverse per il fit (3 con estremi fissi).", ": at least 5 points at 4 different concentrations are needed for the fit (3 with fixed limits)."], [": alcuni punti hanno una sola replica (niente barre di errore).", ": some points have a single replicate (no error bars)."], [": intervallo di confidenza non calcolabile (pochi punti).", ": confidence interval cannot be calculated (too few points)."], [") non inclusa nel grafico e nel fit.", ") not included in the chart and fit."], [" fuori dall'intervallo di concentrazioni misurato, il valore è un'estrapolazione.", " outside the measured concentration range, the value is an extrapolation."], ["): controlla i dati o prova gli estremi fissi.", "): check the data or try fixed limits."], ["): segnale molto debole.", "): very weak signal."], ["): alcune piastre fuori dall'intervallo 30-300 sono state escluse.", "): some plates outside the 30-300 range were excluded."], ["): nessuna piastra tra 30 e 300 colonie, riga esclusa.", "): no plate between 30 and 300 colonies, row excluded."], [": risultati non monotoni (crescita a concentrazioni più alte di una senza crescita): controlla.", ": non-monotonic results (growth at concentrations higher than one without growth): check."], ["»: manca il PM (o la densità per un volume).", "»: MW missing (or density for a volume)."], ["Rf fuori da 0–1 nella corsia «", "Rf outside 0–1 in lane «"], ["Inserisci la distanza percorsa dal fronte (cm) per calcolare gli Rf.", "Enter the distance travelled by the front (cm) to calculate the Rf values."], ["fuori 30-300", "outside 30-300"], ["CFU/mL (media)", "CFU/mL (mean)"], ["📂 Documenti ▾", "📂 Documents ▾"], ["⚙️ Impostazioni ▾", "⚙️ Settings ▾"], ["⏻ Chiudi", "⏻ Close"], ["⚗️ Apri ChemDraw", "⚗️ Open ChemDraw"], ["Cartella dei documenti, documento unico di progetto, Google Drive", "Documents folder, single project document, Google Drive"], ["Settore, chiavi API, lingua, icona sul Desktop", "Field, API keys, language, Desktop icon"], ["🇬🇧 Vedi versione inglese", "🇬🇧 View English version"], ["↩ Torna al testo originale", "↩ Back to the original text"], ["🇬🇧 Stai guardando la versione inglese. Le modifiche che fai qui cambiano solo il documento «English version»; il testo originale non viene toccato.", "🇬🇧 You are viewing the English version. Edits made here only change the \"English version\" document; the original text is not touched."], ["Passa dal testo originale alla versione inglese e viceversa", "Switch between the original text and the English version"], ["✅ Tradotto. Creato «", "✅ Translated. Created «"], ["⬆️ Nuova versione: aggiorna ora", "⬆️ New version: update now"], ["⬆️ Cerca aggiornamenti", "⬆️ Check for updates"], ["Aggiorno il Diario all'ultima versione? I tuoi esperimenti non vengono toccati. Il Diario si riavvia da solo.", "Update the Diary to the latest version? Your experiments are not touched. The Diary restarts by itself."], ["⬆️ Scarico l'aggiornamento…", "⬆️ Downloading the update…"], ["✅ Hai già l'ultima versione", "✅ You already have the latest version"], ["⬆️ Cerco aggiornamenti…", "⬆️ Checking for updates…"], ["Diario aggiornato", "Diary updated"], ["Si sta riavviando: tra pochi secondi si apre una nuova scheda. Questa puoi chiuderla.", "It is restarting: a new tab will open in a few seconds. You can close this one."], ["← Esperimenti", "← Experiments"], ["⬆️ È uscita una nuova versione del Diario", "⬆️ A new version of the Diary is out"], ["Questa versione non è più aggiornata. Premi «Aggiorna ora»: il Diario scarica la versione nuova e si riapre da solo in pochi secondi. I tuoi esperimenti, allegati e documenti non vengono toccati.", "This version is out of date. Press \"Update now\": the Diary downloads the new version and reopens by itself in a few seconds. Your experiments, attachments and documents are not touched."], ["⬆️ Aggiorna ora", "⬆️ Update now"], ["Più tardi", "Later"], ["🔍 Vedi", "🔍 View"], ["Clicca per ingrandire", "Click to enlarge"], ["Cartella", "Folder"]];
+const EN_PAIRS = [["🔬 Diario del Ricercatore", "🔬 Researcher's Diary"], ["＋ Esperimento", "＋ Experiment"], ["📁＋ Gruppo", "📁＋ Group"], ["Crea un gruppo per raggruppare gli esperimenti", "Create a group to organise experiments"], ["🔍 Cerca esperimento…", "🔍 Search experiments…"], ["🧭 Settore", "🧭 Field"], ["☁️ Sincronizza con Drive", "☁️ Sync with Drive"], ["Salva Word e copia di sicurezza nella cartella di Google Drive", "Save Word files and a backup copy to the Google Drive folder"], ["📚 Documento di progetto", "📚 Project document"], ["Crea un unico Word con tutti gli esperimenti di un gruppo o di un progetto", "Create a single Word file with all experiments of a group or project"], ["📂 Cartella documenti", "📂 Documents folder"], ["Apre la cartella con i Word e gli allegati, ordinati per gruppo e sottogruppo", "Opens the folder with Word files and attachments, organised by group and subgroup"], ["🗂️ Riordina documenti", "🗂️ Reorganise documents"], ["Rimette in ordine tutti i documenti gia' esistenti (gruppo / sottogruppo / esperimento). Non cancella nulla.", "Reorganises all existing documents (group / subgroup / experiment). Nothing is deleted."], ["⏻ Chiudi il Diario", "⏻ Close the Diary"], ["Salva e ferma il Diario", "Save and stop the Diary"], ["🔑 Chiavi API e impostazioni", "🔑 API keys and settings"], ["Nome dell'esperimento (es. NG012 – step 3)", "Experiment name (e.g. NG012 – step 3)"], ["Data", "Date"], ["Progetto / molecola target", "Project / target molecule"], ["💾 Salva", "💾 Save"], ["Apre l'app ChemDraw", "Opens the ChemDraw app"], ["📄 Esporta in Word", "📄 Export to Word"], ["Crea un documento Word di questo esperimento", "Create a Word document of this experiment"], ["Elimina esperimento", "Delete experiment"], ["📁 Gruppo:", "📁 Group:"], ["🌐 Lingua della voce: nativa", "🌐 Entry language: native"], ["🇬🇧 Lingua della voce: English", "🇬🇧 Entry language: English"], ["Lingua in cui scrivi questa voce (l'AI e il Word la useranno)", "Language you write this entry in (AI and Word will use it)"], ["Quale intelligenza artificiale usare", "Which AI to use"], ["📈 Dati e grafici", "📈 Data and charts"], ["📎 Allegati (ChemDraw e altri file)", "📎 Attachments (ChemDraw and other files)"], ["📋 Incolla da ChemDraw", "📋 Paste from ChemDraw"], ["Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)", "Paste the structure copied from ChemDraw into the experiment (Cmd+C / Ctrl+C in ChemDraw)"], ["🧪 Disegna molecola", "🧪 Draw molecule"], ["Disegna una molecola o uno schema e allegalo all'esperimento", "Draw a molecule or scheme and attach it to the experiment"], ["＋ Aggiungi file", "＋ Add file"], ["🎯 Obiettivo", "🎯 Objective"], ["🎯 Obiettivo e ipotesi", "🎯 Objective and hypothesis"], ["Qual è lo scopo dell'esperimento?", "What is the purpose of the experiment?"], ["Domanda biologica e ipotesi da verificare.", "Biological question and hypothesis to test."], ["Bersaglio, composti, domanda a cui risponde il saggio.", "Target, compounds, question the assay answers."], ["Ceppi, composti e domanda a cui risponde l'esperimento.", "Strains, compounds and question the experiment answers."], ["Domanda di ricerca, ipotesi, metrica di successo.", "Research question, hypothesis, success metric."], ["🧪 Procedura sperimentale", "🧪 Experimental procedure"], ["Scrivi qui appunti e procedura, anche in modo disordinato: l'AI li metterà in forma.", "Write your notes and procedure here, even messily: the AI will put them in shape."], ["🧫 Saggio e condizioni", "🧫 Assay and conditions"], ["Bersaglio/enzima, composti e concentrazioni, tampone, incubazione, rivelazione, controlli…", "Target/enzyme, compounds and concentrations, buffer, incubation, detection, controls…"], ["🧬 Materiali e metodi", "🧬 Materials and methods"], ["Linee cellulari e passaggio, trattamenti, anticorpi (diluizioni, lotti), kit, protocollo…", "Cell lines and passage, treatments, antibodies (dilutions, lots), kits, protocol…"], ["🦠 Materiali e metodi", "🦠 Materials and methods"], ["Ceppi, terreni, condizioni di crescita, inoculo, metodo (CFU, MIC, curve), controlli…", "Strains, media, growth conditions, inoculum, method (CFU, MIC, curves), controls…"], ["🔧 Preparazione e condizioni di misura", "🔧 Preparation and measurement conditions"], ["Materiale e lotto, processo, parametri, strumento e calibrazione, condizioni ambientali…", "Material and lot, process, parameters, instrument and calibration, environmental conditions…"], ["💻 Metodo e configurazione", "💻 Method and configuration"], ["Dati e versione, modello, iperparametri, seed, hardware, comando eseguito…", "Data and version, model, hyperparameters, seed, hardware, command run…"], ["📊 Risultati e osservazioni", "📊 Results and observations"], ["Rese, aspetto, TLC, NMR, osservazioni…", "Yields, appearance, TLC, NMR, observations…"], ["📊 Risultati (IC50, Ki, inibizione)", "📊 Results (IC50, Ki, inhibition)"], ["Valori ottenuti, confronto con i riferimenti, osservazioni…", "Values obtained, comparison with references, observations…"], ["Espressione, bande, immagini, repliche, osservazioni…", "Expression, bands, images, replicates, observations…"], ["📊 Risultati (conte, MIC, crescita)", "📊 Results (counts, MIC, growth)"], ["Conte, MIC, tempi di raddoppio, osservazioni…", "Counts, MIC, doubling times, observations…"], ["📊 Misure e risultati", "📊 Measurements and results"], ["Valori misurati, incertezze, confronto con le attese…", "Measured values, uncertainties, comparison with expectations…"], ["📊 Risultati e metriche", "📊 Results and metrics"], ["Metriche, confronti con la baseline, osservazioni…", "Metrics, comparison with baseline, observations…"], ["📝 Note e prossimi passi", "📝 Notes and next steps"], ["✨ Stila", "✨ Draft"], ["🔤 Correggi", "🔤 Proofread"], ["🌍 Versione inglese (nuovo Word)", "🌍 English version (new Word file)"], ["💡 Suggerisci titolo", "💡 Suggest title"], ["🪄 Istruzione libera", "🪄 Free instruction"], ["Nessun allegato. Aggiungi o trascina qui i tuoi schemi ChemDraw.", "No attachments. Add or drag your ChemDraw schemes here."], ["💡 Per vedere gli schemi nel Word:", "💡 To see the schemes in Word:"], ["Per vedere gli schemi nel Word:", "To see the schemes in Word:"], ["Nessuna tabella di dati. Aggiungi misure, curve dose-risposta o confronti tra gruppi: compaiono anche nel Word.", "No data tables. Add measurements, dose-response curves or group comparisons: they also appear in the Word file."], ["＋ Scegli lo strumento", "＋ Choose a tool"], ["＋ Altri strumenti…", "＋ More tools…"], ["Apri", "Open"], ["Chiudi", "Close"], ["Annulla", "Cancel"], ["Salva", "Save"], ["💾 Salva i dati", "💾 Save data"], ["🖼️ Salva e allega il grafico", "🖼️ Save and attach chart"], ["✅ Sostituisci", "✅ Replace"], ["➕ Aggiungi sotto", "➕ Add below"], ["Nessun esperimento.", "No experiments."], ["Nessun risultato", "No results"], ["Vuoto: trascina qui degli esperimenti", "Empty: drag experiments here"], ["(senza nome)", "(untitled)"], ["Senza nome", "Untitled"], ["(archiviato)", "(archived)"], ["Azioni del gruppo", "Group actions"], ["🧪  Nuovo esperimento in questo gruppo", "🧪  New experiment in this group"], ["📁  Nuovo sottogruppo", "📁  New subgroup"], ["📚  Unisci tutto in un documento…", "📚  Merge everything into one document…"], ["✎  Rinomina", "✎  Rename"], ["📦  Archivia (scompare dall'elenco)", "📦  Archive (disappears from the list)"], ["🗑  Elimina il gruppo…", "🗑  Delete group…"], ["↩  Ripristina nell'elenco", "↩  Restore to the list"], ["📦 Archivio", "📦 Archive"], ["← Torna ai miei esperimenti", "← Back to my experiments"], ["📦 Archivio: qui ci sono i gruppi archiviati. Per rimetterne uno nell'elenco clicca ⋯ → Ripristina.", "📦 Archive: archived groups are here. To put one back in the list click ⋯ → Restore."], ["Nessun gruppo archiviato.", "No archived groups."], ["— nessun gruppo —", "— no group —"], ["Nome del gruppo:", "Group name:"], ["Nome del sottogruppo:", "Subgroup name:"], ["Nome del nuovo gruppo (es. Progetto NG012):", "New group name (e.g. Project NG012):"], ["Eliminare questo esperimento e i suoi allegati?", "Delete this experiment and its attachments?"], ["Eliminare questa tabella di dati?", "Delete this data table?"], ["Rimuovere l'allegato?", "Remove the attachment?"], ["Chiudere il Diario? I dati sono salvati. Per riaprirlo basta fare di nuovo doppio clic sull'icona.", "Close the Diary? Your data is saved. To reopen it just double-click the icon again."], ["Diario chiuso", "Diary closed"], ["Puoi chiudere questa scheda. Per riaprirlo: doppio clic su «Avvia Diario».", "You can close this tab. To reopen it: double-click \"Avvia Diario\"."], ["Sessione scaduta: chiudi questa scheda e riapri il Diario dal file «Avvia Diario.command».", "Session expired: close this tab and reopen the Diary from the \"Avvia Diario\" file."], ["✅ Salvato", "✅ Saved"], ["✅ Dati salvati", "✅ Data saved"], ["✅ Allegati caricati", "✅ Attachments uploaded"], ["✅ Esperimento spostato", "✅ Experiment moved"], ["✅ Impostazioni salvate", "✅ Settings saved"], ["✅ Chiave rimossa", "✅ Key removed"], ["✅ ChemDraw aperto", "✅ ChemDraw opened"], ["⚗️ Apro ChemDraw…", "⚗️ Opening ChemDraw…"], ["📄 Creo il documento Word…", "📄 Creating the Word document…"], ["✅ Word salvato: ", "✅ Word saved: "], [" — cartella ", " — folder "], [" · copiato anche su Drive", " · also copied to Drive"], [" · Drive aggiornato", " · Drive updated"], ["✅ Struttura incollata: ", "✅ Structure pasted: "], ["📋 Leggo gli appunti…", "📋 Reading the clipboard…"], ["⬆️ Carico ", "⬆️ Uploading "], ["Errore nel caricamento di ", "Upload error: "], ["Errore ", "Error "], ["☁️ Sincronizzo con Drive…", "☁️ Syncing with Drive…"], ["✅ Drive aggiornato: ", "✅ Drive updated: "], ["Word nuovi/aggiornati, ", "Word files new/updated, "], ["allegati copiati (", "attachments copied ("], ["🗂️ Riordino i documenti…", "🗂️ Reorganising documents…"], ["✅ Riordinati ", "✅ Reorganised "], [" esperimenti in ", " experiments in "], [" · vecchi file archiviati (", " · old files archived ("], ["), nulla cancellato", "), nothing deleted"], ["📚 Un unico documento per il progetto", "📚 One document for the whole project"], ["Unisce in ordine di data tutti gli esperimenti del gruppo (sottogruppi compresi) o del progetto. È un file a parte: i Word dei singoli esperimenti non cambiano.", "Merges all experiments of the group (subgroups included) or project in date order. It is a separate file: the Word files of single experiments do not change."], [" in inglese (usa le versioni inglesi già create con «Versione inglese»)", " in English (uses English versions already created with \"English version\")"], ["📚 Crea il documento", "📚 Create the document"], ["📚 Unisco gli esperimenti…", "📚 Merging experiments…"], ["Non ci sono ancora gruppi o progetti.", "There are no groups or projects yet."], ["📁 Gruppo: ", "📁 Group: "], ["🏷️ Progetto: ", "🏷️ Project: "], ["Questa voce è già scritta in inglese.", "This entry is already written in English."], [" traduce la voce…", " is translating the entry…"], [" sta lavorando…", " is working…"], ["Scrivi prima qualcosa nella sezione selezionata.", "First write something in the selected section."], ["Manca la chiave API di ", "Missing API key for "], ["Cosa vuoi che faccia ", "What do you want "], ["🖼️ Creo l'immagine del grafico…", "🖼️ Creating the chart image…"], ["🧭 In che settore lavori?", "🧭 What field do you work in?"], ["Puoi sceglierne più di uno. Il Diario mostra gli strumenti del tuo settore (per esempio il disegno delle molecole per chi fa chimica o farmacologia). Si può cambiare in qualsiasi momento.", "You can pick more than one. The Diary shows the tools for your field (for example molecule drawing for chemistry or pharmacology). You can change it at any time."], ["Scegli il tuo settore di ricerca", "Choose your research field"], ["Chimica (sintesi)", "Chemistry (synthesis)"], ["Farmacologia / biochimica", "Pharmacology / biochemistry"], ["Biologia molecolare e cellulare", "Molecular and cell biology"], ["Microbiologia", "Microbiology"], ["Materiali / fisica / ingegneria", "Materials / physics / engineering"], ["Informatica e dati", "Computer science and data"], ["🔑 Chiavi API e impostazioni", "🔑 API keys and settings"], ["incolla la chiave Gemini", "paste the Gemini key"], ["✅ già salvata (lascia vuoto per non cambiarla)", "✅ already saved (leave empty to keep it)"], ["Modello Gemini (facoltativo, es. gemini-2.5-flash):", "Gemini model (optional, e.g. gemini-2.5-flash):"], ["Le chiavi vengono salvate solo sul tuo computer, in ~/DiarioRicercatore/config.json.", "Keys are saved only on your computer, in ~/DiarioRicercatore/config.json."], ["☁️ Cartella di Google Drive (facoltativa)", "☁️ Google Drive folder (optional)"], ["🔎 Cerca Google Drive", "🔎 Find Google Drive"], ["Il Word di ogni esperimento e una copia di sicurezza (database e allegati) vengono salvati qui, in «Diario del Ricercatore». Serve l'app Google Drive per desktop, che poi sincronizza online da sola. Si aggiorna da sola ogni 5 minuti se hai fatto modifiche, oppure con «☁️ Sincronizza con Drive».", "The Word file of each experiment and a backup copy (database and attachments) are saved here, in \"Diario del Ricercatore\". Requires the Google Drive for desktop app, which then syncs online by itself. It updates automatically every 5 minutes if you made changes, or with \"☁️ Sync with Drive\"."], ["Scegli prima la cartella di Google Drive qui sotto.", "First choose the Google Drive folder below."], ["Non ho trovato Google Drive per desktop su questo computer: installalo da google.com/drive/download oppure scrivi tu il percorso della cartella.", "I could not find Google Drive for desktop on this computer: install it from google.com/drive/download or type the folder path yourself."], ["Ultima sincronizzazione: ", "Last sync: "], ["Ultimo errore di sincronizzazione: ", "Last sync error: "], ["Di solito si trova da sola. Se serve, scrivi il nome (es. ChemDraw 23.1) o il percorso dell'app.", "It is usually found automatically. If needed, type the name (e.g. ChemDraw 23.1) or the app path."], ["⚗️ App ChemDraw", "⚗️ ChemDraw app"], ["Disegna la struttura o lo schema. Verrà allegata come immagine (compare nel Word) insieme al file .mol modificabile, che si apre anche con ChemDraw.", "Draw the structure or scheme. It will be attached as an image (shown in Word) together with the editable .mol file, which also opens in ChemDraw."], ["Carico l'editor di strutture…", "Loading the structure editor…"], ["Disegna prima almeno una molecola.", "First draw at least one molecule."], ["Nome della molecola (es. NG012)", "Molecule name (e.g. NG012)"], ["🧪 Creo l'immagine…", "🧪 Creating the image…"], ["✅ Creato «", "✅ Created «"], ["🧪 Disegna una molecola", "🧪 Draw a molecule"], ["Scegli il tuo settore di ricerca", "Choose your research field"], ["Dose-risposta (IC50)", "Dose-response (IC50)"], ["Dose-risposta (IC50 / EC50)", "Dose-response (IC50 / EC50)"], ["Cinetica enzimatica (Km, Vmax)", "Enzyme kinetics (Km, Vmax)"], ["Scheda del saggio", "Assay sheet"], ["Piastra a 96 pozzetti", "96-well plate"], ["Campioni e reagenti", "Samples and reagents"], ["Conte CFU", "CFU counts"], ["Curva di crescita", "Growth curve"], ["Ceppo e condizioni", "Strain and conditions"], ["Misure x-y con fit", "x-y measurements with fit"], ["Tabella con grafico", "Table with chart"], ["Gruppi: media ± DS e test", "Groups: mean ± SD and test"], ["Materiale e condizioni di misura", "Material and measurement conditions"], ["Ambiente e riproducibilità", "Environment and reproducibility"], ["Reagenti e rese", "Reagents and yields"], ["Caratterizzazione", "Characterisation"], ["Lastra TLC (Rf)", "TLC plate (Rf)"], ["Grafico x-y (con fit)", "x-y chart (with fit)"], ["Barre: gruppi, media ± DS e test", "Bars: groups, mean ± SD and test"], ["Tabella libera con grafico", "Free table with chart"], ["Titolo (es. Inibizione di NLRP3 – composti A e B)", "Title (e.g. NLRP3 inhibition – compounds A and B)"], ["Incolla qui da Excel…", "Paste here from Excel…"], ["Tabella dei dati (puoi incollare da Excel)", "Data table (you can paste from Excel)"], ["Etichetta asse x", "x-axis label"], ["Etichetta asse y", "y-axis label"], ["IC50/EC50 automatico", "Automatic IC50/EC50"], ["Aggiungi all'esperimento", "Add to experiment"], ["Inserisci i dati nella tabella.", "Enter the data in the table."], ["Compila prima i dati.", "Fill in the data first."], ["Inserisci prima i dati.", "Enter the data first."], ["Scrivi la riga di intestazione e almeno una riga di dati.", "Write the header row and at least one data row."], ["Servono almeno due colonne.", "At least two columns are needed."], ["Colonna da rappresentare:", "Column to plot:"], ["La colonna scelta per il grafico non contiene numeri.", "The column chosen for the chart contains no numbers."], ["Una riga per concentrazione: concentrazione, poi le repliche della risposta. Più composti: separali con una riga «# Nome». Il fit è a 4 parametri.", "One row per concentration: concentration, then the response replicates. Several compounds: separate them with a \"# Name\" row. The fit is 4-parameter."], ["Una riga per punto: x, poi le repliche di y. Più serie: separale con una riga «# Nome».", "One row per point: x, then the y replicates. Several series: separate them with a \"# Name\" row."], ["Una riga per gruppo: nome, poi i valori delle repliche (separati da tab, «;» o spazio). Con 2 gruppi fa il test t di Welch, con 3 o più l'ANOVA.", "One row per group: name, then replicate values (separated by tab, \";\" or space). With 2 groups it runs Welch's t-test, with 3 or more ANOVA."], ["La prima riga è l'intestazione, poi una riga per prova. Se la prima colonna è numerica fa un grafico x-y (con fit a scelta), altrimenti un grafico a barre.", "The first row is the header, then one row per run. If the first column is numeric it makes an x-y chart (with a fit of your choice), otherwise a bar chart."], ["Compila i campi che servono (puoi aggiungere altre righe). I campi vuoti non compaiono nel Word.", "Fill in the fields you need (you can add more rows). Empty fields do not appear in the Word file."], ["Compila almeno un campo.", "Fill in at least one field."], ["Compila il layout (nome del gruppo in ogni pozzetto, es. Blank, Controllo, Comp-A 10 µM) e i valori letti (assorbanza, fluorescenza…). Puoi incollare un blocco 8×12 da Excel in ciascuna griglia. Pozzetti vuoti ignorati.", "Fill in the layout (group name in each well, e.g. Blank, Control, Cmpd-A 10 µM) and the readings (absorbance, fluorescence…). You can paste an 8×12 block from Excel into each grid. Empty wells are ignored."], ["Layout (nome del gruppo)", "Layout (group name)"], ["Valori letti", "Readings"], ["Nome del bianco", "Blank name"], ["Nome del controllo", "Control name"], ["Per ogni diluizione scrivi le colonie contate sulle piastre. Diluizione: -6, 10^-6, 1e-6 o 1:1000000. Contano le piastre con 30-300 colonie. Volume piastrato in mL (di solito 0.1).", "For each dilution write the colonies counted on the plates. Dilution: -6, 10^-6, 1e-6 or 1:1000000. Plates with 30-300 colonies count. Plated volume in mL (usually 0.1)."], ["Per ogni riga indica PM e una tra massa, mmol oppure volume + densità. La resa si calcola sul reagente limitante (il primo reagente, o quello segnato «limitante»). Stechiometria 1:1 col prodotto.", "For each row give the MW and one of mass, mmol or volume + density. The yield is calculated on the limiting reagent (the first reagent, or the one marked \"limiting\"). 1:1 stoichiometry with the product."], ["Una riga per ogni concentrazione provata: composto, ceppo, concentrazione e se c'è crescita. La MIC è la concentrazione più bassa senza crescita.", "One row per concentration tested: compound, strain, concentration and whether there is growth. The MIC is the lowest concentration with no growth."], ["Una riga per gruppo e gene con i Ct delle repliche. Indica il gene di riferimento e il gruppo di controllo qui sopra: il Diario calcola ΔCt, ΔΔCt e fold change (2^-ΔΔCt).", "One row per group and gene with the replicate Ct values. Give the reference gene and the control group above: the Diary calculates ΔCt, ΔΔCt and fold change (2^-ΔΔCt)."], ["Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato. Sulla lastra puoi trascinare le macchie su e giù con il mouse; doppio clic su una corsia per aggiungerne una.", "One row per lane of the plate (e.g. SM, co-spot, mixture, product). Choose how many spots it has and enter the Rf of each (0–1). If you measure in cm, write the distance travelled and the solvent-front distance and the Rf is calculated. On the plate you can drag spots up and down with the mouse; double-click a lane to add one."], ["Eluente (es. AcOEt/esano 3:7)", "Eluent (e.g. EtOAc/hexane 3:7)"], ["Fase stazionaria", "Stationary phase"], ["Gel di silice 60 F254", "Silica gel 60 F254"], ["Rivelatore chimico (KMnO4, ninidrina, I2…)", "Chemical stain (KMnO4, ninhydrin, I2…)"], ["Inserisco l'Rf (0–1)", "I enter the Rf (0–1)"], ["Inserisco le distanze in cm", "I enter distances in cm"], ["Fronte (cm)", "Front (cm)"], ["macchie:", "spots:"], ["Nome", "Name"], ["+ Aggiungi corsia", "+ Add lane"], ["＋ Aggiungi riga", "＋ Add row"], ["Elimina la riga", "Delete row"], ["Aggiungi almeno una macchia.", "Add at least one spot."], ["N. macchie", "No. of spots"], ["fronte del solvente", "solvent front"], ["linea di base", "baseline"], ["Eluente: ", "Eluent: "], ["Fase stazionaria: ", "Stationary phase: "], ["Rivelazione: ", "Detection: "], ["Composto", "Compound"], ["Ceppo", "Strain"], ["Crescita", "Growth"], ["Campo", "Field"], ["Valore", "Value"], ["Aspetto", "Appearance"], ["Resa", "Yield"], ["Punto di fusione", "Melting point"], ["Rf (eluente)", "Rf (eluent)"], ["Massa (mg)", "Mass (mg)"], ["Equiv. / resa", "Equiv. / yield"], ["Catalizzatore / additivo", "Catalyst / additive"], ["Prodotto ", "Product "], ["Reagente limitante: ", "Limiting reagent: "], ["Concentrazione del limitante: ", "Limiting reagent concentration: "], ["Massa teorica: ", "Theoretical mass: "], ["Bersaglio / enzima", "Target / enzyme"], ["Composto (lotto)", "Compound (lot)"], ["Substrato / ligando e concentrazione", "Substrate / ligand and concentration"], ["Tampone e pH", "Buffer and pH"], ["Temperatura e tempo di incubazione", "Temperature and incubation time"], ["Metodo di rivelazione", "Detection method"], ["Controlli (positivo, negativo, veicolo)", "Controls (positive, negative, vehicle)"], ["Concentrazione di DMSO", "DMSO concentration"], ["Linea cellulare (passaggio)", "Cell line (passage)"], ["Terreno e siero", "Medium and serum"], ["Densità di semina", "Seeding density"], ["Trattamento (concentrazione, tempo)", "Treatment (concentration, time)"], ["Anticorpi primari (diluizione, lotto)", "Primary antibodies (dilution, lot)"], ["Anticorpi secondari", "Secondary antibodies"], ["Kit / reagenti (lotto)", "Kits / reagents (lot)"], ["Repliche biologiche / tecniche", "Biological / technical replicates"], ["Ceppo (codice)", "Strain (code)"], ["Terreno", "Medium"], ["Temperatura e atmosfera", "Temperature and atmosphere"], ["Inoculo (CFU/mL o OD)", "Inoculum (CFU/mL or OD)"], ["Tempo di incubazione", "Incubation time"], ["Composto / antibiotico (lotto)", "Compound / antibiotic (lot)"], ["Standard di riferimento (CLSI, EUCAST)", "Reference standard (CLSI, EUCAST)"], ["Materiale e lotto", "Material and lot"], ["Sintesi / processo (parametri)", "Synthesis / process (parameters)"], ["Strumento e modello", "Instrument and model"], ["Condizioni ambientali (T, umidità)", "Environmental conditions (T, humidity)"], ["Calibrazione", "Calibration"], ["Preparazione del campione", "Sample preparation"], ["Norma di riferimento", "Reference standard"], ["Repository e commit", "Repository and commit"], ["Versione software e librerie", "Software and library versions"], ["Seed casuale", "Random seed"], ["Dataset (versione)", "Dataset (version)"], ["Comando eseguito", "Command run"], ["Tempo di calcolo", "Computation time"], ["Gene di riferimento", "Reference gene"], ["Gruppo di controllo", "Control group"], ["Ct medio", "Mean Ct"], ["Fold change (intervallo)", "Fold change (range)"], ["Espressione relativa (2^-ΔΔCt)", "Relative expression (2^-ΔΔCt)"], ["Inserisci i valori di Ct.", "Enter the Ct values."], ["Servono almeno un gene bersaglio oltre al riferimento.", "At least one target gene besides the reference is needed."], ["Risposta (%)", "Response (%)"], ["Tempo (h)", "Time (h)"], ["Concentrazione ≤ 0 (", "Concentration ≤ 0 ("], ["Piastra 1", "Plate 1"], ["Piastra 2", "Plate 2"], ["Piastra 3", "Plate 3"], ["Serie ", "Series "], ["(unità)", "(unit)"], ["media ± DS (n)", "mean ± SD (n)"], ["Test t di Welch:", "Welch's t-test:"], ["ANOVA a una via: F(", "One-way ANOVA: F("], ["Bianco sottratto: ", "Blank subtracted: "], ["Alcuni gruppi hanno meno di 3 repliche: le statistiche sono poco affidabili.", "Some groups have fewer than 3 replicates: the statistics are not very reliable."], ["Alcuni gruppi hanno meno di 3 pozzetti.", "Some groups have fewer than 3 wells."], ["Per il test servono almeno 2 valori per gruppo.", "The test needs at least 2 values per group."], ["Per l'ANOVA servono almeno 2 valori per gruppo.", "ANOVA needs at least 2 values per group."], ["Inserisci almeno una concentrazione.", "Enter at least one concentration."], ["Inserisci layout e valori.", "Enter layout and values."], ["Errore nel calcolo: ", "Calculation error: "], ["Valore non numerico: ", "Non-numeric value: "], ["Valore non numerico in ", "Non-numeric value in "], ["Valori di x ≤ 0 non inclusi (asse logaritmico).", "x values ≤ 0 not included (log axis)."], ["Valori di y ≤ 0 non inclusi (asse y logaritmico).", "y values ≤ 0 not included (log y axis)."], ["Resa superiore al 100%: controlla PM e quantità (", "Yield above 100%: check MW and amounts ("], ["Inserisci PM e massa (o mmol) di almeno un reagente per calcolare equivalenti e resa.", "Enter MW and mass (or mmol) of at least one reagent to calculate equivalents and yield."], ["Aggiungi almeno una macchia.", "Add at least one spot."], ["Non riesco a caricare l'editor di strutture. Serve la connessione a internet (oppure scarica JSME e mettilo nella cartella «jsme» accanto a diario_web.py).", "I cannot load the structure editor. An internet connection is needed (or download JSME and put it in the \"jsme\" folder next to diario_web.py)."], ["L'editor di strutture non risponde.", "The structure editor is not responding."], ["Non riesco a convertire il disegno in immagine.", "I cannot convert the drawing to an image."], ["Immagine non creata.", "Image not created."], ["Negli appunti non c'e' nessuna struttura (usa il pulsante 📋 Incolla da ChemDraw per i dettagli)", "There is no structure on the clipboard (use the 📋 Paste from ChemDraw button for details)"], ["Non ho trovato ChemDraw tra le applicazioni.\nScrivi il nome dell'app (es. ChemDraw 23.1) oppure incolla il suo percorso completo (Mac: Finder, seleziona l'app e premi ⌥⌘C · Windows: il percorso di ChemDraw.exe).", "I could not find ChemDraw among the applications.\nType the app name (e.g. ChemDraw 23.1) or paste its full path (Mac: Finder, select the app and press ⌥⌘C · Windows: the path of ChemDraw.exe)."], ["🔬 Diario del", "🔬 Researcher's"], ["Ricercatore", "Diary"], ["🖥️ Crea icona sul Desktop", "🖥️ Create Desktop icon"], ["Crea l'icona del Diario sulla Scrivania, cosi' si apre con un doppio clic", "Create the Diary icon on the Desktop, so it opens with a double-click"], ["✅ Icona creata: ", "✅ Icon created: "], ["🧭 Settore: ", "🧭 Field: "], [" settori", " fields"], ["✨ AI su: ", "✨ AI on: "], ["Creala su ", "Create it at "], ["Creala su", "Create it at"], ["Procedura sperimentale", "Experimental procedure"], ["Obiettivo e ipotesi", "Objective and hypothesis"], ["Obiettivo", "Objective"], ["Saggio e condizioni", "Assay and conditions"], ["Materiali e metodi", "Materials and methods"], ["Preparazione e condizioni di misura", "Preparation and measurement conditions"], ["Metodo e configurazione", "Method and configuration"], ["Risultati e osservazioni", "Results and observations"], ["Risultati (IC50, Ki, inibizione)", "Results (IC50, Ki, inhibition)"], ["Risultati (conte, MIC, crescita)", "Results (counts, MIC, growth)"], ["Misure e risultati", "Measurements and results"], ["Risultati e metriche", "Results and metrics"], ["Note e prossimi passi", "Notes and next steps"], [" in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", " in ChemDraw select the structure, press ⌘C and then ⌘V on this page (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."], ["in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", "in ChemDraw select the structure, press ⌘C and then ⌘V on this page (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."], ["⚠️ Nessuna immagine associata: nel Word comparirà solo il nome. Incolla lo schema da ChemDraw (⌘C → ⌘V qui) o aggiungi un PNG con lo stesso nome.", "⚠️ No associated image: only the name will appear in Word. Paste the scheme from ChemDraw (⌘C → ⌘V here) or add a PNG with the same name."], [" — controlla e modifica prima di applicare", " — check and edit before applying"], ["✨ Proposta di ", "✨ Suggestion from "], ["Trovata: ", "Found: "], [" (clicca per usarla)", " (click to use it)"], ["Eliminare il gruppo «", "Delete the group «"], ["»?\n\nGli esperimenti NON vengono cancellati: passano al gruppo superiore (o all'elenco principale).", "»?\n\nExperiments are NOT deleted: they move to the parent group (or to the main list)."], ["» archiviato: lo trovi in 📦 Archivio", "» archived: you can find it in 📦 Archive"], ["» ripristinato", "» restored"], ["Non riesco ad aprire «", "I cannot open «"], ["». Controlla il nome o il percorso e riprova.", "». Check the name or path and try again."], ["Esperimento non trovato.", "Experiment not found."], ["Gruppo non trovato.", "Group not found."], ["Non ci sono esperimenti da unire.", "There are no experiments to merge."], ["Scegli un gruppo o un progetto.", "Choose a group or a project."], ["Scrivi prima qualcosa da tradurre.", "First write something to translate."], ["Questa voce e' gia' scritta in inglese: non serve tradurla.", "This entry is already written in English: no need to translate it."], ["La traduzione non e' arrivata in un formato leggibile: riprova.", "The translation did not arrive in a readable format: try again."], ["Una sincronizzazione e' gia' in corso.", "A sync is already in progress."], ["Il nome del gruppo non puo' essere vuoto.", "The group name cannot be empty."], ["Testo vuoto.", "Empty text."], [" · senza traduzione: ", " · without translation: "], [" esperimenti uniti in «", " experiments merged into «"], ["Conferma", "Confirm"], ["Titolo", "Title"], ["Ruolo", "Role"], ["Limitante", "Limiting"], ["limitante", "limiting"], ["Reagente", "Reagent"], ["Solvente", "Solvent"], ["Prodotto", "Product"], ["Esempio", "Example"], ["estremi fissi (top 100, bottom 0)", "fixed limits (top 100, bottom 0)"], [" estremi fissi (top 100, bottom 0)", " fixed limits (top 100, bottom 0)"], ["x logaritmico", "log x"], [" x logaritmico", " log x"], ["y logaritmico", "log y"], [" y logaritmico", " log y"], ["nessun fit", "no fit"], ["retta (regressione lineare)", "line (linear regression)"], ["polinomio di 2° grado", "2nd-degree polynomial"], ["esponenziale (k, raddoppio / emivita)", "exponential (k, doubling / half-life)"], ["legge di potenza", "power law"], ["sottrai il bianco", "subtract blank"], [" sottrai il bianco", " subtract blank"], ["normalizza sul controllo (= 100 %)", "normalise to control (= 100 %)"], [" normalizza sul controllo (= 100 %)", " normalise to control (= 100 %)"], ["Gruppo", "Group"], ["Campione", "Sample"], ["Diluizione", "Dilution"], ["crescita", "growth"], ["no crescita", "no growth"], ["Nessun pozzetto «", "No well «"], ["»: il bianco non è stato sottratto.", "»: the blank was not subtracted."], ["»: nessuna normalizzazione.", "»: no normalisation."], [", rivelazione ", ", detection "], [", eluente ", ", eluent "], ["Il gene di riferimento «", "The reference gene «"], ["Il gruppo di controllo «", "The control group «"], ["» non compare nella tabella.", "» does not appear in the table."], [": servono almeno 3 punti per la retta.", ": at least 3 points are needed for the line."], [": servono almeno 4 punti per il polinomio di 2° grado.", ": at least 4 points are needed for the 2nd-degree polynomial."], [": servono almeno 3 punti con y > 0 per l'esponenziale.", ": at least 3 points with y > 0 are needed for the exponential."], [": servono almeno 3 punti con x > 0 e y > 0 per la legge di potenza.", ": at least 3 points with x > 0 and y > 0 are needed for the power law."], [": servono almeno 4 punti su 3 valori di x diversi per Michaelis-Menten.", ": at least 4 points at 3 different x values are needed for Michaelis-Menten."], [": servono almeno 5 punti su 4 concentrazioni diverse per il fit (3 con estremi fissi).", ": at least 5 points at 4 different concentrations are needed for the fit (3 with fixed limits)."], [": alcuni punti hanno una sola replica (niente barre di errore).", ": some points have a single replicate (no error bars)."], [": intervallo di confidenza non calcolabile (pochi punti).", ": confidence interval cannot be calculated (too few points)."], [") non inclusa nel grafico e nel fit.", ") not included in the chart and fit."], [" fuori dall'intervallo di concentrazioni misurato, il valore è un'estrapolazione.", " outside the measured concentration range, the value is an extrapolation."], ["): controlla i dati o prova gli estremi fissi.", "): check the data or try fixed limits."], ["): segnale molto debole.", "): very weak signal."], ["): alcune piastre fuori dall'intervallo 30-300 sono state escluse.", "): some plates outside the 30-300 range were excluded."], ["): nessuna piastra tra 30 e 300 colonie, riga esclusa.", "): no plate between 30 and 300 colonies, row excluded."], [": risultati non monotoni (crescita a concentrazioni più alte di una senza crescita): controlla.", ": non-monotonic results (growth at concentrations higher than one without growth): check."], ["»: manca il PM (o la densità per un volume).", "»: MW missing (or density for a volume)."], ["Rf fuori da 0–1 nella corsia «", "Rf outside 0–1 in lane «"], ["Inserisci la distanza percorsa dal fronte (cm) per calcolare gli Rf.", "Enter the distance travelled by the front (cm) to calculate the Rf values."], ["fuori 30-300", "outside 30-300"], ["CFU/mL (media)", "CFU/mL (mean)"], ["📂 Documenti ▾", "📂 Documents ▾"], ["⚙️ Impostazioni ▾", "⚙️ Settings ▾"], ["⏻ Chiudi", "⏻ Close"], ["⚗️ Apri ChemDraw", "⚗️ Open ChemDraw"], ["Cartella dei documenti, documento unico di progetto, Google Drive", "Documents folder, single project document, Google Drive"], ["Settore, chiavi API, lingua, icona sul Desktop", "Field, API keys, language, Desktop icon"], ["🇬🇧 Vedi versione inglese", "🇬🇧 View English version"], ["↩ Torna al testo originale", "↩ Back to the original text"], ["🇬🇧 Stai guardando la versione inglese. Le modifiche che fai qui cambiano solo il documento «English version»; il testo originale non viene toccato.", "🇬🇧 You are viewing the English version. Edits made here only change the \"English version\" document; the original text is not touched."], ["Passa dal testo originale alla versione inglese e viceversa", "Switch between the original text and the English version"], ["✅ Tradotto. Creato «", "✅ Translated. Created «"], ["⬆️ Nuova versione: aggiorna ora", "⬆️ New version: update now"], ["⬆️ Cerca aggiornamenti", "⬆️ Check for updates"], ["Aggiorno il Diario all'ultima versione? I tuoi esperimenti non vengono toccati. Il Diario si riavvia da solo.", "Update the Diary to the latest version? Your experiments are not touched. The Diary restarts by itself."], ["⬆️ Scarico l'aggiornamento…", "⬆️ Downloading the update…"], ["✅ Hai già l'ultima versione", "✅ You already have the latest version"], ["⬆️ Cerco aggiornamenti…", "⬆️ Checking for updates…"], ["Diario aggiornato", "Diary updated"], ["Si sta riavviando: tra pochi secondi si apre una nuova scheda. Questa puoi chiuderla.", "It is restarting: a new tab will open in a few seconds. You can close this one."], ["← Esperimenti", "← Experiments"], ["⬆️ È uscita una nuova versione del Diario", "⬆️ A new version of the Diary is out"], ["Questa versione non è più aggiornata. Premi «Aggiorna ora»: il Diario scarica la versione nuova e si riapre da solo in pochi secondi. I tuoi esperimenti, allegati e documenti non vengono toccati.", "This version is out of date. Press \"Update now\": the Diary downloads the new version and reopens by itself in a few seconds. Your experiments, attachments and documents are not touched."], ["⬆️ Aggiorna ora", "⬆️ Update now"], ["Più tardi", "Later"], ["🔍 Vedi", "🔍 View"], ["Clicca per ingrandire", "Click to enlarge"], ["Cartella", "Folder"], ["Concentrazione", "Concentration"], ["Concentrazione (", "Concentration ("], [" (% del controllo)", " (% of control)"], ["Valore (", "Value ("], [" (IC 95%: ", " (95% CI: "], [", gdl = ", ", df = "], ["; pendenza (Hill) = ", "; slope (Hill) = "], ["; pendenza ± ES = ", "; slope ± SE = "], ["emivita = ", "half-life = "], ["tempo di raddoppio = ", "doubling time = "], ["Media", "Mean"], ["(gdl ", "(df "], ["Controllo", "Control"], ["Trattato", "Treated"], ["Trattato 1", "Treated 1"], ["Trattato 2", "Treated 2"], ["TLC su ", "TLC on "], ["Colonna «", "Column «"], [", media = ", ", mean = "], [", DS = ", ", SD = "], ["Gruppi archiviati", "Archived groups"], ["Torna ai miei esperimenti", "Back to my experiments"], ["(senza titolo)", "(untitled)"], ["Nuovo esperimento", "New experiment"], ["HPLC (purezza, tR)", "HPLC (purity, tR)"], ["🏛️ Laboratorio ", "🏛️ Lab "], ["🏛️ Laboratorio", "🏛️ Lab"], ["Gli studenti del tuo laboratorio e il loro lavoro", "Your lab's students and their work"], ["🏛️ Il mio laboratorio", "🏛️ My lab"], ["Qui vedi il lavoro degli studenti che hanno condiviso con te la loro cartella. Gli aggiornamenti arrivano da soli (circa un minuto dopo che lo studente ha scritto, più il tempo di Google Drive) e ricevi una notifica.", "Here you see the work of the students who shared their folder with you. Updates arrive by themselves (about a minute after the student writes, plus Google Drive's time) and you get a notification."], ["Nessuno studente ancora. Aggiungine uno qui sotto.", "No students yet. Add one below."], ["＋ Aggiungi uno studente", "＋ Add a student"], ["Nome dello studente", "Student name"], ["Cartella «Diario del Ricercatore» condivisa dallo studente", "\"Diario del Ricercatore\" folder shared by the student"], ["📂 Sfoglia…", "📂 Browse…"], ["＋ Aggiungi", "＋ Add"], ["Come si collega uno studente: 1) lo studente imposta la cartella Google Drive nel suo Diario (⚙️ Impostazioni → Chiavi API e impostazioni); 2) da Google Drive condivide con te la cartella «Diario del Ricercatore»; 3) tu, in Google Drive, fai tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive», così compare sul tuo computer; 4) la scegli qui con «Sfoglia».", "How to connect a student: 1) the student sets the Google Drive folder in their Diary (⚙️ Settings → API keys and settings); 2) from Google Drive they share the \"Diario del Ricercatore\" folder with you; 3) in Google Drive you right-click the shared folder → \"Add shortcut to Drive\", so it appears on your computer; 4) you choose it here with \"Browse\"."], ["Studente aggiunto, ma in quella cartella non c'è ancora il file «stato.json»: comparirà appena lo studente aggiorna il Diario e sincronizza con Drive.", "Student added, but that folder does not contain the \"stato.json\" file yet: it will appear as soon as the student updates the Diary and syncs with Drive."], ["Il tuo nome", "Your name"], ["Il tuo nome (come ti vede il tuo supervisore):", "Your name (as your supervisor sees you):"], ["· Per farti seguire imposta la cartella Google Drive nelle impostazioni.", "· To be followed, set the Google Drive folder in the settings."], ["Scegli un esperimento a sinistra per leggerlo.", "Choose an experiment on the left to read it."], ["← Laboratorio", "← Lab"], ["📂 Cartella", "📂 Folder"], ["✓ Segna tutto come visto", "✓ Mark all as seen"], ["Togli", "Remove"], ["Togliere questo studente dal laboratorio? I suoi file non vengono toccati.", "Remove this student from the lab? Their files are not touched."], ["📄 Apri il Word", "📄 Open Word file"], ["adesso", "just now"], ["min fa", "min ago"], ["ore fa", "h ago"], ["giorni fa", "days ago"], ["esperimenti", "experiments"], ["in attesa della prima sincronizzazione", "waiting for the first sync"], ["novità", "new"], ["Senza gruppo", "No group"], ["modificato", "edited"], ["nuovo", "new"], ["allegati", "attachments"], ["tabelle di dati", "data tables"], ["ultimo aggiornamento", "last update"], ["Scrivi il nome dello studente.", "Enter the student's name."], ["La cartella indicata non esiste su questo computer.", "That folder does not exist on this computer."], ["Il Word di questo esperimento non e' ancora arrivato nella cartella condivisa.", "The Word file of this experiment has not arrived in the shared folder yet."], ["Cartella non trovata o non ancora sincronizzata (manca stato.json).", "Folder not found or not synced yet (stato.json is missing)."], ["esperimento", "experiment"]];
 const EN_MAP = new Map(EN_PAIRS);
-const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(]\s?$|^\s|\s$/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
+const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(=]\s?$|^\s|\s$|^[;,(]/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
 function tx(s) {
   if (UI_LANG !== "en" || typeof s !== "string") return s;
   const t = s.trim(); if (!t) return s;
@@ -2782,12 +3078,32 @@ function txf(s) {
   for (const p of EN_FRAG) if (o.indexOf(p[0]) >= 0) o = o.split(p[0]).join(p[1]);
   return o;
 }
+// risultati dei calcoli (riassunto, avvisi, intestazioni, etichette) nella lingua dell'interfaccia: finiscono anche nel Word
+function trRes(r) {
+  if (UI_LANG !== "en" || !r) return r;
+  if (r.summary) r.summary = String(r.summary).split("\n").map(txf).join("\n");
+  if (r.warns) r.warns = r.warns.map(txf);
+  if (r.table && r.table.length) r.table = r.table.map((row, i) => row.map(c => typeof c === "string" ? (i === 0 ? txf(c) : tx(c)) : c));
+  if (r.chart) { ["xlabel", "ylabel", "note"].forEach(k => { if (typeof r.chart[k] === "string") r.chart[k] = txf(r.chart[k]); }); }
+  return r;
+}
+function txDeep(o) {
+  if (UI_LANG !== "en") return o;
+  if (typeof o === "string") return tx(o);
+  if (Array.isArray(o)) return o.map(txDeep);
+  if (o && typeof o === "object") { Object.keys(o).forEach(k => { o[k] = txDeep(o[k]); }); }
+  return o;
+}
+function txExample(s) {
+  if (UI_LANG !== "en") return s;
+  return s.replace(/Composto/g, "Compound").replace(/Controllo/g, "Control").replace(/Trattato/g, "Treated").replace(/Prova/g, "Run").replace(/Epoche/g, "Epochs").replace(/Accuratezza/g, "Accuracy");
+}
 if (UI_LANG === "en") {
   const FRAG_SEL = "#status, .warn, .dssum, .hint, .muted, #btnSector, #ailabel, .modal .h2";
   const doNode = n => {
     if (n.nodeType === 3) {
       const par = n.parentElement; if (!par || /^(TEXTAREA|SCRIPT|STYLE)$/.test(par.tagName)) return;
-      const v = n.nodeValue, r = par.closest(FRAG_SEL) ? txf(v) : tx(v);
+      const v = n.nodeValue, r = (par.closest(FRAG_SEL) || par.closest("svg")) ? txf(v) : tx(v);
       if (r !== v) n.nodeValue = r;
     } else if (n.nodeType === 1) {
       ["placeholder", "title"].forEach(a => { const v = n.getAttribute(a); if (v) { const r = tx(v); if (r !== v) n.setAttribute(a, r); } });
@@ -3215,6 +3531,124 @@ async function delAtt(id) {
   renderAtt(d.attachments);
 }
 
+// ---------- Laboratorio: bacheca degli studenti (supervisore) ----------
+function agoText(iso) {
+  if (!iso) return "";
+  const t = new Date(iso).getTime(); if (!isFinite(t)) return "";
+  const m = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (m < 1) return tx("adesso");
+  if (m < 60) return m + " " + tx("min fa");
+  if (m < 60 * 24) return Math.round(m / 60) + " " + tx("ore fa");
+  return Math.round(m / 1440) + " " + tx("giorni fa");
+}
+function initials(n) { return String(n || "?").trim().split(/\s+/).slice(0, 2).map(w => w[0] || "").join("").toUpperCase() || "?"; }
+function avatar(m, size) {
+  const sz = size || 64;
+  return h("div", { class: "labav", style: "width:" + sz + "px;height:" + sz + "px;font-size:" + Math.round(sz * 0.36) + "px;background:" + m.color }, initials(m.name),
+    m.news ? h("span", { class: "labbadge" }, String(m.news)) : null);
+}
+async function labBadge() {
+  try {
+    const d = await api("lab_get", {});
+    const n = d.members.reduce((a, m) => a + (m.news || 0), 0);
+    const b = $("labCount"); b.textContent = n ? String(n) : ""; b.hidden = !n;
+    return d;
+  } catch (e) { return null; }
+}
+async function openLab(selId) {
+  let data = await api("lab_get", {}), sel = selId || null;
+  const body = h("div"), bg = modal([body]);
+  bg.querySelector(".modal").style.width = "min(1040px, 96vw)";
+  const close = () => { clearInterval(timer); bg.remove(); labBadge(); };
+  const reload = async () => { data = await api("lab_get", {}); draw(); labBadge(); };
+  const timer = setInterval(() => { if (!document.body.contains(bg)) { clearInterval(timer); return; } if (!body.querySelector(".labread")) reload().catch(() => {}); }, 30000);
+
+  const addForm = () => {
+    const name = h("input", { type: "text", placeholder: "Nome dello studente" });
+    const path = h("input", { type: "text", placeholder: "Cartella «Diario del Ricercatore» condivisa dallo studente", style: "flex:2" });
+    const pick = h("button", { class: "btn grey", onclick: async () => { try { const r = await api("pick_folder", {}); if (r.path) path.value = r.path; } catch (e) { fail(e); } } }, "📂 Sfoglia…");
+    const add = h("button", { class: "btn green", onclick: async () => {
+      try {
+        const r = await api("lab_add", { name: name.value, path: path.value });
+        if (!r.found) alert("Studente aggiunto, ma in quella cartella non c'è ancora il file «stato.json»: comparirà appena lo studente aggiorna il Diario e sincronizza con Drive.");
+        await reload();
+      } catch (e) { fail(e); }
+    } }, "＋ Aggiungi");
+    return h("div", { class: "labadd" }, h("div", { class: "dsopt" }, name, path, pick, add),
+      h("div", { class: "hint" }, "Come si collega uno studente: 1) lo studente imposta la cartella Google Drive nel suo Diario (⚙️ Impostazioni → Chiavi API e impostazioni); 2) da Google Drive condivide con te la cartella «Diario del Ricercatore»; 3) tu, in Google Drive, fai tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive», così compare sul tuo computer; 4) la scegli qui con «Sfoglia»."));
+  };
+
+  const drawBoard = () => {
+    const me = h("input", { type: "text", placeholder: "Il tuo nome", style: "max-width:260px" }); me.value = data.owner_name || "";
+    me.addEventListener("change", () => api("lab_name", { name: me.value }).catch(fail));
+    body.append(
+      h("div", { class: "h2", style: "margin:0" }, "🏛️ Il mio laboratorio"),
+      h("div", { class: "hint" }, "Qui vedi il lavoro degli studenti che hanno condiviso con te la loro cartella. Gli aggiornamenti arrivano da soli (circa un minuto dopo che lo studente ha scritto, più il tempo di Google Drive) e ricevi una notifica."),
+      h("div", { class: "labgrid" }, data.members.length ? data.members.map(m =>
+        h("div", { class: "labcard" + (m.ok ? "" : " off"), onclick: () => { sel = m.id; draw(); } },
+          avatar(m),
+          h("div", { class: "labname" }, m.name),
+          h("div", { class: "muted" }, m.ok ? (m.experiments.length + " " + tx(m.experiments.length === 1 ? "esperimento" : "esperimenti") + " · " + agoText(m.updated)) : tx("in attesa della prima sincronizzazione")),
+          m.news ? h("div", { class: "labnew" }, m.news + " " + tx(m.news === 1 ? "novità" : "novità")) : null))
+        : h("div", { class: "muted" }, "Nessuno studente ancora. Aggiungine uno qui sotto.")),
+      h("div", { class: "h2", style: "margin:14px 0 0;font-size:16px" }, "＋ Aggiungi uno studente"),
+      addForm(),
+      h("div", { class: "labme" }, h("span", { class: "muted" }, "Il tuo nome (come ti vede il tuo supervisore):"), me,
+        data.sync ? null : h("span", { class: "muted" }, "· Per farti seguire imposta la cartella Google Drive nelle impostazioni.")),
+      h("div", { class: "btns" }, h("button", { class: "btn grey", onclick: close }, "Chiudi")));
+  };
+
+  const drawMember = m => {
+    const list = h("div", { class: "lablist" }), read = h("div", { class: "labread-box" }, h("div", { class: "muted" }, "Scegli un esperimento a sinistra per leggerlo."));
+    const groups = {};
+    m.experiments.slice().sort((a, b) => String(b.updated).localeCompare(String(a.updated))).forEach(e => { const k = (e.group || []).join(" / ") || tx("Senza gruppo"); (groups[k] = groups[k] || []).push(e); });
+    Object.keys(groups).forEach(k => {
+      list.append(h("div", { class: "labgroup" }, "📁 " + k));
+      groups[k].forEach(e => {
+        const row = h("div", { class: "labrow", onclick: async () => {
+          try {
+            const d = await api("lab_exp", { member: m.id, exp: e.id });
+            list.querySelectorAll(".labrow").forEach(x => x.classList.remove("on")); row.classList.add("on");
+            const chip = row.querySelector(".labchip"); if (chip) chip.remove(); e.state = "seen";
+            const x = d.exp, T = d.titles || {};
+            read.innerHTML = "";
+            read.append(h("div", { class: "labread" },
+              h("div", { class: "labtitle" }, x.name || tx("(senza nome)")),
+              h("div", { class: "muted" }, [x.date, x.project, (x.group || []).join(" / ")].filter(Boolean).join(" · ") + " · " + tx("modificato") + " " + agoText(x.updated)),
+              ["obiettivo", "procedura", "risultati", "note"].filter(k2 => (x.sections[k2] || "").trim()).map(k2 =>
+                h("div", null, h("div", { class: "labsec" }, tx(T[k2] || k2)), h("div", { class: "labtext" }, x.sections[k2]))),
+              h("div", { class: "muted", style: "margin-top:8px" }, "📎 " + (x.n_att || 0) + " " + tx("allegati") + " · 📈 " + (x.n_data || 0) + " " + tx("tabelle di dati")),
+              h("div", { class: "btns", style: "position:static;padding:10px 0 0" },
+                h("button", { class: "btn blue", onclick: () => api("lab_open", { member: m.id, exp: x.id }).catch(fail) }, "📄 Apri il Word"))));
+            labBadge();
+          } catch (er) { fail(er); }
+        } },
+          h("div", { class: "labrname" }, e.name || tx("(senza nome)")),
+          e.state === "seen" ? null : h("span", { class: "labchip " + e.state }, tx(e.state === "new" ? "nuovo" : "modificato")),
+          h("div", { class: "muted" }, (e.date || "") + " · " + agoText(e.updated)));
+        list.append(row);
+      });
+    });
+    body.append(
+      h("div", { style: "display:flex;align-items:center;gap:12px;flex-wrap:wrap" },
+        h("button", { class: "btn grey small", onclick: () => { sel = null; reload().catch(fail); } }, "← Laboratorio"),
+        avatar(m, 44), h("div", null, h("div", { class: "labname", style: "font-size:18px" }, m.name), h("div", { class: "muted" }, m.ok ? tx("ultimo aggiornamento") + " " + agoText(m.updated) : (m.error || ""))),
+        h("span", { style: "flex:1" }),
+        h("button", { class: "btn grey small", onclick: () => api("lab_open", { member: m.id }).catch(fail) }, "📂 Cartella"),
+        h("button", { class: "btn grey small", onclick: async () => { await api("lab_seen", { member: m.id }); await reload(); } }, "✓ Segna tutto come visto"),
+        h("button", { class: "btn red small", onclick: async () => { if (confirm("Togliere questo studente dal laboratorio? I suoi file non vengono toccati.")) { await api("lab_remove", { id: m.id }); sel = null; await reload(); } } }, "Togli")),
+      m.ok ? h("div", { class: "labsplit" }, list, read) : h("div", { class: "warn" }, m.error || ""),
+      h("div", { class: "btns" }, h("button", { class: "btn grey", onclick: close }, "Chiudi")));
+  };
+
+  const draw = () => {
+    body.innerHTML = "";
+    const m = sel && data.members.find(x => x.id === sel);
+    if (m) drawMember(m); else { sel = null; drawBoard(); }
+  };
+  draw();
+}
+
 async function openMerge(gid) {
   const pr = (await api("projects", {})).projects;
   const opts = [];
@@ -3468,7 +3902,7 @@ function loadJsme() {
 function svgToPng(svg) {
   return new Promise((resolve, reject) => {
     let w = 0, h0 = 0;
-    if (UI_LANG === "en") svg = svg.replace(/>([^<>]+)</g, (m, x) => ">" + tx(x) + "<");
+    if (UI_LANG === "en") svg = svg.replace(/>([^<>]+)</g, (m, x) => ">" + txf(x) + "<");
     const vb = svg.match(/viewBox\s*=\s*"([\d.\-eE+ ,]+)"/i);
     if (vb) { const p = vb[1].trim().split(/[\s,]+/).map(Number); w = p[2]; h0 = p[3]; }
     const mw = svg.match(/<svg[^>]*\swidth\s*=\s*"([\d.]+)/i), mh = svg.match(/<svg[^>]*\sheight\s*=\s*"([\d.]+)/i);
@@ -4052,11 +4486,11 @@ function openDataset(ds, preset) {
   const pl = ds ? ds.payload : {};
   const kindSel = h("select", null, Object.keys(TEXT_KINDS).map(k => h("option", { value: k }, TEXT_KINDS[k])));
   kindSel.value = (ds && ds.kind) || (tool && tool.text) || defaultKind();
-  const title = h("input", { type: "text", placeholder: "Titolo (es. Inibizione di NLRP3 – composti A e B)", maxlength: "120" }); title.value = ds ? ds.title : (tool ? tool.label : "");
+  const title = h("input", { type: "text", placeholder: "Titolo (es. Inibizione di NLRP3 – composti A e B)", maxlength: "120" }); title.value = ds ? ds.title : (tool ? tx(tool.label) : "");
   const unitSel = h("select", null, ["", "M", "mM", "µM", "nM", "pM", "µg/mL", "mg/mL", "mg/kg", "s", "min", "h", "°C", "V", "mV", "nm", "mm"].map(u => h("option", { value: u }, u || "(unità)")));
   unitSel.value = pl.unit != null ? pl.unit : (tool && tool.unit ? tool.unit : "µM");
   const xl = h("input", { type: "text", placeholder: "Etichetta asse x" }), yl = h("input", { type: "text", placeholder: "Etichetta asse y" });
-  xl.value = pl.xlabel || (tool && tool.xl) || ""; yl.value = pl.ylabel || (tool && tool.yl) || "";
+  xl.value = pl.xlabel || (tool && tx(tool.xl)) || ""; yl.value = pl.ylabel || (tool && tx(tool.yl)) || "";
   const o0 = pl.opts || (tool && tool.opts) || {};
   const fixTB = h("input", { type: "checkbox" }); fixTB.checked = !!o0.fixTB;
   const logx = h("input", { type: "checkbox" }); logx.checked = !!o0.logx;
@@ -4100,7 +4534,7 @@ function openDataset(ds, preset) {
     unitSel.style.display = (k === "bars") ? "none" : "";
     if (k === "table") fillCols();
     try {
-      last = analyze(spec());
+      last = trRes(analyze(spec()));
       preview.innerHTML = chartSVG(last.chart);
       summ.textContent = last.summary;
       warnBox.textContent = last.warns.length ? "⚠️ " + last.warns.join(" · ") : "";
@@ -4112,7 +4546,7 @@ function openDataset(ds, preset) {
   const close = () => bg.remove();
   const persist = async () => {
     if (!ta.value.trim()) { alert("Inserisci prima i dati."); return null; }
-    const sp = spec(), a = analyze(sp);
+    const sp = spec(), a = trRes(analyze(sp));
     const pl2 = { kind: sp.kind, title: sp.title, text: sp.text, unit: sp.unit, xlabel: xl.value.trim(), ylabel: yl.value.trim(), opts: sp.opts, summary: a.summary, table: a.table };
     const r = await api("ds_save", { id: ds ? ds.id : null, exp: curId, title: title.value.trim() || DS_KINDS[kindSel.value], kind: kindSel.value, payload: pl2 });
     if (ds) ds.id = r.id; else ds = { id: r.id };
@@ -4123,7 +4557,7 @@ function openDataset(ds, preset) {
     try {
       if (await persist() == null) return;
       status("🖼️ Creo l'immagine del grafico…");
-      const png = await svgToPng(chartSVG(analyze(spec()).chart));
+      const png = await svgToPng(chartSVG(trRes(analyze(spec())).chart));
       const pad = n => String(n).padStart(2, "0"), dt = new Date();
       const stamp = dt.getFullYear() + pad(dt.getMonth() + 1) + pad(dt.getDate()) + "-" + pad(dt.getHours()) + pad(dt.getMinutes()) + pad(dt.getSeconds());
       const nm = (title.value.trim().replace(/[^\w.\- ]+/g, "").replace(/\s+/g, "_").slice(0, 50) || "grafico");
@@ -4132,7 +4566,7 @@ function openDataset(ds, preset) {
       await refreshDs();
     } catch (e) { fail(e); }
   } }, "🖼️ Salva e allega il grafico");
-  const example = h("button", { class: "btn grey small", onclick: () => { ta.value = DS_EXAMPLES[kindSel.value] || ""; if (!title.value) title.value = "Esempio"; lastHead = "\u0000"; refresh(); } }, "Esempio");
+  const example = h("button", { class: "btn grey small", onclick: () => { ta.value = txExample(DS_EXAMPLES[kindSel.value] || ""); if (!title.value) title.value = tx("Esempio"); lastHead = "\u0000"; refresh(); } }, "Esempio");
   const bg = modal([
     h("div", { class: "h2", style: "margin:0" }, "📈 Dati e grafici"),
     h("div", { class: "dsgrid" },
@@ -4388,7 +4822,7 @@ KIND_DEFS.mic = {
       for (let i = 0; i < list.length; i++) if (list[i].no && list.slice(i).every(x => x.no)) { mic = list[i].c; break; }
       if (mic == null && list.some(x => x.no)) warns.push((s || "composto") + " / " + (strain || "ceppo") + ": risultati non monotoni (crescita a concentrazioni più alte di una senza crescita): controlla.");
       const txt = mic != null ? String(mic) : "> " + list[list.length - 1].c;
-      table.push([s, strain, txt]); lines.push((s || "–") + " su " + (strain || "–") + ": MIC = " + txt + " µg/mL.");
+      table.push([s, strain, txt]); lines.push((s || "–") + (UI_LANG === "en" ? " on " : " su ") + (strain || "–") + ": MIC = " + txt + " µg/mL.");
       if (mic != null) chart.bars.push({ label: ((s || "") + " " + (strain || "")).trim(), ys: [mic], mean: mic, sd: NaN, n: 1 });
     });
     if (!keys.length) warns.push("Inserisci almeno una concentrazione.");
@@ -4636,14 +5070,14 @@ KIND_DEFS.tlc = {
 function openStructured(ds, kindId) {
   if (curId == null) return;
   const def = KIND_DEFS[kindId], pl = ds ? ds.payload : {};
-  const st = (pl && pl.state) ? JSON.parse(JSON.stringify(pl.state)) : def.init();
-  const title = h("input", { type: "text", placeholder: "Titolo", maxlength: "120" }); title.value = ds ? ds.title : STRUCT_KINDS[kindId];
+  const st = (pl && pl.state) ? JSON.parse(JSON.stringify(pl.state)) : txDeep(def.init());
+  const title = h("input", { type: "text", placeholder: "Titolo", maxlength: "120" }); title.value = ds ? ds.title : tx(STRUCT_KINDS[kindId]);
   const prev = h("div", { class: "dsprev" }), summ = h("div", { class: "dssum" }), warnBox = h("div", { class: "warn", style: "font-size:13px" });
   let ed = null, last = null, timer = null;
   const refresh = () => {
     try {
       if (ed && ed.sync) ed.sync();
-      last = def.analyze(st);
+      last = trRes(def.analyze(st));
       if (ed && ed.after) ed.after();
       prev.innerHTML = last.chart ? chartSVG(last.chart) : ""; prev.style.display = last.chart ? "" : "none";
       summ.textContent = last.summary || ""; warnBox.textContent = last.warns.length ? "⚠️ " + last.warns.join(" · ") : "";
@@ -4746,6 +5180,8 @@ function build() {
   setInterval(() => { fetch("/api/ping").catch(() => {}); }, 60000);
   $("btnMerge").onclick = () => openMerge(null);
   $("btnView").onclick = () => setView(!viewEN).catch(fail);
+  $("btnLab").onclick = () => openLab(null).catch(fail);
+  labBadge(); setInterval(labBadge, 60000);
   const applyUpdate = async sure => {
     if (sure !== true && !confirm("Aggiorno il Diario all'ultima versione? I tuoi esperimenti non vengono toccati. Il Diario si riavvia da solo.")) return;
     try {
@@ -4876,11 +5312,44 @@ function build() {
 """
 
 
+def file_version(path):
+    """Numero di versione scritto dentro un diario_web.py (tupla di interi), () se non c'e'."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = f.read(6000)
+        m = re.search(r'^APP_VERSION = "([0-9.]+)"', head, re.M)
+        return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+    except (OSError, ValueError):
+        return ()
+
+
+def ensure_installed():
+    """Copia questo file in ~/DiarioRicercatore/app se li' manca o e' piu' vecchio. Ritorna il file da far girare."""
+    me = os.path.abspath(__file__)
+    if getattr(sys, "frozen", False) or os.path.realpath(me) == os.path.realpath(INSTALL_PATH):
+        return me
+    try:
+        mine, inst = file_version(me), file_version(INSTALL_PATH)
+        newer = (not os.path.exists(INSTALL_PATH)) or mine > inst or (mine == inst and os.path.getmtime(me) > os.path.getmtime(INSTALL_PATH) + 1)
+        if newer:
+            os.makedirs(os.path.dirname(INSTALL_PATH), exist_ok=True)
+            tmp = INSTALL_PATH + ".tmp"
+            shutil.copyfile(me, tmp)
+            os.replace(tmp, INSTALL_PATH)
+            jsme = os.path.join(os.path.dirname(me), "jsme")
+            if os.path.isdir(jsme):
+                shutil.copytree(jsme, os.path.join(os.path.dirname(INSTALL_PATH), "jsme"), dirs_exist_ok=True)
+        return INSTALL_PATH
+    except OSError:
+        return me
+
+
 def code_version():
     """Impronta del file del programma: cambia quando il Diario viene aggiornato."""
+    import hashlib
     try:
-        st = os.stat(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-        return "%d-%d" % (st.st_size, int(st.st_mtime))
+        with open(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__), "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:16]
     except OSError:
         return ""
 
@@ -4960,14 +5429,18 @@ def main():
     if "--stop" in args:
         return stop_running()
     foreground = "--foreground" in args or getattr(sys, "frozen", False)
+    target = ensure_installed()
+    if not foreground and os.path.realpath(target) != os.path.realpath(os.path.abspath(__file__)):
+        # da qualsiasi cartella lo si avvii, a girare e' sempre la copia installata (la piu' recente)
+        sys.exit(subprocess.call([sys.executable, target] + args))
     if "--icona" in args:
         print("Icona creata:", make_shortcut())
         return
-    if not getattr(sys, "frozen", False) and (IS_MAC or IS_WIN) and not load_cfg().get("shortcut_v2"):
+    if not getattr(sys, "frozen", False) and (IS_MAC or IS_WIN) and not load_cfg().get("shortcut_v3"):
         try:
             print("Ho creato l'icona «Diario del Ricercatore» sulla Scrivania:", make_shortcut())
             cfg = load_cfg()
-            cfg["shortcut_v2"] = True
+            cfg["shortcut_v3"] = True
             save_cfg(cfg)
         except Exception:
             pass
@@ -5031,6 +5504,7 @@ def main():
     threading.Thread(target=_first_docs, daemon=True).start()
     threading.Thread(target=docs_loop, daemon=True).start()
     threading.Thread(target=auto_sync_loop, daemon=True).start()
+    threading.Thread(target=lab_loop, daemon=True).start()
     threading.Thread(target=_idle, daemon=True).start()
     try:
         srv.serve_forever()

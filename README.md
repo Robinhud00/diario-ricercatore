@@ -28,7 +28,7 @@ Quaderno di laboratorio digitale per **Mac e Windows**. Si apre nel browser ma g
 
 In tutti i casi il Diario **parte in background**: la finestra nera si chiude da sola (o si può chiudere senza paura, non ferma niente). Fare di nuovo doppio clic non lo avvia due volte: riapre solo la scheda del browser. Per spegnerlo usa il pulsante **⏻ Chiudi il Diario** nella barra a sinistra (da terminale: `python3 diario_web.py --stop`). Se nessuno lo usa per 8 ore si spegne da solo. Eventuali errori sono nel file `~/DiarioRicercatore/diario.log`.
 
-**Icona sul Desktop.** Al primo avvio il Diario crea da solo sulla Scrivania l'icona **«Diario del Ricercatore»** (su Mac una piccola app, su Windows un collegamento): da lì in poi basta il doppio clic sull'icona, senza Terminale. Si può ricreare con il pulsante **🖥️ Crea icona sul Desktop** (o `python3 diario_web.py --icona`). L'icona punta alla cartella dove si trova `diario_web.py`: se sposti la cartella, ricreala.
+**Icona sul Desktop.** Al primo avvio il Diario crea da solo sulla Scrivania l'icona **«Diario del Ricercatore»** (su Mac una piccola app, su Windows un collegamento): da lì in poi basta il doppio clic sull'icona, senza Terminale. Si può ricreare con il pulsante **🖥️ Crea icona sul Desktop** (o `python3 diario_web.py --icona`). Il programma viene copiato in `~/DiarioRicercatore/app/` ed è sempre quella copia a girare (icona, aggiornamenti e avvii da qualsiasi cartella usano lo stesso file, e vince sempre la versione più recente): la cartella scaricata si può spostare o cancellare.
 
 **Interfaccia in inglese.** Il pulsante **🌐 English** nella barra a sinistra mette tutta l'interfaccia in inglese (e **🌐 Italiano** la riporta in italiano). È indipendente dalla «Lingua della voce».
 
@@ -59,6 +59,16 @@ Il pulsante **🌍 Versione inglese (nuovo Word)** traduce titolo e sezioni e cr
 
 ## Documento unico di progetto
 A fine progetto: menu **⋯ del gruppo → 📚 Unisci tutto in un documento…** (oppure il pulsante **📚 Documento di progetto**, che permette di scegliere anche un *progetto* invece di un gruppo). Il Diario crea un solo Word con indice e tutti gli esperimenti in ordine di data (sottogruppi compresi), ciascuno su una pagina nuova con le sue figure, tabelle e allegati. Lo trovi in `Documenti/_Riepiloghi/` (e su Drive); è un file a parte, i Word dei singoli esperimenti non cambiano. Con «in inglese» usa le versioni inglesi già create; gli esperimenti senza traduzione vengono segnalati.
+
+## Laboratorio (per chi segue degli studenti)
+Il pulsante **🏛️ Laboratorio** apre la bacheca del supervisore: ogni studente è una scheda con il suo avatar, quando ha aggiornato l'ultima volta e quante novità ci sono. Cliccando si vedono i suoi esperimenti (per gruppo, con «nuovo» / «modificato»), si leggono dentro il Diario e si apre il Word. Quando uno studente aggiunge o modifica qualcosa arriva una notifica di sistema.
+
+Come funziona: non c'è un server, tutto passa dalla cartella Google Drive. Il Diario dello studente, a ogni sincronizzazione (automatica, circa un minuto dopo una modifica), scrive in Drive anche un file `stato.json` con l'elenco e il testo degli esperimenti; il Diario del supervisore legge quel file dalla cartella condivisa.
+1. Lo studente imposta la cartella Google Drive nel suo Diario e condivide con il supervisore la cartella «Diario del Ricercatore».
+2. Il supervisore, in Google Drive, fa tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive» (così arriva sul suo computer con Google Drive per desktop).
+3. In 🏛️ Laboratorio → «Aggiungi uno studente» sceglie quella cartella.
+
+Le novità si vedono dopo che Drive ha sincronizzato (di solito 1–2 minuti): non è tempo reale. Chi ha accesso alla cartella condivisa vede tutti gli esperimenti dello studente (c'è anche la copia di sicurezza del database).
 
 ## Uso
 - **＋ Nuovo esperimento**: nome, data, progetto/molecola target.

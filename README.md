@@ -136,7 +136,7 @@ Clic su "🔑 Chiavi API e impostazioni" in basso a sinistra.
 Il server ascolta solo su 127.0.0.1 (il tuo Mac) e ogni richiesta richiede un codice casuale generato a ogni avvio.
 
 ## Nota sull'AI
-L'AI è istruita a non inventare dati e a segnalare con [da completare: …] ciò che manca. Controlla sempre quantità, rese e nomi prima di applicare il testo.
+L'AI è istruita a non inventare dati. Controlla sempre quantità, rese e nomi prima di applicare il testo.
 
 ## File del repository
 - `diario_web.py` — l'applicazione (server locale + pagina nel browser), un solo file.

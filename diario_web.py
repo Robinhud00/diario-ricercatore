@@ -40,7 +40,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.12.4"
+APP_VERSION = "2026.11.16.1"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -2868,7 +2868,18 @@ textarea:focus,.row input:focus{border-color:var(--v)}
 .violet{background:var(--v)}.green{background:var(--g)}.blue{background:var(--b)}.orange{background:var(--o)}.pink{background:var(--r)}.red{background:#EF4444}.grey{background:#9CA3AF}
 .ghost{background:transparent;border:1px solid rgba(255,255,255,.75)}
 .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-.ailabel{font-weight:700;color:var(--v);margin-right:6px}
+.ailabel{font-weight:700;color:#6D28D9;font-size:14px}
+.aicard{padding:12px 16px;display:flex;flex-direction:column;gap:10px}
+.aihead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+select.aichip{border:1px solid #E9E5FB;background:#FAF8FF;border-radius:999px;padding:5px 10px;font-size:13px;color:#4B5563;max-width:240px}
+.aiacts{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.aibtn2{font:inherit;font-size:13.5px;font-weight:600;border:1px solid #DDD6FE;background:#fff;color:#5B21B6;border-radius:999px;padding:6px 13px;cursor:pointer;transition:background .12s,border-color .12s}
+.aibtn2:hover{background:#F3EEFF;border-color:#A78BFA}
+.aibtn2.primary{background:#7C3AED;border-color:#7C3AED;color:#fff}
+.aibtn2.primary:hover{background:#6D28D9}
+.aibtn2.view{border-color:#BFDBFE;color:#1D4ED8;background:#EFF6FF}
+.aibtn2:disabled{opacity:.5;cursor:wait}
+.aiacts #status{margin-left:auto;font-size:13px}
 .keyrow{display:flex;justify-content:space-between;align-items:center;margin-top:6px}
 .modal .hint{font-size:13px;color:#6B7280}
 #status{color:#6B7280;margin-left:auto;font-size:14px}
@@ -2980,7 +2991,7 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
     </div>
     <input id="search" placeholder="🔍 Cerca esperimento…">
     <div id="list"></div>
-    <button class="btn ghost" id="btnLab" style="width:100%;margin-top:8px;position:relative" title="Gli studenti del tuo laboratorio e il loro lavoro">🏛️ Laboratorio <span id="labCount" class="labbadge" hidden style="position:static;display:inline-block;margin-left:6px"></span></button>
+    <button class="btn ghost" id="btnLab" style="width:100%;margin-top:8px;position:relative" title="Gli studenti del tuo laboratorio e il loro lavoro">🏛️ Laboratorio <span id="labCount" class="labbadge" hidden style="position:static;display:none;margin-left:6px"></span></button>
     <div class="sbrow" style="margin-top:8px">
       <button class="btn ghost" id="btnMenuDocs" style="flex:1" title="Cartella dei documenti, documento unico di progetto, Google Drive">📂 Documenti ▾</button>
       <button class="btn ghost" id="btnMenuSet" style="flex:1" title="Settore, chiavi API, lingua, icona sul Desktop">⚙️ Impostazioni ▾</button>
@@ -3017,16 +3028,22 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
       </div>
     </div>
     <div id="enBanner" hidden style="background:#DBEAFE;border:2px solid #3B82F6;color:#1E3A8A;border-radius:14px;padding:10px 14px;margin-bottom:12px;font-weight:600">🇬🇧 Stai guardando la versione inglese. Le modifiche che fai qui cambiano solo il documento «English version»; il testo originale non viene toccato.</div>
-    <div class="card bar" id="aibar"><span class="ailabel" id="ailabel"></span>
-      <select id="lang" title="Lingua in cui scrivi questa voce (l'AI e il Word la useranno)">
-        <option value="">🌐 Lingua della voce: nativa</option>
-        <option value="en">🇬🇧 Lingua della voce: English</option>
-      </select>
-      <button class="btn blue" id="btnView" hidden title="Passa dal testo originale alla versione inglese e viceversa">🇬🇧 Vedi versione inglese</button>
-      <select id="engine" title="Quale intelligenza artificiale usare">
-        <option value="claude">🟣 Claude</option>
-        <option value="gemini">🔵 Gemini</option>
-      </select>
+    <div class="card aicard" id="aibar">
+      <div class="aihead">
+        <span class="ailabel" id="ailabel"></span>
+        <span style="flex:1"></span>
+        <select id="lang" class="aichip" title="Lingua in cui scrivi questa voce (l'AI e il Word la useranno)">
+          <option value="">🌐 Lingua della voce: nativa</option>
+          <option value="en">🇬🇧 Lingua della voce: English</option>
+        </select>
+        <select id="engine" class="aichip" title="Quale intelligenza artificiale usare">
+          <option value="claude">🟣 Claude</option>
+          <option value="gemini">🔵 Gemini</option>
+        </select>
+      </div>
+      <div class="aiacts" id="aiacts">
+        <button class="aibtn2 view" id="btnView" hidden title="Passa dal testo originale alla versione inglese e viceversa">🇬🇧 Vedi versione inglese</button>
+      </div>
     </div>
     <div id="sections"></div>
     <div class="card">
@@ -3551,7 +3568,7 @@ async function labBadge() {
   try {
     const d = await api("lab_get", {});
     const n = d.members.reduce((a, m) => a + (m.news || 0), 0);
-    const b = $("labCount"); b.textContent = n ? String(n) : ""; b.hidden = !n;
+    const b = $("labCount"); b.textContent = n ? String(n) : ""; b.hidden = !n; b.style.display = n ? "inline-block" : "none";
     return d;
   } catch (e) { return null; }
 }
@@ -5146,9 +5163,9 @@ function build() {
     t.addEventListener("input", () => { autosize(t); scheduleSave(); });
     box.append(h("div", { class: "card", id: "card_" + k }, h("div", { class: "h2" }, title), t));
   });
-  const bar = $("aibar");
-  AIBTNS.forEach(([label, color, mode]) => {
-    bar.append(h("button", { class: "btn aibtn " + color, onclick: () => runAI(mode) }, label));
+  const bar = $("aiacts"), viewBtn = $("btnView");
+  AIBTNS.forEach(([label, color, mode], i) => {
+    bar.insertBefore(h("button", { class: "aibtn aibtn2" + (i === 0 ? " primary" : ""), onclick: () => runAI(mode) }, label), viewBtn);
   });
   bar.append(h("span", { id: "status" }));
   setActive("procedura");

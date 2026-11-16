@@ -42,7 +42,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.16.5"
+APP_VERSION = "2026.11.16.7"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -2342,16 +2342,62 @@ def lab_root(path):
     return None
 
 
+_shared_err = {}
+
+
+def read_shared_json(path, tries=4):
+    """Legge un file JSON da una cartella di Google Drive. Riprova qualche volta: i file «solo online» vengono
+    scaricati al momento e la prima lettura puo' fallire o arrivare vuota. In caso di errore lo ricorda in _shared_err."""
+    last = ""
+    for n in range(tries):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            if not raw.strip():
+                last = "EMPTY"
+            else:
+                data = json.loads(raw.decode("utf-8-sig"))
+                _shared_err.pop(path, None)
+                return data
+        except PermissionError as ex:
+            last = "PERM: %s" % ex
+            break
+        except OSError as ex:
+            last = "OS: [%s] %s" % (getattr(ex, "errno", "?"), ex.strerror or ex)
+        except ValueError as ex:
+            last = "JSON: %s" % ex
+        if n < tries - 1:
+            if n == 0 and IS_MAC and not last.startswith("JSON"):
+                try:   # chiede a macOS di scaricare il file «solo online» di Google Drive
+                    subprocess.run(["fileproviderctl", "materialize", path], capture_output=True, timeout=20)
+                except Exception:
+                    pass
+            time.sleep(0.4)
+    _shared_err[path] = last
+    return None
+
+
+def shared_err_text(path):
+    e = _shared_err.get(path, "")
+    if e.startswith("PERM"):
+        if IS_MAC:
+            return ("Il Mac non permette al Diario di leggere la cartella di Google Drive. Apri Impostazioni di Sistema → Privacy e sicurezza → "
+                    "File e cartelle (oppure «Accesso completo al disco») e attiva Google Drive per Terminale / Python; poi chiudi e riapri il Diario. [%s]" % e)
+        return "Il computer non permette al Diario di leggere la cartella di Google Drive: controlla i permessi della cartella. [%s]" % e
+    if e == "EMPTY" or e.startswith("OS"):
+        return ("Il file dello studente non e' ancora stato scaricato da Google Drive su questo computer. Apri la cartella condivisa dal computer "
+                "(Finder / Esplora file), fai tasto destro → «Disponibile offline», aspetta la spunta verde e riprova. [%s]" % e)
+    if e.startswith("JSON"):
+        return "Il file stato.json dello studente e' arrivato incompleto: riprova tra un minuto. [%s]" % e
+    return "Il file stato.json non si legge: riprova tra poco."
+
+
 def lab_read(member):
     root = lab_root(member.get("path"))
     if not root:
         return None, None
-    try:
-        with open(os.path.join(root, "stato.json"), encoding="utf-8") as f:
-            st = json.load(f)
-        return (st if isinstance(st, dict) else None), root
-    except (OSError, ValueError):
-        return None, root
+    st = read_shared_json(os.path.join(root, "stato.json"))
+    return (st if isinstance(st, dict) else None), root
 
 
 def lab_member_view(member, seen):
@@ -2359,7 +2405,7 @@ def lab_member_view(member, seen):
     out = {"id": member["id"], "name": member.get("name", ""), "color": member.get("color", LAB_COLORS[0]), "path": member.get("path", ""),
            "ok": bool(st), "owner": "", "updated": "", "experiments": [], "news": 0}
     if not st:
-        out["error"] = "Cartella non trovata o non ancora sincronizzata (manca stato.json)." if not root else "Il file stato.json non si legge: riprova tra poco."
+        out["error"] = "Cartella non trovata o non ancora sincronizzata (manca stato.json)." if not root else shared_err_text(os.path.join(root, "stato.json"))
         return out
     sm = seen.get(member["id"], {})
     out["owner"], out["updated"] = s(st.get("owner")), s(st.get("updated"))
@@ -2570,8 +2616,7 @@ def msg_dir(root):
 
 def _msg_read_file(path):
     try:
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
+        d = read_shared_json(path, tries=2)
         if not isinstance(d, dict):
             return []
         out = []
@@ -3964,7 +4009,8 @@ const EN_PAIRS = [
 ["Non riesco a scrivere nella cartella dello studente: chiedigli di condividerla con te come «Editor» (non solo in lettura).", "I cannot write to the student's folder: ask them to share it with you as \"Editor\" (not read-only)."],
 ["Non trovo la cartella condivisa dello studente.", "I cannot find the student's shared folder."],
 ["Ho salvato il file ChemDraw, ma negli appunti non ho trovato l'immagine della struttura, quindi nel Word comparirà solo il nome.\n\nFormati trovati negli appunti: ", "I saved the ChemDraw file, but I did not find the structure image on the clipboard, so only the name will appear in Word.\n\nFormats found on the clipboard: "],
-["\n\nManda questo messaggio a chi ti ha dato il Diario. Intanto puoi salvare lo schema da ChemDraw come PNG e trascinarlo qui.", "\n\nSend this message to whoever gave you the Diary. Meanwhile you can save the scheme from ChemDraw as PNG and drag it here."]
+["\n\nManda questo messaggio a chi ti ha dato il Diario. Intanto puoi salvare lo schema da ChemDraw come PNG e trascinarlo qui.", "\n\nSend this message to whoever gave you the Diary. Meanwhile you can save the scheme from ChemDraw as PNG and drag it here."],
+["⚠️ non riesco a leggere la cartella (clicca per i dettagli)", "⚠️ I cannot read the folder (click for details)"]
 ];
 const EN_MAP = new Map(EN_PAIRS);
 const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(=]\s?$|^\s|\s$|^[;,(]/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
@@ -4618,7 +4664,7 @@ async function openLab(selId) {
         h("div", { class: "labcard" + (m.ok ? "" : " off"), onclick: () => { sel = m.id; draw(); } },
           avatar(m),
           h("div", { class: "labname" }, m.name),
-          h("div", { class: "muted" }, m.ok ? (m.experiments.length + " " + tx(m.experiments.length === 1 ? "esperimento" : "esperimenti") + " · " + agoText(m.updated)) : tx("in attesa della prima sincronizzazione")),
+          h("div", { class: "muted" }, m.ok ? (m.experiments.length + " " + tx(m.experiments.length === 1 ? "esperimento" : "esperimenti") + " · " + agoText(m.updated)) : (m.error && m.error.indexOf("manca stato.json") < 0 ? tx("⚠️ non riesco a leggere la cartella (clicca per i dettagli)") : tx("in attesa della prima sincronizzazione"))),
           m.news ? h("div", { class: "labnew" }, m.news + " " + tx("novità")) : null,
           m.msgs ? h("div", { class: "labnew msgs" }, "💬 " + m.msgs) : null))
         : h("div", { class: "muted" }, "Nessuno studente ancora. Aggiungine uno qui sotto.")),

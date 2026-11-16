@@ -42,7 +42,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.16.7"
+APP_VERSION = "2026.11.16.8"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -669,30 +669,43 @@ function Render-Emf($mf) {
   if (Test-Path $out) { $script:res.png = $out; $script:res.how = 'emf'; $script:res.dpi = $dpi }
 }
 if (-not $res.png) {
+  $trace = ''
   try {
+    $ErrorActionPreference = 'Stop'
     Add-Type -Namespace DiarioClip -Name Native -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr hWnd);
+[DllImport("user32.dll", SetLastError = true)] public static extern bool OpenClipboard(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool CloseClipboard();
-[DllImport("user32.dll")] public static extern IntPtr GetClipboardData(uint uFormat);
+[DllImport("user32.dll", SetLastError = true)] public static extern IntPtr GetClipboardData(uint uFormat);
 [DllImport("user32.dll")] public static extern bool IsClipboardFormatAvailable(uint uFormat);
-[DllImport("gdi32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr CopyEnhMetaFile(IntPtr hemf, string lpszFile);
+[DllImport("gdi32.dll", SetLastError = true)] public static extern IntPtr CopyEnhMetaFile(IntPtr hemf, IntPtr lpszFile);
 '@
+    $trace += 'tipo ok; '
     if ([DiarioClip.Native]::IsClipboardFormatAvailable(14)) {
-      $copy = [IntPtr]::Zero
+      $trace += 'emf presente; '
       $opened = $false
-      for ($n = 0; $n -lt 10 -and -not $opened; $n++) { $opened = [DiarioClip.Native]::OpenClipboard([IntPtr]::Zero); if (-not $opened) { Start-Sleep -Milliseconds 60 } }
+      for ($n = 0; $n -lt 15 -and -not $opened; $n++) { $opened = [DiarioClip.Native]::OpenClipboard([IntPtr]::Zero); if (-not $opened) { Start-Sleep -Milliseconds 80 } }
+      $trace += "aperti=$opened; "
       if ($opened) {
-        $h = [DiarioClip.Native]::GetClipboardData(14)
-        if ($h -ne [IntPtr]::Zero) { $copy = [DiarioClip.Native]::CopyEnhMetaFile($h, $null) }
-        [void][DiarioClip.Native]::CloseClipboard()
+        try {
+          $h = [DiarioClip.Native]::GetClipboardData(14)
+          $trace += "handle=$($h -ne [IntPtr]::Zero); "
+          if ($h -ne [IntPtr]::Zero) {
+            # copia in memoria (il secondo parametro e' un puntatore nullo: niente file)
+            $copy = [DiarioClip.Native]::CopyEnhMetaFile($h, [IntPtr]::Zero)
+            $trace += "copia=$($copy -ne [IntPtr]::Zero); "
+            if ($copy -ne [IntPtr]::Zero) { $mf = New-Object System.Drawing.Imaging.Metafile $copy, $true }
+            else { $mf = New-Object System.Drawing.Imaging.Metafile $h, $false }
+            $trace += "metafile $($mf.Width)x$($mf.Height); "
+            Render-Emf $mf
+            $mf.Dispose()
+            $trace += "png=$([bool]$res.png); "
+          }
+        } finally { [void][DiarioClip.Native]::CloseClipboard() }
       }
-      if ($copy -ne [IntPtr]::Zero) {
-        $mf = New-Object System.Drawing.Imaging.Metafile $copy, $true
-        Render-Emf $mf
-        $mf.Dispose()
-      }
-    }
-  } catch { $res.err = "$_" }
+    } else { $trace += 'emf assente; ' }
+  } catch { $trace += "ERRORE: $($_.Exception.Message)" }
+  $ErrorActionPreference = 'SilentlyContinue'
+  if (-not $res.png) { $res.err = $trace }
 }
 if (-not $res.png -and $do -and $do.GetDataPresent('EnhancedMetafile')) {
   $mf = $do.GetData('EnhancedMetafile')

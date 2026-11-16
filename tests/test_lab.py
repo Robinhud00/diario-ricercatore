@@ -40,3 +40,29 @@ assert sup.lab_scan() == []
 sup.api_lab_seen({"member": m["id"]}); assert sup.api_lab_get({})["members"][0]["news"] == 0
 sup.api_lab_remove({"id": m["id"]}); assert sup.api_lab_get({})["members"] == []
 print("TEST LABORATORIO OK")
+
+# ---------------- messaggi ----------------
+r = sup.api_lab_add({"name": "Marco", "path": drive}); mid = r["id"]
+sup.msg_scan(); st.msg_scan()
+c = sup.load_cfg(); c["owner_name"] = "Prof. Verdi"; sup.save_cfg(c)
+sup.api_lab_send({"member": mid, "exp": eid, "text": "Rifai la TLC con un eluente più polare."})
+sup.api_lab_send({"member": mid, "exp": None, "text": "Ci vediamo giovedì."})
+assert sorted(os.listdir(os.path.join(root, "Messaggi")))[0].startswith("supervisore-")
+ms = st.api_msg_status({}); assert ms["total"] == 2 and ms["by_exp"] == {str(eid): 1, "g": 1} and ms["items"][0]["exp_name"] == "Coupling FM13", ms
+n = st.msg_scan(); assert len(n) == 2 and n[0][0] == "Prof. Verdi", n
+th = st.api_msg_thread({"exp": eid}); assert len(th["messages"]) == 1 and th["messages"][0]["author"] == "Prof. Verdi" and not th["messages"][0]["mine"]
+assert st.api_msg_status({})["total"] == 1
+st.api_msg_send({"exp": eid, "text": "Fatto, Rf 0.4 in AcOEt/esano 1:1."})
+assert os.path.isfile(os.path.join(root, "Messaggi", "studente.json"))
+mv = sup.api_lab_get({})["members"][0]; assert mv["msgs"] == 1 and mv["msg_by_exp"] == {str(eid): 1}, mv
+assert len(sup.msg_scan()) == 1
+lt = sup.api_lab_thread({"member": mid, "exp": eid}); assert [x["mine"] for x in lt["messages"]] == [True, False] and lt["messages"][1]["author"] == "Marco Rossi", lt
+assert sup.api_lab_get({})["members"][0]["msgs"] == 0
+assert len(sup.api_lab_thread({"member": mid, "exp": None})["messages"]) == 1
+st.sync_to_drive(); assert len(st.api_msg_thread({"exp": eid})["messages"]) == 2   # la sincronizzazione non perde nulla
+os.chmod(os.path.join(root, "Messaggi"), 0o500)
+try:
+    sup.api_lab_send({"member": mid, "exp": None, "text": "x"}); ok = os.geteuid() == 0
+except RuntimeError as ex: ok = "Editor" in str(ex)
+os.chmod(os.path.join(root, "Messaggi"), 0o700); assert ok
+print("TEST MESSAGGI OK")

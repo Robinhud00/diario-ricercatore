@@ -68,6 +68,10 @@ Come funziona: non c'è un server, tutto passa dalla cartella Google Drive. Il D
 2. Il supervisore, in Google Drive, fa tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive» (così arriva sul suo computer con Google Drive per desktop).
 3. In 🏛️ Laboratorio → «Aggiungi uno studente» sceglie quella cartella.
 
+**Messaggi.** Supervisore e studente possono scriversi: sotto ogni esperimento (il messaggio resta attaccato a quell'esperimento, e lo studente lo trova nella scheda «💬 Messaggi con il supervisore» dentro l'esperimento) oppure nei «Messaggi generali». Arriva una notifica e un pallino sul pulsante Laboratorio. Per i messaggi la cartella va condivisa con il supervisore come **Editor**: ognuno scrive solo il proprio file dentro `Messaggi/`, così Drive non crea conflitti.
+
+**Stanza.** Nella bacheca, «🧪 Stanza» mostra il laboratorio virtuale: ogni studente al suo bancone. Chi ha scritto negli ultimi 15 minuti «sta lavorando» (con il titolo dell'esperimento nel fumetto), chi nelle ultime 8 ore è «in pausa», gli altri non sono in laboratorio. I messaggi non letti compaiono come fumetto.
+
 Le novità si vedono dopo che Drive ha sincronizzato (di solito 1–2 minuti): non è tempo reale. Chi ha accesso alla cartella condivisa vede tutti gli esperimenti dello studente (c'è anche la copia di sicurezza del database).
 
 ## Uso

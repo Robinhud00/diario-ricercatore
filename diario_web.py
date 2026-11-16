@@ -42,7 +42,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.16.8"
+APP_VERSION = "2026.11.17.1"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -1301,7 +1301,7 @@ def api_export(d):
     drive = False
     if sync_base():
         try:
-            mirror_docs_to_drive(os.path.join(sync_base(), DRIVE_SUBDIR))
+            mirror_docs_to_drive(drive_root())
             drive = True
         except OSError:
             drive = False
@@ -2118,7 +2118,7 @@ def api_merge(d):
     drive = False
     if sync_base():
         try:
-            mirror_docs_to_drive(os.path.join(sync_base(), DRIVE_SUBDIR))
+            mirror_docs_to_drive(drive_root())
             drive = True
         except OSError:
             pass
@@ -2203,9 +2203,10 @@ def docs_migrate_legacy():
                     pass
     base = sync_base()
     if base:
-        old = os.path.join(base, DRIVE_SUBDIR, "Esperimenti")
+        myroot = drive_root()
+        old = os.path.join(myroot, "Esperimenti")
         if os.path.isdir(old):
-            dest = os.path.join(base, DRIVE_SUBDIR, "Esperimenti_vecchi")
+            dest = os.path.join(myroot, "Esperimenti_vecchi")
             for fn in os.listdir(old):
                 p = os.path.join(old, fn)
                 if os.path.isfile(p) and pat.search(fn):
@@ -2287,6 +2288,146 @@ def _prune_dirs_up(path, stop):
         path = os.path.dirname(path)
 
 
+# ---------------- La MIA cartella in Google Drive (una per ogni Diario, mai quella di un altro) ----------------
+# Ogni Diario scrive in una cartella con il proprio nome («Diario del Ricercatore - Nome») e ci mette un file
+# «proprietario»: nessun Diario scrive mai in una cartella che porta il segno di un altro. Cosi' la cartella condivisa
+# di uno studente non puo' piu' essere sovrascritta dal Diario del supervisore.
+OWNER_MARK = ".diario_proprietario.json"
+_root_cache = {"t": 0.0, "base": None, "root": None}
+_root_lock = threading.RLock()
+
+
+def _mark_read(folder):
+    try:
+        with open(os.path.join(folder, OWNER_MARK), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}          # c'e' ma non si legge: per prudenza NON la considero mia
+
+
+def _mark_write(folder):
+    with open(os.path.join(folder, OWNER_MARK), "w", encoding="utf-8") as f:
+        json.dump({"install_id": install_id(), "owner": owner_name(), "created": now()}, f, ensure_ascii=False)
+
+
+def _is_my_root(folder):
+    mk = _mark_read(folder)
+    return bool(mk) and mk.get("install_id") == install_id()
+
+
+def _is_member_root(folder):
+    """True se questa cartella e' quella di uno studente che seguo nel Laboratorio."""
+    try:
+        rp = os.path.realpath(folder)
+        for m in lab_cfg()["members"]:
+            p = os.path.expanduser(s(m.get("path")).strip())
+            for cand in (p, os.path.join(p, DRIVE_SUBDIR)):
+                if os.path.realpath(cand) == rp:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _legacy_is_mine(legacy):
+    """La vecchia cartella «Diario del Ricercatore» (senza segno) e' stata scritta da QUESTO Diario?"""
+    if _is_member_root(legacy):
+        return False
+    try:
+        items = [x for x in os.listdir(legacy) if not x.startswith(".")]
+    except OSError:
+        return False
+    if not items:
+        return True
+    con = db()
+    mine = {r["id"]: safe_name(r["name"])[:60] for r in con.execute("SELECT id,name FROM experiments").fetchall()}
+    con.close()
+    # 1) l'elenco dei file che il Diario aveva copiato li' deve corrispondere ai miei documenti
+    try:
+        with open(os.path.join(legacy, "Documenti", ".diario_manifest.json"), encoding="utf-8") as f:
+            man = [x for x in json.load(f) if isinstance(x, str)]
+    except (OSError, ValueError):
+        man = None
+    if man:
+        return all(os.path.exists(os.path.join(DOC_DIR, *rel.split("/"))) for rel in man)
+    # 2) stato.json: stesso nome e solo esperimenti che ho anch'io
+    try:
+        with open(os.path.join(legacy, "stato.json"), encoding="utf-8") as f:
+            st = json.load(f)
+        ids = [e.get("id") for e in st.get("experiments", [])]
+        return s(st.get("owner")) == owner_name() and all(i in mine for i in ids)
+    except (OSError, ValueError, AttributeError):
+        pass
+    # 3) versioni vecchie: i Word «Nome (n.ID).docx» devono essere dei miei esperimenti
+    found = False
+    for sub in ("Esperimenti", "Esperimenti_vecchi"):
+        d = os.path.join(legacy, sub)
+        if os.path.isdir(d):
+            for fn in os.listdir(d):
+                m = re.search(r"^(.*) \(n\.(\d+)\)\.docx$", fn)
+                if m:
+                    found = True
+                    if int(m.group(2)) not in mine:
+                        return False
+    return found
+
+
+def drive_root(create=True):
+    """Percorso della MIA cartella dentro Google Drive (la crea se serve). None se Drive non e' impostato."""
+    base = sync_base()
+    if not base:
+        return None
+    with _root_lock:
+        c = _root_cache
+        if c["base"] == base and c["root"] and time.time() - c["t"] < 20 and os.path.isdir(c["root"]):
+            return c["root"]
+
+        def done(p):
+            cfg = load_cfg()
+            if cfg.get("drive_folder") != os.path.basename(p):
+                cfg["drive_folder"] = os.path.basename(p)
+                save_cfg(cfg)
+            c.update({"t": time.time(), "base": base, "root": p})
+            return p
+        name = s(load_cfg().get("drive_folder"))
+        if name and os.path.isdir(os.path.join(base, name)) and _is_my_root(os.path.join(base, name)):
+            return done(os.path.join(base, name))
+        try:
+            for fn in sorted(os.listdir(base)):
+                p = os.path.join(base, fn)
+                if fn.startswith(DRIVE_SUBDIR) and os.path.isdir(p) and _is_my_root(p):
+                    return done(p)
+        except OSError:
+            return None
+        if not create:
+            return None
+        wanted = "%s - %s" % (DRIVE_SUBDIR, safe_name(owner_name())[:40] or install_id())
+        legacy, target = os.path.join(base, DRIVE_SUBDIR), os.path.join(base, wanted)
+        if os.path.isdir(legacy) and _mark_read(legacy) is None and _legacy_is_mine(legacy):
+            # era gia' la mia (versioni precedenti): la rinomino sul posto, cosi' chi l'ha condivisa continua a vederla
+            if os.path.exists(target):
+                target = legacy
+            else:
+                try:
+                    os.rename(legacy, target)
+                except OSError:
+                    target = legacy
+        else:
+            if os.path.isdir(target) and not _is_my_root(target):
+                try:
+                    empty = not os.listdir(target)
+                except OSError:
+                    empty = False
+                if not (empty and _mark_read(target) is None):
+                    target = "%s (%s)" % (target, install_id()[:4])
+            os.makedirs(target, exist_ok=True)
+        _mark_write(target)
+        return done(target)
+
+
 # ---------------- Laboratorio (supervisore e studenti, tramite le cartelle Drive condivise) ----------------
 LAB_COLORS = ["#7C3AED", "#2563EB", "#059669", "#D97706", "#DC2626", "#DB2777", "#0891B2", "#4F46E5", "#65A30D", "#9333EA"]
 _lab_notified = {}
@@ -2349,10 +2490,20 @@ def lab_save(lab):
 def lab_root(path):
     """Accetta sia la cartella «Diario del Ricercatore» dello studente sia quella che la contiene."""
     p = os.path.expanduser(s(path).strip())
-    for cand in (p, os.path.join(p, DRIVE_SUBDIR)):
-        if os.path.isfile(os.path.join(cand, "stato.json")):
-            return cand
-    return None
+    if not p or not os.path.isdir(p):
+        return None
+    if os.path.isfile(os.path.join(p, "stato.json")):
+        return None if _is_my_root(p) else p
+    # la cartella che la contiene: va bene solo se dentro c'e' UNA cartella di un altro Diario
+    found = []
+    try:
+        for fn in sorted(os.listdir(p)):
+            c = os.path.join(p, fn)
+            if fn.startswith(DRIVE_SUBDIR) and os.path.isdir(c) and os.path.isfile(os.path.join(c, "stato.json")) and not _is_my_root(c):
+                found.append(c)
+    except OSError:
+        return None
+    return found[0] if len(found) == 1 else None
 
 
 _shared_err = {}
@@ -2446,7 +2597,8 @@ def lab_member_view(member, seen):
 
 def api_lab_get(d):
     lab = lab_cfg()
-    return {"owner_name": owner_name(), "sync": bool(sync_base()),
+    mine = drive_root(create=False) if sync_base() else None
+    return {"owner_name": owner_name(), "sync": bool(sync_base()), "my_folder": os.path.basename(mine) if mine else "",
             "members": [lab_member_view(m, lab["seen"]) for m in lab["members"]]}
 
 
@@ -2463,7 +2615,23 @@ def api_lab_add(d):
         raise RuntimeError("Scrivi il nome dello studente.")
     if not path or not os.path.isdir(os.path.expanduser(path)):
         raise RuntimeError("La cartella indicata non esiste su questo computer.")
+    pp = os.path.expanduser(path)
+    mine = drive_root(create=False)
+    if _is_my_root(pp) or (mine and os.path.realpath(pp) == os.path.realpath(mine)):
+        raise RuntimeError("Questa e' la TUA cartella del Diario, non quella dello studente. Scegli la cartella che lo studente ha condiviso con te.")
+    try:
+        many = [fn for fn in os.listdir(pp) if fn.startswith(DRIVE_SUBDIR) and os.path.isfile(os.path.join(pp, fn, "stato.json")) and not _is_my_root(os.path.join(pp, fn))]
+    except OSError:
+        many = []
+    if not os.path.isfile(os.path.join(pp, "stato.json")) and not many and mine and os.path.realpath(os.path.dirname(mine)) == os.path.realpath(pp):
+        raise RuntimeError("In questa cartella c'e' solo la TUA cartella del Diario. Scegli la cartella che lo studente ha condiviso con te (in Google Drive: tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive»).")
+    if not os.path.isfile(os.path.join(pp, "stato.json")) and len(many) > 1:
+        raise RuntimeError("In questa cartella ci sono i Diari di piu' persone: apri e scegli proprio la cartella dello studente (%s)." % ", ".join(many[:4]))
     lab = lab_cfg()
+    for m in lab["members"]:
+        a, b2 = lab_root(m.get("path")), lab_root(path)
+        if a and b2 and os.path.realpath(a) == os.path.realpath(b2):
+            raise RuntimeError("Questa cartella e' gia' collegata allo studente «%s»." % m.get("name", ""))
     mid = "m%d" % (max([int(m["id"][1:]) for m in lab["members"]] + [0]) + 1)
     lab["members"].append({"id": mid, "name": name, "path": path, "color": LAB_COLORS[len(lab["members"]) % len(LAB_COLORS)]})
     lab_save(lab)
@@ -2670,7 +2838,7 @@ def _same_exp(a, b):
 # ---- lato studente
 def student_root():
     base = sync_base()
-    return os.path.join(base, DRIVE_SUBDIR) if base else None
+    return drive_root() if base else None
 
 
 def student_write_msgs(root):
@@ -2839,7 +3007,9 @@ def sync_to_drive():
     if not _sync_lock.acquire(blocking=False):
         raise RuntimeError("Una sincronizzazione e' gia' in corso.")
     try:
-        root = os.path.join(base, DRIVE_SUBDIR)
+        root = drive_root()
+        if not root or not _is_my_root(root):
+            raise RuntimeError("Non riesco a preparare la mia cartella dentro Google Drive.")
         dir_bak = os.path.join(root, "Backup")
         os.makedirs(dir_bak, exist_ok=True)
         # 1) copia coerente del database (anche mentre il Diario e' in uso)
@@ -3966,7 +4136,6 @@ const EN_PAIRS = [
 ["Cartella «Diario del Ricercatore» condivisa dallo studente", "\"Diario del Ricercatore\" folder shared by the student"],
 ["📂 Sfoglia…", "📂 Browse…"],
 ["＋ Aggiungi", "＋ Add"],
-["Come si collega uno studente: 1) lo studente imposta la cartella Google Drive nel suo Diario (⚙️ Impostazioni → Chiavi API e impostazioni); 2) da Google Drive condivide con te la cartella «Diario del Ricercatore» come «Editor» (serve per i messaggi); 3) tu, in Google Drive, fai tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive», così compare sul tuo computer; 4) la scegli qui con «Sfoglia».", "How to connect a student: 1) the student sets the Google Drive folder in their Diary (⚙️ Settings → API keys and settings); 2) from Google Drive they share the \"Diario del Ricercatore\" folder with you as \"Editor\" (needed for messages); 3) in Google Drive you right-click the shared folder → \"Add shortcut to Drive\", so it appears on your computer; 4) you choose it here with \"Browse\"."],
 ["Studente aggiunto, ma in quella cartella non c'è ancora il file «stato.json»: comparirà appena lo studente aggiorna il Diario e sincronizza con Drive.", "Student added, but that folder does not contain the \"stato.json\" file yet: it will appear as soon as the student updates the Diary and syncs with Drive."],
 ["Il tuo nome", "Your name"],
 ["Il tuo nome (come ti vede il tuo supervisore):", "Your name (as your supervisor sees you):"],
@@ -4023,7 +4192,14 @@ const EN_PAIRS = [
 ["Non trovo la cartella condivisa dello studente.", "I cannot find the student's shared folder."],
 ["Ho salvato il file ChemDraw, ma negli appunti non ho trovato l'immagine della struttura, quindi nel Word comparirà solo il nome.\n\nFormati trovati negli appunti: ", "I saved the ChemDraw file, but I did not find the structure image on the clipboard, so only the name will appear in Word.\n\nFormats found on the clipboard: "],
 ["\n\nManda questo messaggio a chi ti ha dato il Diario. Intanto puoi salvare lo schema da ChemDraw come PNG e trascinarlo qui.", "\n\nSend this message to whoever gave you the Diary. Meanwhile you can save the scheme from ChemDraw as PNG and drag it here."],
-["⚠️ non riesco a leggere la cartella (clicca per i dettagli)", "⚠️ I cannot read the folder (click for details)"]
+["⚠️ non riesco a leggere la cartella (clicca per i dettagli)", "⚠️ I cannot read the folder (click for details)"],
+["Come si collega uno studente: 1) lo studente imposta la cartella Google Drive nel suo Diario (⚙️ Impostazioni → Chiavi API e impostazioni): il Diario crea lì una cartella con il suo nome, «Diario del Ricercatore - Nome»; 2) da Google Drive lo studente la condivide con te come «Editor» (serve per i messaggi); 3) tu, in Google Drive, fai tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive», così compare sul tuo computer; 4) la scegli qui con «Sfoglia». Uno studente può avere più supervisori e tu puoi seguire più studenti: ogni Diario scrive solo nella propria cartella.", "How to connect a student: 1) the student sets the Google Drive folder in their Diary (⚙️ Settings → API keys and settings): the Diary creates a folder there with their name, \"Diario del Ricercatore - Name\"; 2) from Google Drive the student shares it with you as \"Editor\" (needed for messages); 3) in Google Drive you right-click the shared folder → \"Add shortcut to Drive\", so it appears on your computer; 4) you choose it here with \"Browse\". A student can have several supervisors and you can follow several students: each Diary writes only to its own folder."],
+["Cartella condivisa dallo studente («Diario del Ricercatore - …»)", "Folder shared by the student (\"Diario del Ricercatore - …\")"],
+["La tua cartella in Google Drive, da condividere con chi ti segue:", "Your folder in Google Drive, to share with whoever follows you:"],
+["Questa e' la TUA cartella del Diario, non quella dello studente. Scegli la cartella che lo studente ha condiviso con te.", "This is YOUR Diary folder, not the student's. Choose the folder the student shared with you."],
+["Questa cartella e' gia' collegata allo studente «", "This folder is already connected to the student «"],
+["In questa cartella ci sono i Diari di piu' persone: apri e scegli proprio la cartella dello studente (", "This folder contains the Diaries of several people: open it and choose the student's own folder ("],
+["Non riesco a preparare la mia cartella dentro Google Drive.", "I cannot prepare my folder inside Google Drive."]
 ];
 const EN_MAP = new Map(EN_PAIRS);
 const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(=]\s?$|^\s|\s$|^[;,(]/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
@@ -4645,21 +4821,29 @@ async function openLab(selId) {
   bg.querySelector(".modal").style.width = "min(1040px, 96vw)";
   const close = () => { clearInterval(timer); bg.remove(); labBadge(); };
   const reload = async () => { data = await api("lab_get", {}); draw(); labBadge(); };
-  const timer = setInterval(() => { if (!document.body.contains(bg)) { clearInterval(timer); return; } if (!body.querySelector(".labread") && !(document.activeElement && document.activeElement.classList.contains("msgin")) && ![...body.querySelectorAll(".msgin")].some(x => x.value.trim())) reload().catch(() => {}); }, 30000);
+  const busyTyping = () => { const ae = document.activeElement; return (ae && body.contains(ae) && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) || [...body.querySelectorAll(".msgin")].some(x => x.value.trim()); };
+  const timer = setInterval(() => { if (!document.body.contains(bg)) { clearInterval(timer); return; } if (!body.querySelector(".labread") && !busyTyping() && document.querySelectorAll(".modal-bg").length === 1) reload().catch(() => {}); }, 30000);
 
-  const addForm = () => {
+  const openAdd = () => {
     const name = h("input", { type: "text", placeholder: "Nome dello studente" });
-    const path = h("input", { type: "text", placeholder: "Cartella «Diario del Ricercatore» condivisa dallo studente", style: "flex:2" });
+    const path = h("input", { type: "text", placeholder: "Cartella condivisa dallo studente («Diario del Ricercatore - …»)", style: "flex:1" });
     const pick = h("button", { class: "btn grey", onclick: async () => { try { const r = await api("pick_folder", {}); if (r.path) path.value = r.path; } catch (e) { fail(e); } } }, "📂 Sfoglia…");
     const add = h("button", { class: "btn green", onclick: async () => {
       try {
         const r = await api("lab_add", { name: name.value, path: path.value });
+        abg.remove();
         if (!r.found) alert("Studente aggiunto, ma in quella cartella non c'è ancora il file «stato.json»: comparirà appena lo studente aggiorna il Diario e sincronizza con Drive.");
         await reload();
       } catch (e) { fail(e); }
     } }, "＋ Aggiungi");
-    return h("div", { class: "labadd" }, h("div", { class: "dsopt" }, name, path, pick, add),
-      h("div", { class: "hint" }, "Come si collega uno studente: 1) lo studente imposta la cartella Google Drive nel suo Diario (⚙️ Impostazioni → Chiavi API e impostazioni); 2) da Google Drive condivide con te la cartella «Diario del Ricercatore» come «Editor» (serve per i messaggi); 3) tu, in Google Drive, fai tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive», così compare sul tuo computer; 4) la scegli qui con «Sfoglia»."));
+    const abg = modal([
+      h("div", { class: "h2", style: "margin:0" }, "＋ Aggiungi uno studente"),
+      name, h("div", { class: "dsopt" }, path, pick),
+      h("div", { class: "hint" }, "Come si collega uno studente: 1) lo studente imposta la cartella Google Drive nel suo Diario (⚙️ Impostazioni → Chiavi API e impostazioni): il Diario crea lì una cartella con il suo nome, «Diario del Ricercatore - Nome»; 2) da Google Drive lo studente la condivide con te come «Editor» (serve per i messaggi); 3) tu, in Google Drive, fai tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive», così compare sul tuo computer; 4) la scegli qui con «Sfoglia». Uno studente può avere più supervisori e tu puoi seguire più studenti: ogni Diario scrive solo nella propria cartella."),
+      h("div", { class: "btns" }, add, h("button", { class: "btn grey", onclick: () => abg.remove() }, "Annulla"))
+    ]);
+    abg.style.zIndex = "12";
+    name.focus();
   };
 
   const drawBoard = () => {
@@ -4681,8 +4865,8 @@ async function openLab(selId) {
           m.news ? h("div", { class: "labnew" }, m.news + " " + tx("novità")) : null,
           m.msgs ? h("div", { class: "labnew msgs" }, "💬 " + m.msgs) : null))
         : h("div", { class: "muted" }, "Nessuno studente ancora. Aggiungine uno qui sotto.")),
-      h("div", { class: "h2", style: "margin:14px 0 0;font-size:16px" }, "＋ Aggiungi uno studente"),
-      addForm(),
+      h("div", null, h("button", { class: "btn violet", onclick: openAdd }, "＋ Aggiungi uno studente")),
+      data.my_folder ? h("div", { class: "hint" }, tx("La tua cartella in Google Drive, da condividere con chi ti segue:") + " «" + data.my_folder + "»") : null,
       h("div", { class: "labme" }, h("span", { class: "muted" }, "Il tuo nome (come ti vede il tuo supervisore):"), me,
         data.sync ? null : h("span", { class: "muted" }, "· Per farti seguire imposta la cartella Google Drive nelle impostazioni.")),
       myMsgs,

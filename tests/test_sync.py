@@ -24,7 +24,7 @@ png = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001
 p = os.path.join(d, "mol.png"); open(p, "wb").write(png)
 con = dw.db(); con.execute("INSERT INTO attachments(exp_id,filename,path) VALUES(?,?,?)", (eid, "mol.png", p)); con.commit(); con.close()
 r = dw.api_drive_sync({}); print(r)
-root = os.path.join(drive, "Diario del Ricercatore")
+root = dw.drive_root(); assert root.startswith(os.path.join(drive, "Diario del Ricercatore - ")), root
 dr = [os.path.join(a, f) for a, _, fs in os.walk(os.path.join(root, "Documenti")) for f in fs if f.endswith(".docx")]; assert len(dr) == 1, dr
 assert os.path.exists(os.path.join(root, "Backup", "allegati", str(eid), "mol.png"))
 bk = sqlite3.connect(os.path.join(root, "Backup", "diario.db")); assert bk.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1; bk.close()

@@ -64,13 +64,15 @@ A fine progetto: menu **⋯ del gruppo → 📚 Unisci tutto in un documento…*
 Il pulsante **🏛️ Laboratorio** apre la bacheca del supervisore: ogni studente è una scheda con il suo avatar, quando ha aggiornato l'ultima volta e quante novità ci sono. Cliccando si vedono i suoi esperimenti (per gruppo, con «nuovo» / «modificato»), si leggono dentro il Diario e si apre il Word. Quando uno studente aggiunge o modifica qualcosa arriva una notifica di sistema.
 
 Come funziona: non c'è un server, tutto passa dalla cartella Google Drive. Il Diario dello studente, a ogni sincronizzazione (automatica, circa un minuto dopo una modifica), scrive in Drive anche un file `stato.json` con l'elenco e il testo degli esperimenti; il Diario del supervisore legge quel file dalla cartella condivisa.
-1. Lo studente imposta la cartella Google Drive nel suo Diario e condivide con il supervisore la cartella «Diario del Ricercatore».
+1. Lo studente imposta la cartella Google Drive nel suo Diario: il Diario crea lì la **sua** cartella, «Diario del Ricercatore - Nome», e la condivide con il supervisore (come Editor).
 2. Il supervisore, in Google Drive, fa tasto destro sulla cartella condivisa → «Aggiungi scorciatoia a Drive» (così arriva sul suo computer con Google Drive per desktop).
 3. In 🏛️ Laboratorio → «Aggiungi uno studente» sceglie quella cartella.
 
 **Messaggi.** Supervisore e studente possono scriversi: sotto ogni esperimento (il messaggio resta attaccato a quell'esperimento, e lo studente lo trova nella scheda «💬 Messaggi con il supervisore» dentro l'esperimento) oppure nei «Messaggi generali». Arriva una notifica e un pallino sul pulsante Laboratorio. Per i messaggi la cartella va condivisa con il supervisore come **Editor**: ognuno scrive solo il proprio file dentro `Messaggi/`, così Drive non crea conflitti.
 
 **Stanza.** Nella bacheca, «🧪 Stanza» mostra il laboratorio virtuale: ogni studente al suo bancone. Chi ha scritto negli ultimi 15 minuti «sta lavorando» (con il titolo dell'esperimento nel fumetto), chi nelle ultime 8 ore è «in pausa», gli altri non sono in laboratorio. I messaggi non letti compaiono come fumetto.
+
+**Una cartella per ogni Diario.** Ogni Diario scrive solo nella propria cartella «Diario del Ricercatore - Nome», che contiene un file `.diario_proprietario.json` con l'identificativo di quel Diario. Nessun Diario scrive mai in una cartella che porta il segno di un altro: così il Diario del supervisore non può sovrascrivere la cartella dello studente, anche se nel suo Drive c'è la scorciatoia. Chi aveva la vecchia cartella «Diario del Ricercatore» la vede rinominata automaticamente (la condivisione resta). Uno studente può avere più supervisori e un supervisore più studenti.
 
 Le novità si vedono dopo che Drive ha sincronizzato (di solito 1–2 minuti): non è tempo reale. Chi ha accesso alla cartella condivisa vede tutti gli esperimenti dello studente (c'è anche la copia di sicurezza del database).
 

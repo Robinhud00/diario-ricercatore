@@ -14,7 +14,7 @@ eid = st.api_new({})["id"]
 st.api_save({"id": eid, "name": "Coupling FM13", "date": "12/11/2026", "project": "NG012", "obiettivo": "Alchilare", "procedura": "THF, 0 °C", "risultati": "", "note": "", "lang": ""})
 con = st.db(); con.execute("UPDATE experiments SET group_id=? WHERE id=?", (gid, eid)); con.commit(); con.close()
 st.sync_to_drive()
-root = os.path.join(drive, st.DRIVE_SUBDIR)
+root = st.drive_root(); assert os.path.basename(root) == "Diario del Ricercatore - Marco Rossi", root
 S = json.load(open(os.path.join(root, "stato.json"), encoding="utf-8"))
 assert S["owner"] == "Marco Rossi" and S["experiments"][0]["group"] == ["NG012"] and S["experiments"][0]["docx"].endswith(".docx"), S
 assert os.path.isfile(os.path.join(root, "Documenti", *S["experiments"][0]["docx"].split("/")))

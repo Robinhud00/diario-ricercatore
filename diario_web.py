@@ -42,7 +42,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.16.3"
+APP_VERSION = "2026.11.16.5"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -625,7 +625,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $ErrorActionPreference = 'SilentlyContinue'
 $do = [System.Windows.Forms.Clipboard]::GetDataObject()
-$res = @{ types = @(); png = ''; cdx = ''; how = '' }
+$res = @{ types = @(); png = ''; cdx = ''; how = ''; dpi = 0; err = '' }
 if ($do) { $res.types = @($do.GetFormats($false)) }
 function Save-Bmp($bmp, $path) { $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png) }
 function Read-Bytes($obj) {
@@ -648,26 +648,55 @@ if ($do) {
       if ($b -and $b.Length -gt 8) { [System.IO.File]::WriteAllBytes($out, $b); $res.png = $out; $res.how = 'png' }
     }
   }
-  # 3) metafile (la cosa migliore che ChemDraw offre per Word): lo disegno a 4x su fondo trasparente
-  if (-not $res.png) {
-    $fmt = 'EnhancedMetafile'
-    if ($do.GetDataPresent($fmt)) {
-      $mf = $do.GetData($fmt)
-      if ($mf -is [System.Drawing.Imaging.Metafile]) {
-        $w = [math]::Max(1, $mf.Width); $h = [math]::Max(1, $mf.Height)
-        $k = [math]::Min(4, [math]::Floor(4000 / [math]::Max($w, $h))); if ($k -lt 1) { $k = 1 }
-        $bmp = New-Object System.Drawing.Bitmap ([int]($w * $k)), ([int]($h * $k))
-        $bmp.SetResolution(96 * $k, 96 * $k)
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.Clear([System.Drawing.Color]::White)
-        $g.SmoothingMode = 'AntiAlias'; $g.InterpolationMode = 'HighQualityBicubic'
-        $g.DrawImage($mf, 0, 0, [int]($w * $k), [int]($h * $k))
-        $g.Dispose()
-        Save-Bmp $bmp $out; $bmp.Dispose()
-        if (Test-Path $out) { $res.png = $out; $res.how = 'emf' }
+}
+# 3) metafile (quello che ChemDraw mette negli appunti per Word): lo leggo direttamente da Windows,
+#    perche' .NET spesso non lo restituisce, e lo disegno ad alta risoluzione su fondo bianco
+function Render-Emf($mf) {
+  $dx = $mf.HorizontalResolution; if ($dx -le 0) { $dx = 96 }
+  $dy = $mf.VerticalResolution; if ($dy -le 0) { $dy = 96 }
+  $wIn = [math]::Max(0.05, $mf.Width / $dx); $hIn = [math]::Max(0.05, $mf.Height / $dy)
+  $dpi = 384
+  while (($wIn * $dpi -gt 4200 -or $hIn * $dpi -gt 4200) -and $dpi -gt 96) { $dpi = $dpi / 2 }
+  $pw = [int][math]::Ceiling($wIn * $dpi); $ph = [int][math]::Ceiling($hIn * $dpi)
+  $bmp = New-Object System.Drawing.Bitmap $pw, $ph
+  $bmp.SetResolution($dpi, $dpi)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.Clear([System.Drawing.Color]::White)
+  $g.SmoothingMode = 'AntiAlias'; $g.InterpolationMode = 'HighQualityBicubic'; $g.TextRenderingHint = 'AntiAlias'
+  $g.DrawImage($mf, (New-Object System.Drawing.Rectangle 0, 0, $pw, $ph))
+  $g.Dispose()
+  Save-Bmp $bmp $out; $bmp.Dispose()
+  if (Test-Path $out) { $script:res.png = $out; $script:res.how = 'emf'; $script:res.dpi = $dpi }
+}
+if (-not $res.png) {
+  try {
+    Add-Type -Namespace DiarioClip -Name Native -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool CloseClipboard();
+[DllImport("user32.dll")] public static extern IntPtr GetClipboardData(uint uFormat);
+[DllImport("user32.dll")] public static extern bool IsClipboardFormatAvailable(uint uFormat);
+[DllImport("gdi32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr CopyEnhMetaFile(IntPtr hemf, string lpszFile);
+'@
+    if ([DiarioClip.Native]::IsClipboardFormatAvailable(14)) {
+      $copy = [IntPtr]::Zero
+      $opened = $false
+      for ($n = 0; $n -lt 10 -and -not $opened; $n++) { $opened = [DiarioClip.Native]::OpenClipboard([IntPtr]::Zero); if (-not $opened) { Start-Sleep -Milliseconds 60 } }
+      if ($opened) {
+        $h = [DiarioClip.Native]::GetClipboardData(14)
+        if ($h -ne [IntPtr]::Zero) { $copy = [DiarioClip.Native]::CopyEnhMetaFile($h, $null) }
+        [void][DiarioClip.Native]::CloseClipboard()
+      }
+      if ($copy -ne [IntPtr]::Zero) {
+        $mf = New-Object System.Drawing.Imaging.Metafile $copy, $true
+        Render-Emf $mf
+        $mf.Dispose()
       }
     }
-  }
+  } catch { $res.err = "$_" }
+}
+if (-not $res.png -and $do -and $do.GetDataPresent('EnhancedMetafile')) {
+  $mf = $do.GetData('EnhancedMetafile')
+  if ($mf -is [System.Drawing.Imaging.Metafile]) { Render-Emf $mf }
 }
 # 4) immagine normale (DIB/bitmap)
 if (-not $res.png) {
@@ -735,11 +764,12 @@ def read_system_clipboard(tmpdir):
         if not info and r.returncode != 0:
             raise RuntimeError("Non riesco a leggere gli appunti: " + (r.stderr or "").strip()[:300])
         res["types"] = [str(x) for x in (info.get("types") or [])]
+        res["err"] = str(info.get("err") or "")[:300]
         res["how"] = info.get("how") or ""
         if info.get("png") and os.path.exists(info["png"]):
             with open(info["png"], "rb") as f:
                 res["png"] = f.read()
-            res["dpi"] = 384 if res["how"] == "emf" else 0
+            res["dpi"] = int(info.get("dpi") or 0) or (384 if res["how"] == "emf" else 0)
         if info.get("cdx") and os.path.exists(info["cdx"]):
             with open(info["cdx"], "rb") as f:
                 res["cdx"] = f.read()
@@ -784,7 +814,7 @@ def api_clip_paste(d):
         saved.append(add_attachment(exp_id, stem + ".png", png))
     if res["cdx"]:
         saved.append(add_attachment(exp_id, stem + ".cdx", res["cdx"]))
-    return {"saved": saved, "how": res["how"]}
+    return {"saved": saved, "how": res["how"], "image": bool(res["png"]), "types": res["types"][:15], "err": res.get("err", "")}
 
 
 def api_att_open(d):
@@ -3932,7 +3962,9 @@ const EN_PAIRS = [
 ["Scrivi il messaggio.", "Write the message."],
 ["Per mandare messaggi al supervisore imposta prima la cartella Google Drive (⚙️ Impostazioni → Chiavi API e impostazioni).", "To send messages to your supervisor, first set the Google Drive folder (⚙️ Settings → API keys and settings)."],
 ["Non riesco a scrivere nella cartella dello studente: chiedigli di condividerla con te come «Editor» (non solo in lettura).", "I cannot write to the student's folder: ask them to share it with you as \"Editor\" (not read-only)."],
-["Non trovo la cartella condivisa dello studente.", "I cannot find the student's shared folder."]
+["Non trovo la cartella condivisa dello studente.", "I cannot find the student's shared folder."],
+["Ho salvato il file ChemDraw, ma negli appunti non ho trovato l'immagine della struttura, quindi nel Word comparirà solo il nome.\n\nFormati trovati negli appunti: ", "I saved the ChemDraw file, but I did not find the structure image on the clipboard, so only the name will appear in Word.\n\nFormats found on the clipboard: "],
+["\n\nManda questo messaggio a chi ti ha dato il Diario. Intanto puoi salvare lo schema da ChemDraw come PNG e trascinarlo qui.", "\n\nSend this message to whoever gave you the Diary. Meanwhile you can save the scheme from ChemDraw as PNG and drag it here."]
 ];
 const EN_MAP = new Map(EN_PAIRS);
 const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(=]\s?$|^\s|\s$|^[;,(]/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
@@ -4425,7 +4457,11 @@ function avatar(m, size) {
 // ---------- Messaggi (studente <-> supervisore) ----------
 function threadBox(load, send, opts) {
   const o = opts || {}, list = h("div", { class: "msglist" }), ta = h("textarea", { class: "msgin", rows: "2", placeholder: o.placeholder || "Scrivi un messaggio…" });
+  let lastKey = null;
   const draw = msgs => {
+    const key = msgs.map(m => m.id).join(",");
+    if (key === lastKey) return;          // niente di nuovo: non tocco la lista (cosi' non salta mentre leggi)
+    lastKey = key;
     list.innerHTML = "";
     if (!msgs.length) list.append(h("div", { class: "muted", style: "padding:6px 2px" }, o.empty || "Nessun messaggio."));
     msgs.forEach(m => list.append(h("div", { class: "msg" + (m.mine ? " mine" : "") + (m.unread ? " unread" : "") },
@@ -4442,6 +4478,13 @@ function threadBox(load, send, opts) {
   ta.addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); btn.click(); } });
   const el = h("div", { class: "msgbox" }, list, h("div", { class: "msgsend" }, ta, btn));
   refresh().catch(() => {});
+  // i messaggi nuovi compaiono da soli: ricontrollo ogni 10 secondi finche' la finestra e' aperta
+  let seenInDom = false;
+  const poll = setInterval(() => {
+    if (!document.body.contains(el)) { if (seenInDom) clearInterval(poll); return; }
+    seenInDom = true;
+    refresh().catch(() => {});
+  }, 10000);
   return { el, refresh };
 }
 // scheda «Messaggi» dentro l'esperimento (lato studente)
@@ -4697,6 +4740,7 @@ async function pasteChem(silent) {
   try {
     if (dirty) await saveNow();
     const r = await api("clip_paste", { exp: curId });
+    if (r.image === false) alert("Ho salvato il file ChemDraw, ma negli appunti non ho trovato l'immagine della struttura, quindi nel Word comparirà solo il nome.\n\nFormati trovati negli appunti: " + ((r.types || []).join(", ") || "nessuno") + (r.err ? "\nErrore: " + r.err : "") + "\n\nManda questo messaggio a chi ti ha dato il Diario. Intanto puoi salvare lo schema da ChemDraw come PNG e trascinarlo qui.");
     status("✅ Struttura incollata: " + r.saved.join(", "), 3000);
     const d = await api("get", { id: curId });
     renderAtt(d.attachments);

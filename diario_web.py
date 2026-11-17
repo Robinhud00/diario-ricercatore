@@ -42,7 +42,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.17.2"
+APP_VERSION = "2026.11.17.4"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -356,7 +356,7 @@ def api_list(d):
     q = "%" + s(d.get("q")).strip() + "%"
     con = db()
     rows = con.execute(
-        "SELECT id,name,date,project FROM experiments "
+        "SELECT id,name,date,project,group_id FROM experiments "
         "WHERE name LIKE ? OR project LIKE ? OR obiettivo LIKE ? OR procedura LIKE ? "
         "ORDER BY updated DESC, id DESC",
         (q, q, q, q),
@@ -4233,7 +4233,7 @@ select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px
 .muted{color:#9CA3AF}
 .drop{border:2px dashed #C4B5FD;border-radius:12px;padding:12px;margin-top:8px}
 .drop.over{background:var(--vl)}
-.topline{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.topline{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:8px;flex-wrap:wrap}
 .secgrid{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}
 .secopt{display:flex;align-items:center;gap:6px;padding:8px 10px;border:1px solid #DDD6FE;border-radius:10px;cursor:pointer}
 .modal.wide{width:min(1180px,96vw)}
@@ -4267,13 +4267,129 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
 .modal textarea{min-height:300px}
 .modal input{border:1px solid #DDD6FE;border-radius:10px;padding:10px 12px;outline:none}
 .modal .btns{display:flex;gap:8px;justify-content:flex-end}
+/* ===================== Aspetto «calmo» (ispirato a Notion, Linear, Apple Notes) ===================== */
+:root{--ink:#1B1B1F;--ink2:#3F3F46;--mut:#71717A;--line:#E6E6EB;--line2:#D9D9E0;--soft:#F5F5F7;--side:#F7F7F9;
+  --acc:#6D46E8;--acc2:#5B36D6;--accs:#F1ECFF;--ring:0 0 0 3px rgba(109,70,232,.16);--r:10px;
+  --sh1:0 1px 2px rgba(16,16,24,.05);--sh3:0 12px 40px rgba(16,16,24,.16),0 2px 6px rgba(16,16,24,.06)}
+body{background:#fff;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable","Segoe UI",Inter,"Helvetica Neue",Arial,sans-serif;font-size:15px;-webkit-font-smoothing:antialiased}
+::selection{background:#E4DBFF}
+*{scrollbar-width:thin;scrollbar-color:#D4D4DA transparent}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#D4D4DA;border-radius:10px;border:3px solid transparent;background-clip:content-box}
+
+/* ---- barra laterale */
+aside{background:var(--side);color:var(--ink);border-right:1px solid var(--line);padding:16px 12px 12px;gap:8px;width:282px}
+.logo{font-size:15px;font-weight:700;letter-spacing:-.01em;margin:2px 6px 6px;color:var(--ink)}
+aside .btn{background:transparent;color:var(--ink2);border:1px solid transparent;box-shadow:none;font-weight:550;font-size:13.5px;padding:7px 10px;border-radius:8px;text-align:left}
+aside .btn:hover{background:#EDEDF1;filter:none}
+aside #btnNew{background:var(--acc);color:#fff;text-align:center;box-shadow:var(--sh1)}
+aside #btnNew:hover{background:var(--acc2)}
+aside #btnNewGroup{text-align:center;border-color:var(--line2);background:#fff}
+aside #btnLangTop{border-color:var(--line2);background:#fff;font-size:12px!important;padding:4px 8px!important;color:var(--mut)}
+aside #btnUpdateNow{background:#10B981;color:#fff;text-align:center}
+aside .sbrow .btn{text-align:center;font-size:13px}
+aside #btnLab{text-align:left}
+.sbsearch{position:relative}
+#search{background:#fff;border:1px solid var(--line2);border-radius:8px;padding:8px 54px 8px 10px;font-size:14px;color:var(--ink);-webkit-text-fill-color:var(--ink)}
+#search:focus{border-color:var(--acc);box-shadow:var(--ring)}
+.kbd{display:inline-flex;align-items:center;gap:2px;font:600 11px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--mut);background:var(--soft);border:1px solid var(--line2);border-bottom-width:2px;border-radius:5px;padding:3px 5px}
+.sbsearch .kbd{position:absolute;right:8px;top:50%;transform:translateY(-50%);cursor:pointer}
+#list{background:transparent;padding:2px 0 8px;border-radius:0;border-bottom:1px solid var(--line)}
+.item{color:var(--ink2);border-radius:7px;padding:6px 10px;margin-bottom:1px}
+.item:hover{background:#EDEDF1}
+.item.sel{background:#fff;color:var(--ink);box-shadow:var(--sh1),0 0 0 1px var(--line)}
+.it-name{font-weight:550;font-size:14px}
+.it-date{font-size:11.5px;color:var(--mut);opacity:1}
+.ghead{background:transparent!important;color:var(--ink);text-shadow:none;padding:5px 6px;border-radius:7px;font-size:13.5px}
+.ghead:hover{background:#EDEDF1!important}
+.ghead::before{content:"";width:8px;height:8px;border-radius:3px;background:var(--gc,#A1A1AA);flex:none;order:1}
+.garrow{order:0;color:var(--mut)}.gname{order:2;font-weight:650}.gcount{order:3}
+.ghead>*:last-child{order:4}
+.gcount{background:transparent;color:var(--mut);font-weight:500;padding:0 4px}
+.gmore{background:transparent;color:var(--mut);opacity:0;transition:opacity .12s}
+.ghead:hover .gmore,.gmore:focus{opacity:1}.gmore:hover{background:#E2E2E8}
+.ghead.dropover{outline:2px solid var(--acc)}
+.gbody{border-left:1px solid var(--line2)!important;margin-left:12px;padding-left:4px}
+.sbnote{color:var(--mut);font-size:12.5px}
+.labbadge{background:#EF4444}
+
+@media (max-width:900px){aside{width:228px;padding:12px 8px}.it-date{display:none}main{padding:18px 16px 60px}input.title{font-size:24px}}
+/* ---- area principale */
+main{background:#fff;padding:26px clamp(18px,4vw,56px) 80px}
+main>*{max-width:940px;margin-left:auto!important;margin-right:auto!important}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:none;padding:16px 18px}
+.card.active{border-color:#CDBDFF;box-shadow:var(--ring)}
+main>.card:first-child{border:0;padding:4px 0 6px;background:transparent}
+input.title{background:transparent;font-size:30px;font-weight:750;letter-spacing:-.02em;padding:4px 6px;margin-left:-6px;border-radius:8px;color:var(--ink)}
+input.title:hover{background:var(--soft)}input.title:focus{background:transparent;box-shadow:var(--ring)}
+input.title::placeholder{color:#B4B4BC}
+.row{gap:6px;margin-top:8px}
+.row input,.row select{border:1px solid transparent;background:var(--soft);border-radius:8px;padding:6px 10px;font-size:14px;color:var(--ink2)}
+.row input:hover,.row select:hover{border-color:var(--line2)}
+.row input:focus,.row select:focus{border-color:var(--acc);background:#fff;box-shadow:var(--ring)}
+#groupsel{max-width:260px}
+.row .spacer{flex:1}
+.h2{color:var(--ink);font-size:15px;font-weight:650;letter-spacing:-.005em}
+textarea{background:#fff;border:1px solid var(--line);border-radius:10px;font-size:15px;line-height:1.6;color:var(--ink);padding:11px 13px}
+textarea:hover{border-color:var(--line2)}
+textarea:focus,.row input:focus{border-color:var(--acc);box-shadow:var(--ring)}
+textarea::placeholder,input::placeholder{color:#A1A1AA}
+.muted{color:var(--mut)}
+.att{background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:6px 10px}
+.drop{border:1.5px dashed var(--line2);border-radius:12px}
+.drop.over{background:var(--accs);border-color:var(--acc)}
+select{border:1px solid var(--line2);border-radius:8px}
+select:focus{border-color:var(--acc);box-shadow:var(--ring)}
+
+/* ---- pulsanti: uno solo pieno (l'azione principale), gli altri sobri */
+.btn{background:#fff;color:var(--ink2);border:1px solid var(--line2);border-radius:8px;padding:7px 12px;font-weight:550;font-size:14px;box-shadow:var(--sh1);transition:background .12s,border-color .12s,color .12s}
+.btn:hover{filter:none;background:var(--soft);border-color:#C9C9D2}
+.btn:focus-visible{outline:none;box-shadow:var(--ring)}
+.btn.small{padding:4px 9px;font-size:13px}
+.violet,.green,.blue,.orange,.pink,.grey{background:#fff;color:var(--ink2)}
+.btn.red{color:#DC2626;border-color:#F3C4C4}.btn.red:hover{background:#FEF2F2;border-color:#EBA0A0}
+.btn.primary,.modal .btns .btn.green,.modal .btns .btn.violet,.modal .btn.green:not(.small),#btnLinkGo{background:var(--acc);color:#fff;border-color:var(--acc)}
+.btn.primary:hover,.modal .btns .btn.green:hover,.modal .btns .btn.violet:hover,.modal .btn.green:not(.small):hover{background:var(--acc2);border-color:var(--acc2)}
+.modal .btns .btn.grey,.modal .btn.grey{background:#fff;color:var(--ink2)}
+#dsquick .btn{border-radius:999px;font-size:13.5px;padding:6px 12px}
+#btnDel{padding:7px 10px}
+
+/* ---- barra dell'assistente */
+.aicard{background:#FBFAFF;border-color:#ECE7FB}
+.ailabel{color:var(--acc2);font-size:13px}
+.aibtn2{border-color:#E2DAFB;color:#4C2BB8;font-size:13px;padding:5px 12px}
+.aibtn2.primary{background:var(--acc);border-color:var(--acc)}
+select.aichip{background:#fff;border-color:var(--line);font-size:12.5px;color:var(--mut)}
+
+/* ---- finestre e menu */
+.modal-bg{background:rgba(24,24,32,.32);-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
+.modal{border-radius:14px;box-shadow:var(--sh3);padding:22px 24px;border:1px solid var(--line)}
+.modal .btns{border-top:1px solid var(--line);padding-top:12px;margin-top:4px}
+.modal .h2{font-size:17px}
+.gmenu{border-radius:10px;border:1px solid var(--line);box-shadow:var(--sh3);padding:5px;min-width:240px}
+.gmenu button{padding:8px 10px;border-radius:7px;font-size:14px;color:var(--ink2)}
+.gmenu button:hover{background:var(--soft)}
+#msgBanner,#enBanner{border-width:1px!important;border-radius:10px!important;font-weight:550!important}
+
+/* ---- comandi rapidi (⌘K) */
+.palette-bg{position:fixed;inset:0;background:rgba(24,24,32,.28);-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);z-index:60;display:flex;justify-content:center;align-items:flex-start;padding-top:12vh}
+.palette{width:min(620px,92vw);background:#fff;border-radius:14px;box-shadow:var(--sh3);border:1px solid var(--line);overflow:hidden;display:flex;flex-direction:column;max-height:70vh}
+.palette input{border:0;border-bottom:1px solid var(--line);padding:16px 18px;font-size:17px;outline:none;color:var(--ink)}
+.palette .plist{overflow:auto;padding:6px}
+.palette .psec{font-size:11.5px;font-weight:650;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;padding:10px 12px 4px}
+.palette .pitem{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;cursor:pointer;color:var(--ink2)}
+.palette .pitem .pi{width:22px;text-align:center;flex:none}
+.palette .pitem .pt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.palette .pitem .ps{font-size:12px;color:var(--mut);flex:none;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.palette .pitem.on{background:var(--accs);color:var(--ink)}
+.palette .pfoot{border-top:1px solid var(--line);padding:8px 14px;font-size:12px;color:var(--mut);display:flex;gap:14px}
+.palette .pempty{padding:18px;color:var(--mut);text-align:center}
 </style>
 </head>
 <body>
 <div class="app">
   <aside>
     <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:6px">
-      <div class="logo">🔬 Diario del<br>Ricercatore</div>
+      <div class="logo">🔬 Diario del Ricercatore</div>
       <button class="btn ghost" id="btnLangTop" style="padding:6px 9px;font-size:13px;white-space:nowrap" title="Interface in English / Interfaccia in italiano">🇬🇧 English</button>
     </div>
     <button class="btn green" id="btnUpdateNow" hidden style="width:100%;margin-bottom:8px">⬆️ Nuova versione: aggiorna ora</button>
@@ -4281,7 +4397,7 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
       <button class="btn orange" id="btnNew" style="flex:1.25" title="Nuovo esperimento">＋ Esperimento</button>
       <button class="btn ghost" id="btnNewGroup" style="flex:1" title="Crea un gruppo per raggruppare gli esperimenti">📁＋ Gruppo</button>
     </div>
-    <input id="search" placeholder="🔍 Cerca esperimento…">
+    <div class="sbsearch"><input id="search" placeholder="🔍 Cerca esperimento…"><span class="kbd" id="kbdK" title="Comandi rapidi: cerca un esperimento o un comando">⌘K</span></div>
     <div id="list"></div>
     <button class="btn ghost" id="btnLab" style="width:100%;margin-top:8px;position:relative" title="Gli studenti del tuo laboratorio e il loro lavoro">🏛️ Laboratorio <span id="labCount" class="labbadge" hidden style="position:static;display:none;margin-left:6px"></span></button>
     <div class="sbrow" style="margin-top:8px">
@@ -4309,15 +4425,13 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
     <div class="card">
       <input id="name" class="title" placeholder="Nome dell'esperimento (es. NG012 – step 3)">
       <div class="row">
-        <input id="date" placeholder="Data">
-        <input id="project" placeholder="Progetto / molecola target">
-        <button class="btn green" id="btnSave">💾 Salva</button>
-        <button class="btn blue" id="btnExport" title="Crea un documento Word di questo esperimento">📄 Esporta in Word</button>
+        <input id="date" placeholder="Data" title="Data">
+        <input id="project" placeholder="Progetto / molecola target" title="Progetto / molecola target">
+        <select id="groupsel" title="Gruppo"></select>
+        <span class="spacer"></span>
+        <button class="btn" id="btnSave" title="Salva (⌘S / Ctrl+S). Il Diario salva comunque da solo mentre scrivi.">💾 Salva</button>
+        <button class="btn primary" id="btnExport" title="Crea un documento Word di questo esperimento">📄 Esporta in Word</button>
         <button class="btn red" id="btnDel" title="Elimina esperimento">🗑</button>
-      </div>
-      <div class="row">
-        <span class="muted">📁 Gruppo:</span>
-        <select id="groupsel"></select>
       </div>
     </div>
     <div id="msgBanner" hidden style="background:#FEF3C7;border:2px solid #F59E0B;color:#92400E;border-radius:14px;padding:10px 14px;margin-bottom:12px;font-weight:600;cursor:pointer"></div>
@@ -4349,7 +4463,7 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
     </div>
     <div class="card">
       <div class="topline">
-        <div class="h2" style="margin:0">📎 Allegati (ChemDraw e altri file)</div>
+        <div class="h2" style="margin:0">📎 Allegati</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn orange" id="btnChem" title="Apre l'app ChemDraw">⚗️ Apri ChemDraw</button>
         <button class="btn orange" id="btnPasteChem" title="Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)">📋 Incolla da ChemDraw</button>
@@ -4360,7 +4474,7 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
       <input type="file" id="filepick" multiple style="display:none">
       <div class="drop" id="drop">
         <div id="attlist"></div>
-        <div class="muted" style="margin-top:8px;font-size:13px">💡 <b>Per vedere gli schemi nel Word:</b> in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.</div>
+        <div class="muted" style="margin-top:8px;font-size:13px">💡 <b>Per vedere gli schemi nel Word:</b> in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina, fuori dai campi di testo (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.</div>
       </div>
     </div>
     <div class="card" id="msgcard" hidden>
@@ -4747,8 +4861,8 @@ const EN_PAIRS = [
 ["Misure e risultati", "Measurements and results"],
 ["Risultati e metriche", "Results and metrics"],
 ["Note e prossimi passi", "Notes and next steps"],
-[" in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", " in ChemDraw select the structure, press ⌘C and then ⌘V on this page (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."],
-["in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", "in ChemDraw select the structure, press ⌘C and then ⌘V on this page (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."],
+[" in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina, fuori dai campi di testo (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", " in ChemDraw select the structure, press ⌘C and then ⌘V on this page, outside the text fields (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."],
+["in ChemDraw seleziona la struttura, premi ⌘C e poi ⌘V su questa pagina, fuori dai campi di testo (oppure salva lo schema come PNG e trascinalo qui). Il file .cdx/.cdxml resta allegato come originale modificabile. Le immagini PNG/JPG compaiono nel documento Word.", "in ChemDraw select the structure, press ⌘C and then ⌘V on this page, outside the text fields (or save the scheme as PNG and drag it here). The .cdx/.cdxml file stays attached as the editable original. PNG/JPG images appear in the Word document."],
 ["⚠️ Nessuna immagine associata: nel Word comparirà solo il nome. Incolla lo schema da ChemDraw (⌘C → ⌘V qui) o aggiungi un PNG con lo stesso nome.", "⚠️ No associated image: only the name will appear in Word. Paste the scheme from ChemDraw (⌘C → ⌘V here) or add a PNG with the same name."],
 [" — controlla e modifica prima di applicare", " — check and edit before applying"],
 ["✨ Proposta di ", "✨ Suggestion from "],
@@ -4978,7 +5092,40 @@ const EN_PAIRS = [
 ["Un esperimento è stato modificato su due computer: trovi l'altra versione nell'elenco come «(versione dall'altro computer)».", "An experiment was edited on two computers: you will find the other version in the list as \"(versione dall'altro computer)\"."],
 ["Mentre scrivevi è arrivata una versione di questo esperimento dall'altro computer: l'ho tenuta come copia «(versione dall'altro computer)».", "While you were writing, a version of this experiment arrived from the other computer: I kept it as a copy \"(versione dall'altro computer)\"."],
 ["In questa cartella non c'e' un Diario. Scegli la cartella «Diario del Ricercatore - …» che il Diario dell'altro computer ha creato in Google Drive.", "There is no Diary in this folder. Choose the \"Diario del Ricercatore - …\" folder that the Diary on the other computer created in Google Drive."],
-["In quel Diario non ci sono ancora dati da prendere: aggiorna il Diario sull'altro computer e premi «Sincronizza con Drive», poi riprova.", "That Diary has no data to fetch yet: update the Diary on the other computer and press \"Sync with Drive\", then try again."]
+["In quel Diario non ci sono ancora dati da prendere: aggiorna il Diario sull'altro computer e premi «Sincronizza con Drive», poi riprova.", "That Diary has no data to fetch yet: update the Diary on the other computer and press \"Sync with Drive\", then try again."],
+["Cerca un esperimento o un comando…", "Search an experiment or a command…"],
+["per scegliere", "to choose"],
+["per aprire", "to open"],
+["per chiudere", "to close"],
+["Esperimenti", "Experiments"],
+["Comandi", "Commands"],
+["Nuovo gruppo", "New group"],
+["Esporta in Word", "Export to Word"],
+["Incolla da ChemDraw", "Paste from ChemDraw"],
+["Disegna molecola", "Draw molecule"],
+["Aggiungi file", "Add file"],
+["Laboratorio", "Lab"],
+["Documento di progetto", "Project document"],
+["Cartella documenti", "Documents folder"],
+["Sincronizza con Drive", "Sync with Drive"],
+["Riordina documenti", "Reorganise documents"],
+["Chiavi API e impostazioni", "API keys and settings"],
+["Settore di ricerca", "Research field"],
+["Usa su più computer", "Use on several computers"],
+["Interfaccia in italiano", "Italian interface"],
+["Interfaccia in inglese", "English interface"],
+["Crea icona sul Desktop", "Create Desktop icon"],
+["Cerca aggiornamenti", "Check for updates"],
+["Archivio", "Archive"],
+["Chiudi il Diario", "Close the Diary"],
+["esperimento aperto", "open experiment"],
+["documenti", "documents"],
+["impostazioni", "settings"],
+["dati e grafici", "data and charts"],
+["assistente", "assistant"],
+["Comandi rapidi: cerca un esperimento o un comando", "Quick commands: search an experiment or a command"],
+["Salva (⌘S / Ctrl+S). Il Diario salva comunque da solo mentre scrivi.", "Save (⌘S / Ctrl+S). The Diary also saves by itself while you write."],
+["📎 Allegati", "📎 Attachments"]
 ];
 const EN_MAP = new Map(EN_PAIRS);
 const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(=]\s?$|^\s|\s$|^[;,(]/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
@@ -5022,7 +5169,7 @@ if (UI_LANG === "en") {
   const FRAG_SEL = "#status, .warn, .dssum, .hint, .muted, #btnSector, #ailabel, .modal .h2";
   const doNode = n => {
     if (n.nodeType === 3) {
-      const par = n.parentElement; if (!par || /^(TEXTAREA|SCRIPT|STYLE)$/.test(par.tagName)) return;
+      const par = n.parentElement; if (!par || /^(TEXTAREA|SCRIPT|STYLE)$/.test(par.tagName) || par.closest(".notr")) return;
       const v = n.nodeValue, r = (par.closest(FRAG_SEL) || par.closest("svg")) ? txf(v) : tx(v);
       if (r !== v) n.nodeValue = r;
     } else if (n.nodeType === 1) {
@@ -5234,9 +5381,9 @@ function renderGroup(g, arch) {
       ["🗑  Elimina il gruppo…", () => deleteGroup(g), true]];
   }
   if (items) ctl.append(h("button", { class: "gmore", title: "Azioni del gruppo", onclick: ev => openGroupMenu(ev, items, arch ? null : g) }, "⋯"));
-  const head = h("div", { class: "ghead", title: groupPath(g.id), style: "background:" + g.color, onclick: () => toggleGroup(g) },
+  const head = h("div", { class: "ghead", title: groupPath(g.id), style: "background:" + g.color + ";--gc:" + g.color, onclick: () => toggleGroup(g) },
     h("span", { class: "garrow" }, g.collapsed ? "▸" : "▾"),
-    h("span", { class: "gname", title: g.name }, "📁 " + g.name),
+    h("span", { class: "gname", title: g.name }, g.name),
     h("span", { class: "gcount" }, String(countExps(g.id))),
     ctl);
   wrap.append(head);
@@ -5651,7 +5798,7 @@ async function openLab(selId) {
           m.msgs ? h("div", { class: "labnew msgs" }, "💬 " + m.msgs) : null))
         : h("div", { class: "muted" }, "Nessuno studente ancora. Aggiungine uno qui sotto.")),
       h("div", null, h("button", { class: "btn violet", onclick: openAdd }, "＋ Aggiungi uno studente")),
-      data.my_folder ? h("div", { class: "hint" }, tx("La tua cartella in Google Drive, da condividere con chi ti segue:") + " «" + data.my_folder + "»") : null,
+      data.my_folder ? h("div", { class: "hint" }, tx("La tua cartella in Google Drive, da condividere con chi ti segue:") + " ", h("span", { class: "notr" }, "«" + data.my_folder + "»")) : null,
       h("div", { class: "labme" }, h("span", { class: "muted" }, "Il tuo nome (come ti vede il tuo supervisore):"), me,
         data.sync ? null : h("span", { class: "muted" }, "· Per farti seguire imposta la cartella Google Drive nelle impostazioni.")),
       myMsgs,
@@ -5761,9 +5908,9 @@ async function openMulti() {
     h("div", { class: "hint" }, "Puoi usare lo stesso Diario su più computer (per esempio in ufficio e a casa). Gli esperimenti, i gruppi, le tabelle e gli allegati passano da un computer all'altro attraverso la tua cartella in Google Drive, circa un minuto dopo ogni modifica."),
     h("div", { class: "keyrow" }, h("b", null, "Questo computer")),
     h("div", { class: "dsopt" }, dev, h("button", { class: "btn grey small", onclick: async () => { try { await api("device_name", { name: dev.value }); status("✅ " + tx("Salvato"), 2000); } catch (e) { fail(e); } } }, "Salva")),
-    info.folder ? h("div", { class: "hint" }, tx("La tua cartella in Google Drive:") + " «" + info.folder + "»") : h("div", { class: "warn", style: "font-size:13px" }, "Questo computer non è ancora collegato a Google Drive. Per usare un Diario che hai già su un altro computer, scegli qui sotto la sua cartella."),
+    info.folder ? h("div", { class: "hint" }, tx("La tua cartella in Google Drive:") + " ", h("span", { class: "notr" }, "«" + info.folder + "»")) : h("div", { class: "warn", style: "font-size:13px" }, "Questo computer non è ancora collegato a Google Drive. Per usare un Diario che hai già su un altro computer, scegli qui sotto la sua cartella."),
     info.devices && info.devices.length ? h("div", null, h("div", { class: "keyrow" }, h("b", null, "Computer che usano questo Diario")),
-      info.devices.map(x => h("div", { class: "muted" }, "💻 " + (x.name || "?") + (x.system ? " · " + x.system : "") + " · " + tx("ultima sincronizzazione") + " " + ago(x.last) + (x.me ? " · " + tx("(questo)") : "")))) : null,
+      info.devices.map(x => h("div", { class: "muted" }, h("span", { class: "notr" }, "💻 " + (x.name || "?") + (x.system ? " · " + x.system : "")), " · " + tx("ultima sincronizzazione") + " " + ago(x.last) + (x.me ? " · " + tx("(questo)") : "")))) : null,
     h("div", { class: "keyrow" }, h("b", null, "🔗 Usare qui un Diario che hai su un altro computer")),
     h("div", { class: "hint" }, "1) Sull'altro computer aggiorna il Diario e premi «☁️ Sincronizza con Drive». 2) Su questo computer installa Google Drive per desktop con lo stesso account. 3) Qui scegli la cartella «Diario del Ricercatore - …» dell'altro computer (in «Il mio Drive») e premi «Collega»."),
     h("div", { class: "dsopt" }, path, pick, link),
@@ -5790,6 +5937,73 @@ async function syncPoll() {
     const d = await api("get", { id: curId, uid: curExp.uid });
     if (d.exp.updated !== curExp.updated || d.exp.id !== curId) await openExp(d.exp.id);
   } catch (e) { await loadList().catch(() => {}); }
+}
+
+// ---------- Comandi rapidi: ⌘K / Ctrl+K (come in Notion, Linear, VS Code) ----------
+function openPalette() {
+  if (document.querySelector(".palette-bg")) return;
+  const btn = id => () => { const b = $(id); if (b) b.click(); };
+  const cmds = [
+    ["🧪", "Nuovo esperimento", () => newExp(), ""],
+    ["📁", "Nuovo gruppo", btn("btnNewGroup"), ""],
+    ["📄", "Esporta in Word", btn("btnExport"), "esperimento aperto"],
+    ["📋", "Incolla da ChemDraw", btn("btnPasteChem"), "allegati"],
+    ["⚗️", "Disegna molecola", btn("btnDraw"), "allegati"],
+    ["＋", "Aggiungi file", btn("btnAdd"), "allegati"],
+    ["🏛️", "Laboratorio", btn("btnLab"), ""],
+    ["📚", "Documento di progetto", btn("btnMerge"), "documenti"],
+    ["📂", "Cartella documenti", btn("btnDocs"), "documenti"],
+    ["☁️", "Sincronizza con Drive", btn("btnSync"), "documenti"],
+    ["🗂️", "Riordina documenti", btn("btnReorg"), "documenti"],
+    ["🔑", "Chiavi API e impostazioni", btn("btnKey"), "impostazioni"],
+    ["🧭", "Settore di ricerca", btn("btnSector"), "impostazioni"],
+    ["💻", "Usa su più computer", btn("btnMulti"), "impostazioni"],
+    ["🌐", UI_LANG === "en" ? "Interfaccia in italiano" : "Interfaccia in inglese", btn("btnUiLang"), "impostazioni"],
+    ["🖥️", "Crea icona sul Desktop", btn("btnShortcut"), "impostazioni"],
+    ["⬆️", "Cerca aggiornamenti", btn("btnUpdate"), "impostazioni"],
+    ["📦", "Archivio", btn("btnArchive"), ""],
+    ["⏻", "Chiudi il Diario", btn("btnQuit"), ""]
+  ];
+  document.querySelectorAll("#dsquick .btn").forEach(b => { const t = b.textContent.trim(); if (t) cmds.splice(3, 0, ["📈", t.replace(/^\S+\s+/, ""), () => b.click(), "dati e grafici"]); });
+  (AIBTNS || []).forEach(([label, color, mode]) => cmds.push(["✨", label.replace(/^\S+\s+/, ""), () => runAI(mode), "assistente"]));
+  const input = h("input", { placeholder: tx("Cerca un esperimento o un comando…") });
+  const list = h("div", { class: "plist" });
+  const bg = h("div", { class: "palette-bg", onclick: e => { if (e.target === bg) close(); } },
+    h("div", { class: "palette" }, input, list,
+      h("div", { class: "pfoot" }, h("span", null, "↑↓ " + tx("per scegliere")), h("span", null, "↵ " + tx("per aprire")), h("span", null, "esc " + tx("per chiudere")))));
+  let rows = [], cur = 0, exps = [];
+  const close = () => { bg.remove(); document.removeEventListener("keydown", onKey, true); };
+  const norm = s => String(s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+  const score = (q, s) => { const a = norm(s); if (!q) return 1; if (a.startsWith(q)) return 3; if (a.includes(" " + q)) return 2; if (a.includes(q)) return 1;
+    if (q.length < 4) return 0;
+    let i = 0; for (const ch of a) { if (ch === q[i]) i++; if (i === q.length) return .5; } return 0; };
+  const draw = () => {
+    const q = norm(input.value.trim());
+    const E = exps.map(e => ({ icon: "🧪", t: e.name || tx("(senza nome)"), s: [e.date, groupPath ? (e.group_id != null ? groupPath(e.group_id) : "") : ""].filter(Boolean).join(" · "), run: () => openExp(e.id), sc: Math.max(score(q, e.name), score(q, e.project) * .8) }))
+      .filter(x => x.sc > 0).sort((a, b) => b.sc - a.sc).slice(0, q ? 8 : 5);
+    const C = cmds.map(c => ({ icon: c[0], t: tx(c[1]), s: tx(c[3]), run: c[2], sc: score(q, tx(c[1])) || score(q, c[1]) })).filter(x => x.sc > 0).sort((a, b) => b.sc - a.sc).slice(0, q ? 10 : 12);
+    list.innerHTML = ""; rows = [];
+    const sec = (title, arr) => { if (!arr.length) return; list.append(h("div", { class: "psec" }, title)); arr.forEach(x => {
+      const i = rows.length;
+      const el = h("div", { class: "pitem", onmousemove: () => { if (cur !== i) { cur = i; mark(); } }, onclick: () => { close(); x.run(); } },
+        h("span", { class: "pi" }, x.icon), h("span", { class: "pt" }, x.t), x.s ? h("span", { class: "ps" }, x.s) : null);
+      rows.push({ el, run: x.run }); list.append(el); }); };
+    sec(tx("Esperimenti"), E); sec(tx("Comandi"), C);
+    if (!rows.length) list.append(h("div", { class: "pempty" }, tx("Nessun risultato")));
+    cur = Math.min(cur, Math.max(0, rows.length - 1)); mark();
+  };
+  const mark = () => rows.forEach((r, i) => { r.el.classList.toggle("on", i === cur); if (i === cur) r.el.scrollIntoView({ block: "nearest" }); });
+  const onKey = e => {
+    if (e.key === "Escape") { e.preventDefault(); close(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); cur = Math.min(rows.length - 1, cur + 1); mark(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); cur = Math.max(0, cur - 1); mark(); }
+    else if (e.key === "Enter") { e.preventDefault(); const r = rows[cur]; if (r) { close(); r.run(); } }
+  };
+  document.addEventListener("keydown", onKey, true);
+  input.addEventListener("input", () => { cur = 0; draw(); });
+  document.body.append(bg); input.focus();
+  api("list", { q: "" }).then(d => { exps = d.items || []; draw(); }).catch(() => draw());
+  draw();
 }
 
 async function openMerge(gid) {
@@ -7324,6 +7538,8 @@ function build() {
   setInterval(() => { fetch("/api/ping").catch(() => {}); }, 60000);
   $("btnMerge").onclick = () => openMerge(null);
   $("btnMulti").onclick = () => openMulti().catch(fail);
+  if (!/Mac|iPhone|iPad/.test(navigator.platform || "")) $("kbdK").textContent = "Ctrl K";
+  $("kbdK").onclick = () => openPalette();
   setInterval(syncPoll, 15000); syncPoll();
   $("btnView").onclick = () => setView(!viewEN).catch(fail);
   $("btnLab").onclick = () => openLab(null).catch(fail);
@@ -7413,14 +7629,17 @@ function build() {
   window.addEventListener("drop", e => e.preventDefault());
   // incolla un'immagine (es. uno schema copiato da ChemDraw con ⌘C) come allegato
   window.addEventListener("paste", e => {
+    // Incollare in un campo di testo (o dentro una finestra aperta: strumenti, impostazioni, messaggi…) incolla SOLO il testo:
+    // gli allegati si creano con ⌘V / Ctrl+V solo quando non stai scrivendo in un campo, oppure con «📋 Incolla da ChemDraw».
+    const ae = document.activeElement;
+    const inField = ae && (/^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName) || ae.isContentEditable);
+    if (inField || document.querySelector(".modal-bg, .viewer")) return;
     const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
     const it = items.find(x => x.kind === "file" && /^image\/(png|jpeg)$/.test(x.type));
     if (!it) {
       // ChemDraw (soprattutto su Mac) non mette un'immagine "normale" negli appunti del browser:
-      // se non c'e' testo da incollare, la legge il programma direttamente dagli appunti di sistema.
-      const hasText = items.some(x => x.kind === "string" && x.type === "text/plain");
-      const ae = document.activeElement, inField = ae && /^(INPUT|TEXTAREA)$/.test(ae.tagName);
-      if ((!hasText || !inField) && curId != null) { e.preventDefault(); pasteChem(true).catch(() => {}); }
+      // la legge il programma direttamente dagli appunti di sistema.
+      if (curId != null) { e.preventDefault(); pasteChem(true).catch(() => {}); }
       return;
     }
     const f = it.getAsFile();
@@ -7435,6 +7654,7 @@ function build() {
   });
   window.addEventListener("keydown", e => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") { e.preventDefault(); saveNow().catch(fail); }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
   });
   window.addEventListener("pagehide", () => {
     if (dirty && curId != null) {

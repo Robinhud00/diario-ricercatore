@@ -53,7 +53,7 @@ n = st.msg_scan(); assert len(n) == 2 and n[0][0] == "Prof. Verdi", n
 th = st.api_msg_thread({"exp": eid}); assert len(th["messages"]) == 1 and th["messages"][0]["author"] == "Prof. Verdi" and not th["messages"][0]["mine"]
 assert st.api_msg_status({})["total"] == 1
 st.api_msg_send({"exp": eid, "text": "Fatto, Rf 0.4 in AcOEt/esano 1:1."})
-assert os.path.isfile(os.path.join(root, "Messaggi", "studente.json"))
+assert any(f.startswith("studente-") for f in os.listdir(os.path.join(root, "Messaggi")))
 mv = sup.api_lab_get({})["members"][0]; assert mv["msgs"] == 1 and mv["msg_by_exp"] == {str(eid): 1}, mv
 assert len(sup.msg_scan()) == 1
 lt = sup.api_lab_thread({"member": mid, "exp": eid}); assert [x["mine"] for x in lt["messages"]] == [True, False] and lt["messages"][1]["author"] == "Marco Rossi", lt

@@ -60,6 +60,13 @@ Il pulsante **🌍 Versione inglese (nuovo Word)** traduce titolo e sezioni e cr
 ## Documento unico di progetto
 A fine progetto: menu **⋯ del gruppo → 📚 Unisci tutto in un documento…** (oppure il pulsante **📚 Documento di progetto**, che permette di scegliere anche un *progetto* invece di un gruppo). Il Diario crea un solo Word con indice e tutti gli esperimenti in ordine di data (sottogruppi compresi), ciascuno su una pagina nuova con le sue figure, tabelle e allegati. Lo trovi in `Documenti/_Riepiloghi/` (e su Drive); è un file a parte, i Word dei singoli esperimenti non cambiano. Con «in inglese» usa le versioni inglesi già create; gli esperimenti senza traduzione vengono segnalati.
 
+## Lo stesso Diario su più computer (ufficio e casa)
+⚙️ Impostazioni → **💻 Usa su più computer**. Sul primo computer basta aver impostato Google Drive e sincronizzato. Sul secondo: installa Google Drive per desktop con lo stesso account, apri il Diario, «💻 Usa su più computer» → scegli la cartella «Diario del Ricercatore - Nome» → **Collega**. Gli esperimenti del secondo computer, se ce n'erano, vengono aggiunti al Diario.
+
+Da quel momento esperimenti, gruppi, tabelle, traduzioni e allegati passano da un computer all'altro attraverso la sottocartella `Dati` (un file per esperimento, gli allegati con l'impronta del contenuto nel nome), circa un minuto dopo ogni modifica; l'esperimento aperto si aggiorna da solo. Se lo stesso esperimento viene modificato su due computer prima che si siano sincronizzati, nessuna versione si perde: una compare come «… (versione dall'altro computer)». Anche gli studenti seguiti nel Laboratorio sono gli stessi sui due computer.
+
+**Recupero.** Se l'unico computer si è rotto, su quello nuovo «Collega» alla cartella del Diario in Drive: se c'è solo la copia di sicurezza di una versione vecchia, il Diario la ripristina (database e allegati).
+
 ## Laboratorio (per chi segue degli studenti)
 Il pulsante **🏛️ Laboratorio** apre la bacheca del supervisore: ogni studente è una scheda con il suo avatar, quando ha aggiornato l'ultima volta e quante novità ci sono. Cliccando si vedono i suoi esperimenti (per gruppo, con «nuovo» / «modificato»), si leggono dentro il Diario e si apre il Word. Quando uno studente aggiunge o modifica qualcosa arriva una notifica di sistema.
 

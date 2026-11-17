@@ -42,7 +42,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.17.1"
+APP_VERSION = "2026.11.17.2"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -80,18 +80,60 @@ MODES = {
 }
 
 
+_cfg_lock = threading.RLock()
+
+
+class _Cfg(dict):
+    """Impostazioni lette da config.json; ricorda com'erano, cosi' al salvataggio scrive solo cio' che e' cambiato."""
+    _orig = None
+
+
+def _cfg_read_disk():
+    for n in range(4):
+        try:
+            with open(CFG_PATH, encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            time.sleep(0.05 * (n + 1))
+    return {}
+
+
 def load_cfg():
-    try:
-        with open(CFG_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with _cfg_lock:
+        d = _cfg_read_disk()
+    c = _Cfg(d)
+    c._orig = json.loads(json.dumps(d))
+    return c
 
 
 def save_cfg(cfg):
-    with open(CFG_PATH, "w") as f:
-        json.dump(cfg, f)
-    os.chmod(CFG_PATH, 0o600)
+    """Scrittura sicura: rilegge il file e applica solo le chiavi modificate (piu' parti del Diario salvano insieme),
+    poi sostituisce il file in un colpo solo (mai un file scritto a meta')."""
+    with _cfg_lock:
+        orig = getattr(cfg, "_orig", None)
+        if orig is None:
+            new = dict(cfg)
+        else:
+            new = _cfg_read_disk()
+            for k in set(orig) | set(cfg):
+                if k not in cfg:
+                    new.pop(k, None)
+                elif k not in orig or orig[k] != cfg[k]:
+                    new[k] = cfg[k]
+        os.makedirs(os.path.dirname(CFG_PATH), exist_ok=True)
+        tmp = CFG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(new, f)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, CFG_PATH)
+        if isinstance(cfg, _Cfg):
+            cfg._orig = json.loads(json.dumps(dict(cfg)))
 
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
@@ -297,6 +339,7 @@ def init_db():
     con.execute("CREATE TABLE IF NOT EXISTS msg_seen(id TEXT PRIMARY KEY)")
     con.execute("CREATE TABLE IF NOT EXISTS translations(exp_id INTEGER PRIMARY KEY, name TEXT, obiettivo TEXT, procedura TEXT, risultati TEXT, note TEXT, updated TEXT)")
     con.commit()
+    multi_migrate(con)
     con.close()
 
 
@@ -324,7 +367,9 @@ def api_list(d):
 
 def api_get(d):
     con = db()
-    row = con.execute("SELECT * FROM experiments WHERE id=?", (int(d["id"]),)).fetchone()
+    row = con.execute("SELECT * FROM experiments WHERE uid=?", (s(d["uid"]),)).fetchone() if d.get("uid") else None
+    if row is None:
+        row = con.execute("SELECT * FROM experiments WHERE id=?", (int(d["id"]),)).fetchone()
     if not row:
         con.close()
         raise RuntimeError("Esperimento non trovato.")
@@ -357,34 +402,80 @@ def api_new(d):
         "INSERT INTO experiments(name,date,project,updated,group_id,lang) VALUES(?,?,?,?,?,?)",
         ("New experiment" if load_cfg().get("ui_lang") == "en" else "Nuovo esperimento", datetime.date.today().strftime("%d/%m/%Y"), "", now(), gid, load_cfg().get("lang_default") or ""),
     )
-    con.commit()
     new_id = cur.lastrowid
+    con.execute("UPDATE experiments SET uid=?, num=?, created=?, origin=? WHERE id=?", (_uid(), new_id, msg_now(), install_id(), new_id))
+    con.commit()
     con.close()
     return {"id": new_id}
 
 
+def clone_exp(con, eid, suffix):
+    """Copia completa di un esperimento (testo, tabelle, traduzione, allegati). Ritorna il nuovo id."""
+    r = con.execute("SELECT * FROM experiments WHERE id=?", (eid,)).fetchone()
+    nid = con.execute("INSERT INTO experiments(name,date,project,obiettivo,procedura,risultati,note,updated,group_id,lang,uid,created,origin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (s(r["name"]) + " " + suffix, r["date"], r["project"], r["obiettivo"], r["procedura"], r["risultati"], r["note"], now(),
+                       r["group_id"], r["lang"], _uid(), now(), install_id())).lastrowid
+    con.execute("UPDATE experiments SET num=? WHERE id=?", (nid, nid))
+    for x in con.execute("SELECT title,kind,payload FROM datasets WHERE exp_id=? ORDER BY id", (eid,)).fetchall():
+        con.execute("INSERT INTO datasets(exp_id,title,kind,payload,updated) VALUES(?,?,?,?,?)", (nid, x["title"], x["kind"], x["payload"], now()))
+    tr = con.execute("SELECT * FROM translations WHERE exp_id=?", (eid,)).fetchone()
+    if tr:
+        con.execute("INSERT INTO translations(exp_id,name,obiettivo,procedura,risultati,note,updated) VALUES(?,?,?,?,?,?,?)",
+                    (nid, tr["name"], tr["obiettivo"], tr["procedura"], tr["risultati"], tr["note"], now()))
+    for a in con.execute("SELECT filename, path FROM attachments WHERE exp_id=? ORDER BY id", (eid,)).fetchall():
+        d = os.path.join(ATT_DIR, str(nid))
+        os.makedirs(d, exist_ok=True)
+        dest = os.path.join(d, a["filename"])
+        try:
+            shutil.copyfile(a["path"], dest)
+        except OSError:
+            continue
+        con.execute("INSERT INTO attachments(exp_id,filename,path) VALUES(?,?,?)", (nid, a["filename"], dest))
+    return nid
+
+
 def api_save(d):
     con = db()
+    eid = int(d["id"])
+    row = None
+    if d.get("uid"):     # l'esperimento puo' aver cambiato numero dopo una sincronizzazione
+        row = con.execute("SELECT * FROM experiments WHERE uid=?", (s(d["uid"]),)).fetchone()
+    if row is None:
+        row = con.execute("SELECT * FROM experiments WHERE id=?", (eid,)).fetchone()
+    if row is None:
+        con.close()
+        raise RuntimeError("Esperimento non trovato.")
+    eid, copy_id = row["id"], None
+    base = d.get("base")
+    if base and s(row["updated"]) != s(base) and _pulled_ids.get(eid) == row["updated"]:
+        # mentre scrivevi qui e' arrivata una versione dall'altro computer: la tengo come copia
+        with _multi_lock:
+            copy_id = clone_exp(con, eid, VERSION_ALTRO)
+        _data_ver["n"] += 1
+        _data_ver["conflicts"] += 1
+    stamp = now()
     con.execute(
         "UPDATE experiments SET name=?,date=?,project=?,obiettivo=?,procedura=?,risultati=?,note=?,lang=?,updated=? WHERE id=?",
         (s(d.get("name")).strip(), s(d.get("date")).strip(), s(d.get("project")).strip(),
          s(d.get("obiettivo")), s(d.get("procedura")), s(d.get("risultati")), s(d.get("note")),
-         "en" if d.get("lang") == "en" else "", now(), int(d["id"])),
+         "en" if d.get("lang") == "en" else "", stamp, eid),
     )
     con.commit()
     con.close()
+    _pulled_ids.pop(eid, None)
     lg = "en" if d.get("lang") == "en" else ""
     cfg = load_cfg()
     if (cfg.get("lang_default") or "") != lg:
         cfg["lang_default"] = lg
         save_cfg(cfg)
-    return {}
+    return {"updated": stamp, "id": eid, "conflict_copy": copy_id}
 
 
 def api_delete(d):
     exp_id = int(d["id"])
     con = db()
-    con.execute("DELETE FROM attachments WHERE exp_id=?", (exp_id,))
+    for tb in ("attachments", "datasets", "translations"):
+        con.execute("DELETE FROM %s WHERE exp_id=?" % tb, (exp_id,))
     con.execute("DELETE FROM experiments WHERE id=?", (exp_id,))
     con.commit()
     nxt = con.execute("SELECT id FROM experiments ORDER BY updated DESC, id DESC LIMIT 1").fetchone()
@@ -439,8 +530,8 @@ def api_group_new(d):
             raise RuntimeError("Gruppo superiore non trovato.")
         con.execute("UPDATE exp_groups SET collapsed=0 WHERE id=?", (parent,))
     n = con.execute("SELECT COUNT(*) AS c FROM exp_groups").fetchone()["c"]
-    cur = con.execute("INSERT INTO exp_groups(name,parent_id,color,collapsed,archived) VALUES(?,?,?,0,0)",
-                      (name, parent, PALETTE[n % len(PALETTE)]))
+    cur = con.execute("INSERT INTO exp_groups(name,parent_id,color,collapsed,archived,uid) VALUES(?,?,?,0,0,?)",
+                      (name, parent, PALETTE[n % len(PALETTE)], _uid()))
     con.commit()
     new_id = cur.lastrowid
     con.close()
@@ -1882,7 +1973,7 @@ def api_quit(d):
     return {"ok": True}
 
 
-READONLY_ROUTES = {"/api/lab_thread", "/api/lab_send", "/api/msg_thread", "/api/msg_status", "/api/lab_get", "/api/lab_add", "/api/lab_remove", "/api/lab_exp", "/api/lab_seen", "/api/lab_open", "/api/pick_folder", "/api/update_check", "/api/update_apply", "/api/ui_lang", "/api/shortcut", "/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
+READONLY_ROUTES = {"/api/multi_info", "/api/sync_ver", "/api/lab_thread", "/api/lab_send", "/api/msg_thread", "/api/msg_status", "/api/lab_get", "/api/lab_add", "/api/lab_remove", "/api/lab_exp", "/api/lab_seen", "/api/lab_open", "/api/pick_folder", "/api/update_check", "/api/update_apply", "/api/ui_lang", "/api/shortcut", "/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
 
 
 def docs_kick():
@@ -1973,7 +2064,7 @@ def export_exp(exp_id, force=False):
             keep_docs = {docx, docx_en}
             # Word con un altro nome (esperimento rinominato): via il vecchio
             for fn in os.listdir(target):
-                if fn.lower().endswith(".docx") and re.search(r"\(n\.%d\)( - English version)?\.docx$" % row["id"], fn) and os.path.join(target, fn) not in keep_docs:
+                if fn.lower().endswith(".docx") and re.search(r"\(n\.\d+\)( - English version)?\.docx$", fn) and os.path.join(target, fn) not in keep_docs:
                     try:
                         os.remove(os.path.join(target, fn))
                     except OSError:
@@ -2310,12 +2401,12 @@ def _mark_read(folder):
 
 def _mark_write(folder):
     with open(os.path.join(folder, OWNER_MARK), "w", encoding="utf-8") as f:
-        json.dump({"install_id": install_id(), "owner": owner_name(), "created": now()}, f, ensure_ascii=False)
+        json.dump({"install_id": install_id(), "diary_id": diary_id(), "owner": owner_name(), "created": now()}, f, ensure_ascii=False)
 
 
 def _is_my_root(folder):
     mk = _mark_read(folder)
-    return bool(mk) and mk.get("install_id") == install_id()
+    return bool(mk) and (mk.get("diary_id") or mk.get("install_id")) == diary_id()
 
 
 def _is_member_root(folder):
@@ -2404,7 +2495,7 @@ def drive_root(create=True):
             return None
         if not create:
             return None
-        wanted = "%s - %s" % (DRIVE_SUBDIR, safe_name(owner_name())[:40] or install_id())
+        wanted = "%s - %s" % (DRIVE_SUBDIR, safe_name(owner_name())[:40] or diary_id())
         legacy, target = os.path.join(base, DRIVE_SUBDIR), os.path.join(base, wanted)
         if os.path.isdir(legacy) and _mark_read(legacy) is None and _legacy_is_mine(legacy):
             # era gia' la mia (versioni precedenti): la rinomino sul posto, cosi' chi l'ha condivisa continua a vederla
@@ -2633,13 +2724,19 @@ def api_lab_add(d):
         if a and b2 and os.path.realpath(a) == os.path.realpath(b2):
             raise RuntimeError("Questa cartella e' gia' collegata allo studente «%s»." % m.get("name", ""))
     mid = "m%d" % (max([int(m["id"][1:]) for m in lab["members"]] + [0]) + 1)
-    lab["members"].append({"id": mid, "name": name, "path": path, "color": LAB_COLORS[len(lab["members"]) % len(LAB_COLORS)]})
+    lab["members"].append({"id": mid, "name": name, "path": path, "color": LAB_COLORS[len(lab["members"]) % len(LAB_COLORS)],
+                           "key": _student_key(path) or "", "added": now()})
     lab_save(lab)
     return {"id": mid, "found": bool(lab_root(path))}
 
 
 def api_lab_remove(d):
     lab = lab_cfg()
+    for m in lab["members"]:
+        if m["id"] == d.get("id") and m.get("key"):
+            if not isinstance(lab.get("removed"), dict):
+                lab["removed"] = {}
+            lab["removed"][m["key"]] = now()
     lab["members"] = [m for m in lab["members"] if m["id"] != d.get("id")]
     lab["seen"].pop(s(d.get("id")), None)
     lab_save(lab)
@@ -2700,12 +2797,13 @@ def api_pick_folder(d):
     """Finestra di sistema per scegliere una cartella."""
     try:
         if IS_MAC:
-            r = subprocess.run(["osascript", "-e", 'POSIX path of (choose folder with prompt "Scegli la cartella «Diario del Ricercatore» dello studente")'],
+            prompt = "Scegli la cartella «Diario del Ricercatore - …» del tuo Diario" if d.get("which") == "diary" else "Scegli la cartella «Diario del Ricercatore» dello studente"
+            r = subprocess.run(["osascript", "-e", 'POSIX path of (choose folder with prompt "%s")' % prompt],
                                capture_output=True, text=True, timeout=300)
             return {"path": (r.stdout or "").strip()}
         if IS_WIN:
             ps = ("Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-                  "$f.Description = 'Scegli la cartella Diario del Ricercatore dello studente'; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }")
+                  "$f.Description = '%s'; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }") % ("Scegli la cartella del tuo Diario" if d.get("which") == "diary" else "Scegli la cartella Diario del Ricercatore dello studente")
             r = subprocess.run(["powershell", "-STA", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=300)
             return {"path": (r.stdout or "").strip()}
     except (OSError, subprocess.TimeoutExpired):
@@ -2823,12 +2921,16 @@ def msg_read_all(root):
     d, out = msg_dir(root), []
     if os.path.isdir(d):
         for fn in sorted(os.listdir(d)):
-            if fn.endswith(".json") and (fn == "studente.json" or fn.startswith("supervisore-")):
+            if fn.endswith(".json") and (fn.startswith("studente") or fn.startswith("supervisore-")):
                 for m in _msg_read_file(os.path.join(d, fn)):
                     m["file"] = fn
                     out.append(m)
-    out.sort(key=lambda m: m["time"])
-    return out
+    seen, uniq = set(), []
+    for m in sorted(out, key=lambda m: m["time"]):
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            uniq.append(m)
+    return uniq
 
 
 def _same_exp(a, b):
@@ -2845,8 +2947,9 @@ def student_write_msgs(root):
     con = db()
     rows = [{"id": r["id"], "exp": r["exp_id"], "text": r["text"], "time": r["time"]} for r in con.execute("SELECT * FROM my_messages ORDER BY rowid").fetchall()]
     con.close()
-    if rows or os.path.exists(os.path.join(msg_dir(root), "studente.json")):
-        _msg_write_file(os.path.join(msg_dir(root), "studente.json"), owner_name(), "student", rows)
+    p = os.path.join(msg_dir(root), "studente-%s.json" % install_id())
+    if rows or os.path.exists(p):
+        _msg_write_file(p, owner_name(), "student", rows)
 
 
 def student_messages():
@@ -2857,11 +2960,15 @@ def student_messages():
     seen = {r["id"] for r in con.execute("SELECT id FROM msg_seen").fetchall()}
     con.close()
     root, others = student_root(), []
+    mine_ids = {m["id"] for m in mine}
     if root:
         for m in msg_read_all(root):
             if m["role"] != "student":
                 m["mine"] = False
                 m["unread"] = m["id"] not in seen
+                others.append(m)
+            elif m["id"] not in mine_ids:      # scritto da me su un altro computer
+                m["mine"] = True
                 others.append(m)
     allm = mine + others
     allm.sort(key=lambda m: m["time"])
@@ -2918,18 +3025,18 @@ def api_msg_status(d):
 
 # ---- lato supervisore
 def _sup_file(root):
-    return os.path.join(msg_dir(root), "supervisore-%s.json" % install_id())
+    return os.path.join(msg_dir(root), "supervisore-%s-%s.json" % (diary_id(), install_id()))
 
 
 def lab_messages(member, lab):
     st, root = lab_read(member)
     if not root:
         return [], None
-    mine_file = os.path.basename(_sup_file(root))
+    mine_prefix = "supervisore-%s" % diary_id()
     seen = set(lab.get("msg_seen", {}).get(member["id"], []))
     out = []
     for m in msg_read_all(root):
-        m["mine"] = m["file"] == mine_file
+        m["mine"] = m["file"].startswith(mine_prefix)
         m["unread"] = (m["role"] == "student") and m["id"] not in seen
         out.append(m)
     return out, root
@@ -2999,6 +3106,641 @@ def msg_scan():
     return out
 
 
+# ---------------- Lo stesso Diario su piu' computer (ufficio, casa…) ----------------
+# Nella cartella Drive del Diario, sottocartella «Dati»:
+#   esperimenti/<uid>.json   un file per esperimento (testo, tabelle, elenco allegati, traduzione, gruppo)
+#   gruppi/<uid>.json        un file per gruppo
+#   allegati/<uid>/<sha>_<nome>   i file allegati (mai sovrascritti: il nome contiene l'impronta del contenuto)
+#   dispositivi/<id>.json    i computer collegati a questo Diario
+#   laboratorio.json         gli studenti seguiti (supervisore)
+# Ogni computer ricorda l'ultima versione su cui era d'accordo con la cartella (tabella sync_state):
+#   cambiato solo qui -> la scrive; cambiato solo di la' -> la prende; cambiato in tutti e due -> tiene la sua
+#   e aggiunge l'altra come copia «(versione dall'altro computer)». Non si perde mai niente.
+import hashlib as _hashlib
+import platform as _platform
+
+_multi_lock = threading.RLock()
+_data_ver = {"n": 0, "changed": [], "conflicts": 0}
+_pulled_ids = {}          # id locale -> valore di «updated» scritto dall'ultima importazione
+DELETED = "DELETED"
+
+
+def diary_id():
+    cfg = load_cfg()
+    if not cfg.get("diary_id"):
+        cfg["diary_id"] = install_id()
+        save_cfg(cfg)
+    return cfg["diary_id"]
+
+
+def device_name():
+    n = s(load_cfg().get("device_name")).strip()
+    if n:
+        return n
+    try:
+        return _platform.node().split(".")[0] or "computer"
+    except Exception:
+        return "computer"
+
+
+def _uid():
+    return secrets.token_hex(10)
+
+
+def multi_migrate(con):
+    cols = [r["name"] for r in con.execute("PRAGMA table_info(experiments)")]
+    for c, typ in (("uid", "TEXT"), ("created", "TEXT"), ("num", "INTEGER"), ("origin", "TEXT")):
+        if c not in cols:
+            con.execute("ALTER TABLE experiments ADD COLUMN %s %s" % (c, typ))
+    gcols = [r["name"] for r in con.execute("PRAGMA table_info(exp_groups)")]
+    if "uid" not in gcols:
+        con.execute("ALTER TABLE exp_groups ADD COLUMN uid TEXT")
+    con.execute("CREATE TABLE IF NOT EXISTS sync_state(kind TEXT, uid TEXT, hash TEXT, PRIMARY KEY(kind, uid))")
+    con.execute("CREATE TABLE IF NOT EXISTS att_hash(path TEXT PRIMARY KEY, size INTEGER, mtime REAL, sha TEXT)")
+    ensure_uids(con)
+
+
+def ensure_uids(con):
+    me = install_id()
+    for r in con.execute("SELECT id, updated FROM experiments WHERE uid IS NULL OR uid='' OR num IS NULL OR created IS NULL OR origin IS NULL").fetchall():
+        row = con.execute("SELECT uid, num, created, origin FROM experiments WHERE id=?", (r["id"],)).fetchone()
+        con.execute("UPDATE experiments SET uid=?, num=?, created=?, origin=? WHERE id=?",
+                    (row["uid"] or _uid(), row["num"] if row["num"] is not None else r["id"], row["created"] or r["updated"] or now(),
+                     row["origin"] or me, r["id"]))
+    for r in con.execute("SELECT id FROM exp_groups WHERE uid IS NULL OR uid=''").fetchall():
+        con.execute("UPDATE exp_groups SET uid=? WHERE id=?", (_uid(), r["id"]))
+    con.commit()
+
+
+def _h(obj):
+    return _hashlib.sha1(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def file_sha(con, path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    r = con.execute("SELECT size, mtime, sha FROM att_hash WHERE path=?", (path,)).fetchone()
+    if r and r["size"] == st.st_size and abs(r["mtime"] - st.st_mtime) < 0.001:
+        return r["sha"]
+    h = _hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    sha = h.hexdigest()
+    con.execute("INSERT OR REPLACE INTO att_hash(path,size,mtime,sha) VALUES(?,?,?,?)", (path, st.st_size, st.st_mtime, sha))
+    return sha
+
+
+def _group_uid_map(con):
+    return {r["id"]: r["uid"] for r in con.execute("SELECT id, uid FROM exp_groups")}
+
+
+def local_group_records(con):
+    gm = _group_uid_map(con)
+    out = {}
+    for g in con.execute("SELECT * FROM exp_groups").fetchall():
+        rec = {"uid": g["uid"], "name": s(g["name"]), "parent": gm.get(g["parent_id"]) if g["parent_id"] is not None else None,
+               "color": s(g["color"]), "archived": 1 if g["archived"] else 0}
+        out[g["uid"]] = rec
+    return out
+
+
+def local_exp_record(con, row, gm=None):
+    gm = gm if gm is not None else _group_uid_map(con)
+    atts = []
+    for a in con.execute("SELECT filename, path FROM attachments WHERE exp_id=? ORDER BY id", (row["id"],)).fetchall():
+        sha = file_sha(con, a["path"])
+        if sha:
+            atts.append({"name": a["filename"], "sha": sha})
+    atts.sort(key=lambda a: (a["name"], a["sha"]))
+    dss = [{"title": s(x["title"]), "kind": s(x["kind"]), "payload": s(x["payload"])}
+           for x in con.execute("SELECT title, kind, payload FROM datasets WHERE exp_id=? ORDER BY id", (row["id"],)).fetchall()]
+    tr = con.execute("SELECT name, obiettivo, procedura, risultati, note FROM translations WHERE exp_id=?", (row["id"],)).fetchone()
+    return {"uid": row["uid"], "num": row["num"], "created": s(row["created"]), "origin": s(row["origin"]),
+            "name": s(row["name"]), "date": s(row["date"]), "project": s(row["project"]),
+            "obiettivo": s(row["obiettivo"]), "procedura": s(row["procedura"]), "risultati": s(row["risultati"]),
+            "note": s(row["note"]), "lang": s(row["lang"]), "group": gm.get(row["group_id"]) if row["group_id"] is not None else None,
+            "attachments": atts, "datasets": dss, "translation": dict(tr) if tr else None}
+
+
+def _rec_hash(rec):
+    return _h({k: v for k, v in rec.items() if k not in ("hash", "rev", "device", "written")})
+
+
+def data_dir(root):
+    return os.path.join(root, "Dati")
+
+
+def _read_records(folder):
+    out = {}
+    if not os.path.isdir(folder):
+        return out
+    for fn in os.listdir(folder):
+        if fn.endswith(".json"):
+            rec = read_shared_json(os.path.join(folder, fn), tries=2)
+            if isinstance(rec, dict) and rec.get("uid") == fn[:-5]:
+                out[rec["uid"]] = rec
+    return out
+
+
+def _write_record(folder, rec):
+    os.makedirs(folder, exist_ok=True)
+    rec = dict(rec)
+    rec["hash"] = DELETED if rec.get("deleted") else _rec_hash(rec)
+    rec["device"], rec["written"] = install_id(), now()
+    p = os.path.join(folder, rec["uid"] + ".json")
+    tmp = p + ".%s.tmp" % install_id()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f, ensure_ascii=False)
+    os.replace(tmp, p)
+    return rec["hash"]
+
+
+def _blob_name(a):
+    return "%s_%s" % (a["sha"][:20], safe_name(a["name"])[:80] or "file")
+
+
+def _S(con, kind, uid):
+    r = con.execute("SELECT hash FROM sync_state WHERE kind=? AND uid=?", (kind, uid)).fetchone()
+    return r["hash"] if r else None
+
+
+def _setS(con, kind, uid, h):
+    con.execute("INSERT OR REPLACE INTO sync_state(kind,uid,hash) VALUES(?,?,?)", (kind, uid, h))
+
+
+def renumber_exp(con, old, new):
+    if old == new:
+        return
+    for sql in ("UPDATE experiments SET id=? WHERE id=?", "UPDATE attachments SET exp_id=? WHERE exp_id=?",
+                "UPDATE datasets SET exp_id=? WHERE exp_id=?", "UPDATE doc_index SET exp_id=? WHERE exp_id=?",
+                "UPDATE translations SET exp_id=? WHERE exp_id=?", "UPDATE my_messages SET exp_id=? WHERE exp_id=?"):
+        con.execute(sql, (new, old))
+    if old in _pulled_ids:
+        _pulled_ids[new] = _pulled_ids.pop(old)
+
+
+def _apply_group(con, rec, gid_by_uid):
+    if rec["uid"] in gid_by_uid:
+        con.execute("UPDATE exp_groups SET name=?, color=?, archived=? WHERE id=?",
+                    (rec.get("name") or "Gruppo", rec.get("color") or PALETTE[0], 1 if rec.get("archived") else 0, gid_by_uid[rec["uid"]]))
+    else:
+        cur = con.execute("INSERT INTO exp_groups(name,parent_id,color,collapsed,archived,uid) VALUES(?,?,?,0,?,?)",
+                          (rec.get("name") or "Gruppo", None, rec.get("color") or PALETTE[0], 1 if rec.get("archived") else 0, rec["uid"]))
+        gid_by_uid[rec["uid"]] = cur.lastrowid
+
+
+def _delete_group_local(con, gid):
+    row = con.execute("SELECT parent_id FROM exp_groups WHERE id=?", (gid,)).fetchone()
+    if row:
+        con.execute("UPDATE exp_groups SET parent_id=? WHERE parent_id=?", (row["parent_id"], gid))
+        con.execute("UPDATE experiments SET group_id=? WHERE group_id=?", (row["parent_id"], gid))
+        con.execute("DELETE FROM exp_groups WHERE id=?", (gid,))
+
+
+def _delete_exp_local(con, eid):
+    paths = [r["path"] for r in con.execute("SELECT path FROM attachments WHERE exp_id=?", (eid,)).fetchall()]
+    for t in ("attachments", "datasets", "translations"):
+        con.execute("DELETE FROM %s WHERE exp_id=?" % t, (eid,))
+    con.execute("DELETE FROM experiments WHERE id=?", (eid,))
+    for p in paths:
+        if _inside(p, ATT_DIR) and not con.execute("SELECT 1 FROM attachments WHERE path=?", (p,)).fetchone():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def _apply_exp(con, rec, blobs_dir, gid_by_uid, as_copy=False):
+    """Scrive nel database locale la versione arrivata dalla cartella. False se mancano ancora dei file allegati."""
+    for a in rec.get("attachments", []):
+        if not os.path.isfile(os.path.join(blobs_dir, rec["uid"], _blob_name(a))):
+            return False
+    if rec.get("group") and rec["group"] not in gid_by_uid:
+        return False
+    row = None if as_copy else con.execute("SELECT * FROM experiments WHERE uid=?", (rec["uid"],)).fetchone()
+    gid = gid_by_uid.get(rec.get("group")) if rec.get("group") else None
+    vals = (s(rec.get("name")), s(rec.get("date")), s(rec.get("project")), s(rec.get("obiettivo")), s(rec.get("procedura")),
+            s(rec.get("risultati")), s(rec.get("note")), s(rec.get("lang")), gid)
+    stamp = now()
+    if row:
+        eid = row["id"]
+        con.execute("UPDATE experiments SET name=?,date=?,project=?,obiettivo=?,procedura=?,risultati=?,note=?,lang=?,group_id=?,updated=?,num=?,created=?,origin=? WHERE id=?",
+                    vals + (stamp, rec.get("num"), rec.get("created"), rec.get("origin"), eid))
+    else:
+        num = rec.get("num")
+        free = isinstance(num, int) and not con.execute("SELECT 1 FROM experiments WHERE id=?", (num,)).fetchone()
+        uid, origin = rec["uid"], rec.get("origin")
+        if as_copy:
+            uid, origin, free = _uid(), install_id(), False
+        cols = "name,date,project,obiettivo,procedura,risultati,note,lang,group_id,updated,uid,created,origin"
+        args = vals + (stamp, uid, rec.get("created") or stamp, origin)
+        if free:
+            con.execute("INSERT INTO experiments(id," + cols + ",num) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (num,) + args + (num,))
+            eid = num
+        else:
+            eid = con.execute("INSERT INTO experiments(" + cols + ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", args).lastrowid
+            con.execute("UPDATE experiments SET num=? WHERE id=?", (num if (isinstance(num, int) and not as_copy) else eid, eid))
+    # tabelle di dati e traduzione: si sostituiscono
+    con.execute("DELETE FROM datasets WHERE exp_id=?", (eid,))
+    for x in rec.get("datasets", []):
+        con.execute("INSERT INTO datasets(exp_id,title,kind,payload,updated) VALUES(?,?,?,?,?)", (eid, x.get("title"), x.get("kind"), x.get("payload"), stamp))
+    con.execute("DELETE FROM translations WHERE exp_id=?", (eid,))
+    tr = rec.get("translation")
+    if isinstance(tr, dict):
+        con.execute("INSERT INTO translations(exp_id,name,obiettivo,procedura,risultati,note,updated) VALUES(?,?,?,?,?,?,?)",
+                    (eid, tr.get("name"), tr.get("obiettivo"), tr.get("procedura"), tr.get("risultati"), tr.get("note"), stamp))
+    # allegati: tengo quelli uguali, aggiungo i nuovi, tolgo quelli che di la' non ci sono piu'
+    have = [(r["id"], r["filename"], r["path"]) for r in con.execute("SELECT id, filename, path FROM attachments WHERE exp_id=? ORDER BY id", (eid,)).fetchall()]
+    keep = set()
+    for a in rec.get("attachments", []):
+        hit = None
+        for aid, fn, p in have:
+            if aid not in keep and fn == a["name"] and file_sha(con, p) == a["sha"]:
+                hit = aid
+                break
+        if hit:
+            keep.add(hit)
+            continue
+        d = os.path.join(ATT_DIR, str(eid))
+        dest = os.path.join(d, a["name"])
+        if os.path.exists(dest):
+            d = os.path.join(d, a["sha"][:10])
+            dest = os.path.join(d, a["name"])
+        os.makedirs(d, exist_ok=True)
+        shutil.copyfile(os.path.join(blobs_dir, rec["uid"], _blob_name(a)), dest)
+        keep.add(con.execute("INSERT INTO attachments(exp_id,filename,path) VALUES(?,?,?)", (eid, a["name"], dest)).lastrowid)
+    for aid, fn, p in have:
+        if aid not in keep:
+            con.execute("DELETE FROM attachments WHERE id=?", (aid,))
+            if _inside(p, ATT_DIR) and not con.execute("SELECT 1 FROM attachments WHERE path=?", (p,)).fetchone():
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+    if as_copy:
+        con.execute("UPDATE experiments SET name=? WHERE id=?", (s(rec.get("name")) + " " + VERSION_ALTRO, eid))
+    _pulled_ids[eid] = con.execute("SELECT updated FROM experiments WHERE id=?", (eid,)).fetchone()["updated"]
+    return eid
+
+
+VERSION_ALTRO = "(versione dall'altro computer)"
+
+
+def _push_blobs(con, rec, blobs_dir):
+    paths = {(r["filename"]): r["path"] for r in con.execute("SELECT a.filename, a.path FROM attachments a JOIN experiments e ON e.id=a.exp_id WHERE e.uid=?", (rec["uid"],))}
+    for a in rec.get("attachments", []):
+        dst = os.path.join(blobs_dir, rec["uid"], _blob_name(a))
+        if not os.path.exists(dst) and paths.get(a["name"]):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(paths[a["name"]], dst + ".tmp")
+            os.replace(dst + ".tmp", dst)
+
+
+def multi_sync(root):
+    """Scambia esperimenti e gruppi con la cartella del Diario. Ritorna il riepilogo."""
+    out = {"presi": 0, "scritti": 0, "conflitti": 0, "in_attesa": 0}
+    dd = data_dir(root)
+    gdir, edir, bdir = os.path.join(dd, "gruppi"), os.path.join(dd, "esperimenti"), os.path.join(dd, "allegati")
+    with _multi_lock, _docs_lock:
+        con = db()
+        try:
+            ensure_uids(con)
+            changed_ids = set()
+            # ---- gruppi
+            remote_g = _read_records(gdir)
+            local_g = local_group_records(con)
+            gid_by_uid = {r["uid"]: r["id"] for r in con.execute("SELECT id, uid FROM exp_groups")}
+            to_parent = []
+            for uid in set(remote_g) | set(local_g) | {r["uid"] for r in con.execute("SELECT uid FROM sync_state WHERE kind='g'")}:
+                L, R, S = local_g.get(uid), remote_g.get(uid), _S(con, "g", uid)
+                Lh = _rec_hash(L) if L else (DELETED if S else None)
+                Rh = R.get("hash") if R else None
+                if Lh == Rh:
+                    if Lh:
+                        _setS(con, "g", uid, Lh)
+                    continue
+                remote_changed = Rh is not None and Rh != S
+                local_changed = Lh is not None and Lh != S
+                if remote_changed and not local_changed:
+                    if Rh == DELETED:
+                        if uid in gid_by_uid:
+                            _delete_group_local(con, gid_by_uid.pop(uid))
+                    else:
+                        _apply_group(con, R, gid_by_uid)
+                        to_parent.append(R)
+                    _setS(con, "g", uid, Rh)
+                    out["presi"] += 1
+                elif local_changed:
+                    # cambiato qui (o in tutti e due: per i gruppi vince questo computer)
+                    rec = {"uid": uid, "deleted": True} if Lh == DELETED else L
+                    _setS(con, "g", uid, _write_record(gdir, rec))
+                    out["scritti"] += 1
+            for R in to_parent:
+                p = gid_by_uid.get(R.get("parent")) if R.get("parent") else None
+                me = gid_by_uid.get(R["uid"])
+                if me and p != me and (p is None or p not in group_descendants(con, me)):
+                    con.execute("UPDATE exp_groups SET parent_id=? WHERE id=?", (p, me))
+            # ---- esperimenti
+            remote_e = _read_records(edir)
+            gm = _group_uid_map(con)
+            rows = {r["uid"]: r for r in con.execute("SELECT * FROM experiments").fetchall()}
+            known = {r["uid"] for r in con.execute("SELECT uid FROM sync_state WHERE kind='e'")}
+            for uid in set(remote_e) | set(rows) | known:
+                row, R, S = rows.get(uid), remote_e.get(uid), _S(con, "e", uid)
+                L = local_exp_record(con, row, gm) if row else None
+                Lh = _rec_hash(L) if L else (DELETED if S else None)
+                Rh = R.get("hash") if R else None
+                if Lh == Rh:
+                    if Lh:
+                        _setS(con, "e", uid, Lh)
+                    continue
+                remote_changed = Rh is not None and Rh != S
+                local_changed = Lh is not None and Lh != S
+                if remote_changed and not local_changed:
+                    if Rh == DELETED:
+                        if row:
+                            _delete_exp_local(con, row["id"])
+                            changed_ids.add(row["id"])
+                        _setS(con, "e", uid, Rh)
+                        out["presi"] += 1
+                    else:
+                        eid = _apply_exp(con, R, bdir, gid_by_uid)
+                        if eid is False:
+                            out["in_attesa"] += 1      # i file allegati non sono ancora arrivati: riprovo dopo
+                            continue
+                        changed_ids.add(eid)
+                        _setS(con, "e", uid, Rh)
+                        out["presi"] += 1
+                elif local_changed and remote_changed and Rh != DELETED and Lh != DELETED:
+                    # modificato su tutti e due i computer: tengo il mio e aggiungo l'altro come copia
+                    cid = _apply_exp(con, R, bdir, gid_by_uid, as_copy=True)
+                    if cid is False:
+                        out["in_attesa"] += 1
+                        continue
+                    changed_ids.add(cid)
+                    crow = con.execute("SELECT * FROM experiments WHERE id=?", (cid,)).fetchone()
+                    CL = local_exp_record(con, crow, _group_uid_map(con))
+                    _push_blobs(con, CL, bdir)
+                    _setS(con, "e", crow["uid"], _write_record(edir, CL))
+                    _push_blobs(con, L, bdir)
+                    _setS(con, "e", uid, _write_record(edir, L))
+                    out["conflitti"] += 1
+                elif local_changed and Lh == DELETED and remote_changed:
+                    eid = _apply_exp(con, R, bdir, gid_by_uid)           # cancellato qui ma cambiato di la': lo riprendo
+                    if eid is False:
+                        out["in_attesa"] += 1
+                        continue
+                    changed_ids.add(eid)
+                    _setS(con, "e", uid, Rh)
+                    out["presi"] += 1
+                elif local_changed:
+                    if Lh == DELETED:
+                        _setS(con, "e", uid, _write_record(edir, {"uid": uid, "deleted": True}))
+                    else:
+                        _push_blobs(con, L, bdir)
+                        _setS(con, "e", uid, _write_record(edir, L))
+                    out["scritti"] += 1
+            con.commit()
+            # ---- numeri: se due computer hanno dato lo stesso numero, cambia quello creato dopo (lo fa chi l'ha creato)
+            remote_e = _read_records(edir)
+            nums = {}
+            for r2 in list(remote_e.values()) + [dict(x) for x in con.execute("SELECT uid, num, created FROM experiments")]:
+                if r2.get("deleted") or r2.get("num") is None:
+                    continue
+                nums.setdefault(r2["num"], {})[r2["uid"]] = (s(r2.get("created")), r2["uid"])
+            top = max([n for n in nums if isinstance(n, int)] + [r["id"] for r in con.execute("SELECT id FROM experiments")] + [0])
+            me = install_id()
+            for r in con.execute("SELECT id, uid, num, created, origin FROM experiments WHERE origin=?", (me,)).fetchall():
+                rivals = nums.get(r["num"], {})
+                if len(rivals) > 1 and min(rivals.values()) != (s(r["created"]), r["uid"]):
+                    top += 1
+                    con.execute("UPDATE experiments SET num=? WHERE id=?", (top, r["id"]))
+                    nums.setdefault(top, {})[r["uid"]] = (s(r["created"]), r["uid"])
+                    row = con.execute("SELECT * FROM experiments WHERE id=?", (r["id"],)).fetchone()
+                    L = local_exp_record(con, row)
+                    _setS(con, "e", r["uid"], _write_record(edir, L))
+                    changed_ids.add(r["id"])
+            # ---- ogni esperimento al suo numero, se il posto e' libero
+            for r in con.execute("SELECT id, num FROM experiments WHERE num IS NOT NULL AND num<>id ORDER BY num").fetchall():
+                if not con.execute("SELECT 1 FROM experiments WHERE id=?", (r["num"],)).fetchone():
+                    renumber_exp(con, r["id"], r["num"])
+                    changed_ids.add(r["num"])
+            con.commit()
+            if changed_ids:
+                _data_ver["n"] += 1
+                _data_ver["changed"] = sorted(changed_ids)[-200:]
+                _data_ver["conflicts"] += out["conflitti"]
+                docs_kick()
+        finally:
+            con.close()
+    # questo computer e' collegato a questo Diario
+    try:
+        os.makedirs(os.path.join(dd, "dispositivi"), exist_ok=True)
+        with open(os.path.join(dd, "dispositivi", install_id() + ".json"), "w", encoding="utf-8") as f:
+            json.dump({"id": install_id(), "name": device_name(), "system": _platform.system(), "last": now(), "version": APP_VERSION}, f, ensure_ascii=False)
+    except OSError:
+        pass
+    lab_members_sync(dd)
+    return out
+
+
+def remote_signature(root):
+    """Impronta veloce della cartella «Dati»: cambia quando l'altro computer scrive qualcosa."""
+    sig = []
+    for sub in ("esperimenti", "gruppi"):
+        d = os.path.join(data_dir(root), sub)
+        try:
+            for e in os.scandir(d):
+                if e.name.endswith(".json"):
+                    st = e.stat()
+                    sig.append((sub, e.name, st.st_size, int(st.st_mtime)))
+        except OSError:
+            pass
+    return _h(sorted(sig))
+
+
+# ---- studenti seguiti (supervisore): gli stessi su tutti i computer
+def _student_key(path):
+    r = lab_root(path)
+    mk = _mark_read(r) if r else None
+    return (mk or {}).get("diary_id") or (mk or {}).get("install_id") if mk else None
+
+
+def lab_members_sync(dd):
+    base = sync_base()
+    p = os.path.join(dd, "laboratorio.json")
+    remote = read_shared_json(p, tries=1) if os.path.exists(p) else None
+    remote = remote if isinstance(remote, dict) else {}
+    lab = lab_cfg()
+    removed = dict(lab.get("removed") or {}) if isinstance(lab.get("removed"), dict) else {}
+    for k, ts in (remote.get("removed") or {}).items():
+        if s(ts) > s(removed.get(k)):
+            removed[k] = s(ts)
+    changed = False
+    for m in lab["members"]:
+        if not m.get("key"):
+            k = _student_key(m.get("path"))
+            if k:
+                m["key"], changed = k, True
+        if not m.get("added"):
+            m["added"], changed = "2000-01-01T00:00:00", True
+    bykey = {m["key"]: m for m in lab["members"] if m.get("key")}
+    for rm in remote.get("members", []):
+        k = rm.get("key")
+        if not k:
+            continue
+        if k in bykey:
+            if s(rm.get("added")) > s(bykey[k].get("added")):
+                bykey[k]["added"], changed = s(rm.get("added")), True
+            continue
+        path = os.path.join(base, *s(rm.get("rel")).split("/")) if (base and rm.get("rel")) else s(rm.get("path"))
+        mid = "m%d" % (max([int(m["id"][1:]) for m in lab["members"] if m["id"][1:].isdigit()] + [0]) + 1)
+        m = {"id": mid, "name": rm.get("name", ""), "path": path, "color": rm.get("color", LAB_COLORS[0]), "key": k, "added": s(rm.get("added"))}
+        lab["members"].append(m)
+        bykey[k] = m
+        changed = True
+    keep = [m for m in lab["members"] if not (m.get("key") and s(removed.get(m["key"])) >= s(m.get("added")) and removed.get(m["key"]))]
+    if len(keep) != len(lab["members"]) or removed != (lab.get("removed") if isinstance(lab.get("removed"), dict) else {}):
+        changed = True
+    lab["members"], lab["removed"] = keep, removed
+    if changed:
+        lab_save(lab)
+    out = {"members": [], "removed": removed}
+    for m in lab["members"]:
+        if not m.get("key"):
+            continue
+        rel = ""
+        try:
+            if base and _inside(os.path.expanduser(m["path"]), base):
+                rel = os.path.relpath(os.path.expanduser(m["path"]), base).replace(os.sep, "/")
+        except (OSError, ValueError):
+            rel = ""
+        out["members"].append({"key": m["key"], "name": m.get("name", ""), "color": m.get("color", ""), "rel": rel, "path": m.get("path", ""), "added": m.get("added", "")})
+    if out != {k: remote.get(k) for k in ("members", "removed")}:
+        try:
+            tmp = p + ".%s.tmp" % install_id()
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+            os.replace(tmp, p)
+        except OSError:
+            pass
+
+
+# ---- collegare questo computer a un Diario che esiste gia' (su un altro computer)
+def _find_diary_folder(path):
+    p = os.path.expanduser(s(path).strip())
+    if not os.path.isdir(p):
+        raise RuntimeError("La cartella indicata non esiste su questo computer.")
+    if _mark_read(p):
+        return p
+    found = []
+    try:
+        for fn in sorted(os.listdir(p)):
+            c = os.path.join(p, fn)
+            if fn.startswith(DRIVE_SUBDIR) and os.path.isdir(c) and _mark_read(c):
+                found.append(c)
+    except OSError:
+        pass
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        raise RuntimeError("Qui ci sono piu' Diari (%s): scegli proprio la cartella del tuo." % ", ".join(os.path.basename(x) for x in found[:4]))
+    raise RuntimeError("In questa cartella non c'e' un Diario. Scegli la cartella «Diario del Ricercatore - …» che il Diario dell'altro computer ha creato in Google Drive.")
+
+
+def api_multi_info(d):
+    root = drive_root(create=False) if sync_base() else None
+    devs = []
+    if root:
+        dd = os.path.join(data_dir(root), "dispositivi")
+        if os.path.isdir(dd):
+            for fn in sorted(os.listdir(dd)):
+                x = read_shared_json(os.path.join(dd, fn), tries=1) if fn.endswith(".json") else None
+                if isinstance(x, dict):
+                    devs.append({"name": x.get("name", ""), "system": x.get("system", ""), "last": x.get("last", ""), "me": x.get("id") == install_id()})
+    return {"device": device_name(), "folder": os.path.basename(root) if root else "", "devices": devs, "sync": bool(sync_base()),
+            "time": _sync_state.get("time", ""), "error": _sync_state.get("error", "")}
+
+
+def api_device_name(d):
+    cfg = load_cfg()
+    cfg["device_name"] = s(d.get("name")).strip()[:40]
+    save_cfg(cfg)
+    return {}
+
+
+def _restore_from_backup(folder):
+    """Diario di una versione vecchia (senza «Dati»): rimette qui il database della copia di sicurezza e gli allegati."""
+    bk = os.path.join(folder, "Backup", "diario.db")
+    tmp = DB_PATH + ".ripristino"
+    shutil.copyfile(bk, tmp)
+    src = sqlite3.connect(tmp)
+    src.row_factory = sqlite3.Row
+    old_paths = [(r["id"], r["path"]) for r in src.execute("SELECT id, path FROM attachments")]
+    src.close()
+    con = db()
+    con.close()
+    os.replace(tmp, DB_PATH)
+    init_db()
+    con = db()
+    for aid, p in old_paths:
+        parts = re.split(r"[\\/]+", s(p))
+        rel = parts[-2:] if len(parts) >= 2 else parts
+        srcf = os.path.join(folder, "Backup", "allegati", *rel)
+        dest = os.path.join(ATT_DIR, *rel)
+        if os.path.isfile(srcf):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copyfile(srcf, dest)
+        con.execute("UPDATE attachments SET path=? WHERE id=?", (dest, aid))
+    con.commit()
+    con.close()
+
+
+def api_link_diary(d):
+    folder = _find_diary_folder(d.get("path"))
+    mk = _mark_read(folder) or {}
+    did = mk.get("diary_id") or mk.get("install_id")
+    if not did:
+        raise RuntimeError("Il segno di questo Diario non si legge: riprova tra un minuto.")
+    if did == diary_id():
+        return {"already": True, "folder": os.path.basename(folder)}
+    con = db()
+    n_local = con.execute("SELECT COUNT(*) FROM experiments").fetchone()[0]
+    con.close()
+    has_data = os.path.isdir(os.path.join(folder, "Dati", "esperimenti"))
+    if not has_data:
+        if not os.path.isfile(os.path.join(folder, "Backup", "diario.db")):
+            raise RuntimeError("In quel Diario non ci sono ancora dati da prendere: aggiorna il Diario sull'altro computer e premi «Sincronizza con Drive», poi riprova.")
+        if n_local and not d.get("force"):
+            raise RuntimeError("Quel Diario e' di una versione vecchia. Aggiorna il Diario sull'altro computer e premi «Sincronizza con Drive», poi riprova. (Se l'altro computer non c'e' piu', usa questa funzione su un Diario ancora vuoto.)")
+    with _multi_lock:
+        cfg = load_cfg()
+        cfg["sync_dir"] = os.path.dirname(folder)
+        cfg["diary_id"] = did
+        cfg["drive_folder"] = os.path.basename(folder)
+        if not s(cfg.get("owner_name")).strip() and mk.get("owner"):
+            cfg["owner_name"] = mk["owner"]
+        save_cfg(cfg)
+        _root_cache.update({"t": 0.0, "root": None})
+        con = db()
+        con.execute("DELETE FROM sync_state")
+        con.commit()
+        con.close()
+        restored = False
+        if not has_data:
+            _restore_from_backup(folder)
+            restored = True
+    res = sync_to_drive()
+    return {"folder": os.path.basename(folder), "restored": restored, "added_local": n_local, "esperimenti": res.get("esperimenti")}
+
+
+def api_sync_ver(d):
+    return {"ver": _data_ver["n"], "changed": _data_ver["changed"], "conflicts": _data_ver["conflicts"]}
+
+
 def sync_to_drive():
     """Copia nella cartella Drive: un Word per ogni esperimento + copia di sicurezza di database e allegati."""
     base = sync_base()
@@ -3010,6 +3752,12 @@ def sync_to_drive():
         root = drive_root()
         if not root or not _is_my_root(root):
             raise RuntimeError("Non riesco a preparare la mia cartella dentro Google Drive.")
+        try:
+            multi = multi_sync(root)
+        except Exception as ex:
+            multi = {"errore": str(ex)}
+        _sync_state["multi"] = multi
+        _sync_state["remote_sig"] = remote_signature(root)
         dir_bak = os.path.join(root, "Backup")
         os.makedirs(dir_bak, exist_ok=True)
         # 1) copia coerente del database (anche mentre il Diario e' in uso)
@@ -3038,7 +3786,7 @@ def sync_to_drive():
         rows = con.execute("SELECT id FROM experiments").fetchall()
         con.close()
         _sync_state.update({"time": now(), "error": "", "last_ts": time.time()})
-        return {"documenti": n_doc, "allegati": n_att, "esperimenti": len(rows), "cartella": root}
+        return {"documenti": n_doc, "allegati": n_att, "esperimenti": len(rows), "cartella": root, "altri_computer": multi}
     except Exception as ex:
         _sync_state["error"] = str(ex)
         raise
@@ -3057,10 +3805,17 @@ def api_drive_sync(d):
 
 def auto_sync_loop():
     """Ogni minuto, se la cartella Drive e' impostata e ci sono modifiche, sincronizza da sola."""
+    n = 0
     while True:
-        time.sleep(60)
+        time.sleep(20)
+        n += 1
         try:
-            if sync_base() and os.path.getmtime(DB_PATH) > _sync_state["last_ts"]:
+            if not sync_base():
+                continue
+            local = os.path.getmtime(DB_PATH) > _sync_state["last_ts"] and n % 3 == 0
+            root = drive_root(create=False)
+            remote = bool(root) and remote_signature(root) != _sync_state.get("remote_sig")
+            if local or remote or n % 15 == 0:
                 sync_to_drive()
         except Exception:
             pass
@@ -3181,7 +3936,7 @@ def api_set_keys(d):
 ROUTES = {
     "/api/list": api_list, "/api/get": api_get, "/api/new": api_new, "/api/save": api_save,
     "/api/delete": api_delete, "/api/att_open": api_att_open, "/api/att_reveal": api_att_reveal,
-    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/docs_reorganize": api_docs_reorganize, "/api/docs_open": api_docs_open, "/api/translate": api_translate, "/api/tr_save": api_tr_save, "/api/merge": api_merge, "/api/lab_get": api_lab_get, "/api/lab_thread": api_lab_thread, "/api/lab_send": api_lab_send, "/api/msg_thread": api_msg_thread, "/api/msg_send": api_msg_send, "/api/msg_status": api_msg_status, "/api/lab_name": api_lab_name, "/api/lab_add": api_lab_add, "/api/lab_remove": api_lab_remove, "/api/lab_exp": api_lab_exp, "/api/lab_seen": api_lab_seen, "/api/lab_open": api_lab_open, "/api/pick_folder": api_pick_folder, "/api/ui_lang": api_ui_lang, "/api/update_check": api_update_check, "/api/update_apply": api_update_apply, "/api/shortcut": api_shortcut, "/api/projects": api_projects, "/api/ping": api_ping, "/api/quit": api_quit, "/api/sector_set": api_sector_set,
+    "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/docs_reorganize": api_docs_reorganize, "/api/docs_open": api_docs_open, "/api/translate": api_translate, "/api/tr_save": api_tr_save, "/api/merge": api_merge, "/api/lab_get": api_lab_get, "/api/multi_info": api_multi_info, "/api/device_name": api_device_name, "/api/link_diary": api_link_diary, "/api/sync_ver": api_sync_ver, "/api/lab_thread": api_lab_thread, "/api/lab_send": api_lab_send, "/api/msg_thread": api_msg_thread, "/api/msg_send": api_msg_send, "/api/msg_status": api_msg_status, "/api/lab_name": api_lab_name, "/api/lab_add": api_lab_add, "/api/lab_remove": api_lab_remove, "/api/lab_exp": api_lab_exp, "/api/lab_seen": api_lab_seen, "/api/lab_open": api_lab_open, "/api/pick_folder": api_pick_folder, "/api/ui_lang": api_ui_lang, "/api/update_check": api_update_check, "/api/update_apply": api_update_apply, "/api/shortcut": api_shortcut, "/api/projects": api_projects, "/api/ping": api_ping, "/api/quit": api_quit, "/api/sector_set": api_sector_set,
     "/api/ds_list": api_ds_list, "/api/ds_save": api_ds_save, "/api/ds_delete": api_ds_delete, "/api/ai": api_ai, "/api/key_status": api_key_status,
     "/api/set_keys": api_set_keys, "/api/export": api_export,
     "/api/chemdraw_open": api_chemdraw_open, "/api/chemdraw_set": api_chemdraw_set,
@@ -3539,6 +4294,7 @@ table.plate input{width:46px;border:1px solid #E5E7EB;border-radius:5px;padding:
     </div>
     <div hidden>
     <button class="btn ghost" id="btnUpdate">⬆️ Cerca aggiornamenti</button>
+    <button class="btn ghost" id="btnMulti">💻 Usa su più computer</button>
     <button class="btn ghost" id="btnSector">🧭 Settore</button>
     <button class="btn ghost" id="btnSync" title="Salva Word e copia di sicurezza nella cartella di Google Drive">☁️ Sincronizza con Drive</button>
     <button class="btn ghost" id="btnMerge" title="Crea un unico Word con tutti gli esperimenti di un gruppo o di un progetto">📚 Documento di progetto</button>
@@ -4199,7 +4955,30 @@ const EN_PAIRS = [
 ["Questa e' la TUA cartella del Diario, non quella dello studente. Scegli la cartella che lo studente ha condiviso con te.", "This is YOUR Diary folder, not the student's. Choose the folder the student shared with you."],
 ["Questa cartella e' gia' collegata allo studente «", "This folder is already connected to the student «"],
 ["In questa cartella ci sono i Diari di piu' persone: apri e scegli proprio la cartella dello studente (", "This folder contains the Diaries of several people: open it and choose the student's own folder ("],
-["Non riesco a preparare la mia cartella dentro Google Drive.", "I cannot prepare my folder inside Google Drive."]
+["Non riesco a preparare la mia cartella dentro Google Drive.", "I cannot prepare my folder inside Google Drive."],
+["💻 Usa su più computer", "💻 Use on several computers"],
+["💻 Il Diario su più computer", "💻 The Diary on several computers"],
+["Puoi usare lo stesso Diario su più computer (per esempio in ufficio e a casa). Gli esperimenti, i gruppi, le tabelle e gli allegati passano da un computer all'altro attraverso la tua cartella in Google Drive, circa un minuto dopo ogni modifica.", "You can use the same Diary on several computers (for example at the office and at home). Experiments, groups, tables and attachments move from one computer to the other through your Google Drive folder, about a minute after each change."],
+["Questo computer", "This computer"],
+["es. Ufficio, Casa", "e.g. Office, Home"],
+["La tua cartella in Google Drive:", "Your folder in Google Drive:"],
+["Questo computer non è ancora collegato a Google Drive. Per usare un Diario che hai già su un altro computer, scegli qui sotto la sua cartella.", "This computer is not connected to Google Drive yet. To use a Diary you already have on another computer, choose its folder below."],
+["Computer che usano questo Diario", "Computers using this Diary"],
+["(questo)", "(this one)"],
+["🔗 Usare qui un Diario che hai su un altro computer", "🔗 Use here a Diary you have on another computer"],
+["1) Sull'altro computer aggiorna il Diario e premi «☁️ Sincronizza con Drive». 2) Su questo computer installa Google Drive per desktop con lo stesso account. 3) Qui scegli la cartella «Diario del Ricercatore - …» dell'altro computer (in «Il mio Drive») e premi «Collega».", "1) On the other computer update the Diary and press \"☁️ Sync with Drive\". 2) On this computer install Google Drive for desktop with the same account. 3) Here choose the other computer's \"Diario del Ricercatore - …\" folder (in \"My Drive\") and press \"Connect\"."],
+["Cartella «Diario del Ricercatore - …» in Google Drive", "\"Diario del Ricercatore - …\" folder in Google Drive"],
+["🔗 Collega", "🔗 Connect"],
+["Se modifichi lo stesso esperimento su due computer prima che si siano sincronizzati, il Diario tiene tutte e due le versioni: una si chiamerà «… (versione dall'altro computer)». Controllala e cancella quella che non ti serve.", "If you edit the same experiment on two computers before they have synced, the Diary keeps both versions: one will be called \"… (versione dall'altro computer)\". Check it and delete the one you don't need."],
+["Scegli prima la cartella del Diario con «Sfoglia».", "First choose the Diary folder with \"Browse\"."],
+["Collego questo computer a quel Diario? Gli esperimenti già presenti su questo computer verranno aggiunti a quel Diario (non si perde niente).", "Connect this computer to that Diary? The experiments already on this computer will be added to that Diary (nothing is lost)."],
+["🔗 Collego e scarico gli esperimenti…", "🔗 Connecting and downloading experiments…"],
+["✅ Questo computer è già collegato a quel Diario.", "✅ This computer is already connected to that Diary."],
+["Collegato a", "Connected to"],
+["Un esperimento è stato modificato su due computer: trovi l'altra versione nell'elenco come «(versione dall'altro computer)».", "An experiment was edited on two computers: you will find the other version in the list as \"(versione dall'altro computer)\"."],
+["Mentre scrivevi è arrivata una versione di questo esperimento dall'altro computer: l'ho tenuta come copia «(versione dall'altro computer)».", "While you were writing, a version of this experiment arrived from the other computer: I kept it as a copy \"(versione dall'altro computer)\"."],
+["In questa cartella non c'e' un Diario. Scegli la cartella «Diario del Ricercatore - …» che il Diario dell'altro computer ha creato in Google Drive.", "There is no Diary in this folder. Choose the \"Diario del Ricercatore - …\" folder that the Diary on the other computer created in Google Drive."],
+["In quel Diario non ci sono ancora dati da prendere: aggiorna il Diario sull'altro computer e premi «Sincronizza con Drive», poi riprova.", "That Diary has no data to fetch yet: update the Diary on the other computer and press \"Sync with Drive\", then try again."]
 ];
 const EN_MAP = new Map(EN_PAIRS);
 const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(=]\s?$|^\s|\s$|^[;,(]/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
@@ -4327,6 +5106,7 @@ function autosize(t) {
 
 function collect() {
   const o = { id: curId, name: $("name").value, date: $("date").value, project: $("project").value, lang: $("lang").value };
+  if (curExp && !viewEN) { o.uid = curExp.uid; o.base = curExp.updated; }
   SECTIONS.forEach(s => { o[s[0]] = $("sec_" + s[0]).value; });
   return o;
 }
@@ -4352,8 +5132,13 @@ async function setView(en) {
 async function saveNow() {
   clearTimeout(saveTimer);
   if (curId == null) return;
-  await api(viewEN ? "tr_save" : "save", collect());
+  const r = await api(viewEN ? "tr_save" : "save", collect());
   dirty = false;
+  if (!viewEN && r && curExp) {
+    if (r.updated) curExp.updated = r.updated;
+    if (r.id && r.id !== curId) curId = r.id;
+    if (r.conflict_copy) status("⚠️ " + tx("Mentre scrivevi è arrivata una versione di questo esperimento dall'altro computer: l'ho tenuta come copia «(versione dall'altro computer)»."), 15000);
+  }
   status("✅ Salvato", 2000);
   await loadList();
 }
@@ -4948,6 +5733,63 @@ async function openLab(selId) {
     if (m) drawMember(m); else { sel = null; drawBoard(); }
   };
   draw();
+}
+
+// ---------- Il Diario su piu' computer ----------
+async function openMulti() {
+  let info = {};
+  try { info = await api("multi_info", {}); } catch (e) { return fail(e); }
+  const dev = h("input", { type: "text", placeholder: "es. Ufficio, Casa", style: "max-width:240px" }); dev.value = info.device || "";
+  const path = h("input", { type: "text", placeholder: "Cartella «Diario del Ricercatore - …» in Google Drive", style: "flex:1" });
+  const pick = h("button", { class: "btn grey", onclick: async () => { try { const r = await api("pick_folder", { which: "diary" }); if (r.path) path.value = r.path; } catch (e) { fail(e); } } }, "📂 Sfoglia…");
+  const link = h("button", { class: "btn violet", onclick: async () => {
+    if (!path.value.trim()) { alert(tx("Scegli prima la cartella del Diario con «Sfoglia».")); return; }
+    if (!confirm(tx("Collego questo computer a quel Diario? Gli esperimenti già presenti su questo computer verranno aggiunti a quel Diario (non si perde niente)."))) return;
+    link.disabled = true;
+    try {
+      if (dirty) await saveNow();
+      status(tx("🔗 Collego e scarico gli esperimenti…"));
+      const r = await api("link_diary", { path: path.value });
+      bg.remove();
+      await loadList();
+      status(r.already ? tx("✅ Questo computer è già collegato a quel Diario.") : "✅ " + tx("Collegato a") + " «" + r.folder + "» · " + (r.esperimenti || 0) + " " + tx("esperimenti"), 9000);
+    } catch (e) { status(""); fail(e); } finally { link.disabled = false; }
+  } }, "🔗 Collega");
+  const ago = t => t ? agoText(t) : "–";
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, "💻 Il Diario su più computer"),
+    h("div", { class: "hint" }, "Puoi usare lo stesso Diario su più computer (per esempio in ufficio e a casa). Gli esperimenti, i gruppi, le tabelle e gli allegati passano da un computer all'altro attraverso la tua cartella in Google Drive, circa un minuto dopo ogni modifica."),
+    h("div", { class: "keyrow" }, h("b", null, "Questo computer")),
+    h("div", { class: "dsopt" }, dev, h("button", { class: "btn grey small", onclick: async () => { try { await api("device_name", { name: dev.value }); status("✅ " + tx("Salvato"), 2000); } catch (e) { fail(e); } } }, "Salva")),
+    info.folder ? h("div", { class: "hint" }, tx("La tua cartella in Google Drive:") + " «" + info.folder + "»") : h("div", { class: "warn", style: "font-size:13px" }, "Questo computer non è ancora collegato a Google Drive. Per usare un Diario che hai già su un altro computer, scegli qui sotto la sua cartella."),
+    info.devices && info.devices.length ? h("div", null, h("div", { class: "keyrow" }, h("b", null, "Computer che usano questo Diario")),
+      info.devices.map(x => h("div", { class: "muted" }, "💻 " + (x.name || "?") + (x.system ? " · " + x.system : "") + " · " + tx("ultima sincronizzazione") + " " + ago(x.last) + (x.me ? " · " + tx("(questo)") : "")))) : null,
+    h("div", { class: "keyrow" }, h("b", null, "🔗 Usare qui un Diario che hai su un altro computer")),
+    h("div", { class: "hint" }, "1) Sull'altro computer aggiorna il Diario e premi «☁️ Sincronizza con Drive». 2) Su questo computer installa Google Drive per desktop con lo stesso account. 3) Qui scegli la cartella «Diario del Ricercatore - …» dell'altro computer (in «Il mio Drive») e premi «Collega»."),
+    h("div", { class: "dsopt" }, path, pick, link),
+    h("div", { class: "hint" }, "Se modifichi lo stesso esperimento su due computer prima che si siano sincronizzati, il Diario tiene tutte e due le versioni: una si chiamerà «… (versione dall'altro computer)». Controllala e cancella quella che non ti serve."),
+    info.error ? h("div", { class: "warn", style: "font-size:13px" }, tx("Ultimo errore di sincronizzazione: ") + info.error) : null,
+    h("div", { class: "btns" }, h("button", { class: "btn grey", onclick: () => bg.remove() }, "Chiudi"))
+  ]);
+}
+// arrivano modifiche dall'altro computer: aggiorno elenco ed esperimento aperto
+let syncVer = null, syncConf = 0;
+async function syncPoll() {
+  let v;
+  try { v = await api("sync_ver", {}); } catch (e) { return; }
+  if (syncVer === null) { syncVer = v.ver; syncConf = v.conflicts; return; }
+  if (v.ver === syncVer) return;
+  syncVer = v.ver;
+  await loadList().catch(() => {});
+  if (v.conflicts > syncConf) {
+    syncConf = v.conflicts;
+    status("⚠️ " + tx("Un esperimento è stato modificato su due computer: trovi l'altra versione nell'elenco come «(versione dall'altro computer)»."), 15000);
+  }
+  if (curId == null || dirty || !curExp) return;
+  try {
+    const d = await api("get", { id: curId, uid: curExp.uid });
+    if (d.exp.updated !== curExp.updated || d.exp.id !== curId) await openExp(d.exp.id);
+  } catch (e) { await loadList().catch(() => {}); }
 }
 
 async function openMerge(gid) {
@@ -6481,6 +7323,8 @@ function build() {
   };
   setInterval(() => { fetch("/api/ping").catch(() => {}); }, 60000);
   $("btnMerge").onclick = () => openMerge(null);
+  $("btnMulti").onclick = () => openMulti().catch(fail);
+  setInterval(syncPoll, 15000); syncPoll();
   $("btnView").onclick = () => setView(!viewEN).catch(fail);
   $("btnLab").onclick = () => openLab(null).catch(fail);
   labBadge(); setInterval(labBadge, 60000);
@@ -6516,7 +7360,7 @@ function build() {
   setTimeout(() => { api("update_check", {}).then(d => { if (d.available) askUpdate(); }).catch(() => {}); }, 2500);
   const viaBtn = id => [$(id).textContent, () => $(id).click()];
   $("btnMenuDocs").onclick = ev => openGroupMenu(ev, ["btnDocs", "btnMerge", "btnSync", "btnReorg"].map(viaBtn), null);
-  $("btnMenuSet").onclick = ev => openGroupMenu(ev, ["btnSector", "btnKey", "btnUiLang", "btnShortcut", "btnUpdate"].map(viaBtn), null);
+  $("btnMenuSet").onclick = ev => openGroupMenu(ev, ["btnSector", "btnKey", "btnMulti", "btnUiLang", "btnShortcut", "btnUpdate"].map(viaBtn), null);
   $("btnUiLang").textContent = UI_LANG === "en" ? "🌐 Italiano" : "🌐 English";
   $("btnLangTop").textContent = UI_LANG === "en" ? "🇮🇹 Italiano" : "🇬🇧 English";
   $("btnLangTop").onclick = () => $("btnUiLang").click();

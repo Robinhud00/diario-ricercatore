@@ -106,6 +106,19 @@ Nella card **Allegati**, il pulsante **🧪 Disegna molecola** apre un editor di
 
 L'editor si carica da internet (jsme-editor.github.io). **Per usarlo anche offline:** scarica JSME dal suo sito, decomprimilo e metti la cartella `jsme` (quella che contiene `jsme.nocache.js`) accanto a `diario_web.py`: viene usata in automatico. La cartella `jsme/` è esclusa da git.
 
+## 🔎 Questa reazione è già stata fatta?
+Nella card **Allegati**, il pulsante **🔎 Reazione già fatta?** raccoglie le sostanze dell'esperimento:
+- dalla tabella **Reagenti e rese** (nomi e ruoli);
+- dai file **ChemDraw** allegati (`.cdxml`, `.cdx`, anche quelli incollati con ⌘V/Ctrl+V) e dai `.mol`/`.sdf` del «Disegna molecola»: le strutture vengono lette dal Diario, trasformate in SMILES e il ruolo (reagente, prodotto, reagente sopra la freccia) viene preso dallo schema di reazione o dalla posizione delle frecce. Le abbreviazioni (OMe, Boc…) vengono espanse se ChemDraw le ha salvate; altrimenti in ChemDraw usa tasto destro → *Expand Label*;
+- dalle **immagini** allegate, solo se vuoi: l'AI scelta (Claude o Gemini) legge le strutture disegnate. Va sempre controllato il risultato.
+
+Ogni sostanza viene riconosciuta su **PubChem** (nome IUPAC, formula, CID). Poi il Diario cerca:
+- **nel tuo Diario** gli esperimenti con le stesse sostanze («stessa reazione» se ci sono prodotto e reagenti);
+- in **PubMed** gli articoli che citano insieme prodotto e reagenti, e nei **brevetti**; se il prodotto è nuovo (non in PubChem) usa le molecole più simili, per trovare reazioni simili;
+- con un clic su Google Scholar, Google Patents, Reaxys e SciFinder (il pulsante copia lo SMILES della reazione da incollare nei loro editor).
+
+Con «📝 Aggiungi i nomi IUPAC alle Note» i nomi finiscono nell'esperimento (e nel Word). Serve la connessione a internet; le risposte di PubChem restano in memoria per non ripetere le richieste.
+
 ## ☁️ Google Drive (sincronizzazione e backup)
 Serve l'app **Google Drive per desktop**: crea una cartella sincronizzata (Mac: di solito `~/Library/CloudStorage/GoogleDrive-…/Il mio Drive`; Windows: un'unità tipo `G:\Il mio Drive`). In «🔑 Chiavi API e impostazioni» → **Cartella di Google Drive** premi «🔎 Cerca Google Drive» (o scrivi il percorso) e salva.
 
@@ -120,7 +133,7 @@ Al primo avvio scegli il tuo settore (anche più di uno); il pulsante **🧭 Set
 
 | Settore | Strumenti |
 |---|---|
-| **Chimica (sintesi)** | Reagenti e rese (mmol, equivalenti, concentrazione, resa dal reagente limitante), scheda di caratterizzazione (aspetto, p.f., Rf, NMR, MS, HPLC, IR, [α]D), **lastra TLC** (numero di macchie e Rf di ognuna, disegnata e allegabile al Word), disegno molecole e ChemDraw |
+| **Chimica (sintesi)** | Reagenti e rese (mmol, equivalenti, concentrazione, resa dal reagente limitante), scheda di caratterizzazione (aspetto, p.f., Rf, NMR, MS, HPLC, IR, [α]D), **lastra TLC** (numero di macchie, Rf ed etichetta di ognuna, macchie trascinabili; la lastra si allarga in base al numero di corsie; disegnata e allegabile al Word), disegno molecole e ChemDraw |
 | **Farmacologia / biochimica** | Dose-risposta con IC50/EC50 e intervallo di confidenza al 95% (fit a 4 parametri), cinetica enzimatica (Km, Vmax), scheda del saggio, confronto tra gruppi |
 | **Biologia molecolare e cellulare** | Piastra a 96 pozzetti (layout e valori, sottrazione del bianco, normalizzazione, test), qPCR (ΔCt, ΔΔCt, fold change), scheda campioni e reagenti (linea cellulare, anticorpi e lotti) |
 | **Microbiologia** | Conte CFU (30-300 colonie, diluizioni), MIC, curva di crescita (tempo di raddoppio), scheda ceppo e condizioni |
@@ -159,7 +172,7 @@ L'AI è istruita a non inventare dati e a segnalare con [da completare: …] ci�
 - `legacy/diario_finestra_nativa.py` — vecchia versione con finestra nativa (richiede `customtkinter`); non più mantenuta.
 
 ## Prove automatiche
-`python3 tests/test_sync.py` prova la sincronizzazione con una cartella Drive finta; `python3 tests/test_windows.py` prova le parti che cambiano tra Mac e Windows (simulate). Lavorano in cartelle temporanee e non toccano i tuoi dati.
+`python3 tests/test_sync.py` prova la sincronizzazione con una cartella Drive finta; `python3 tests/test_windows.py` prova le parti che cambiano tra Mac e Windows (simulate). `python3 tests/test_chimica.py` prova la lettura delle strutture ChemDraw/MOL e la ricerca delle reazioni (PubChem simulato). Lavorano in cartelle temporanee e non toccano i tuoi dati.
 
 ## Licenza
 MIT — vedi il file `LICENSE`.

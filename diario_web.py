@@ -42,7 +42,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.17.4"
+APP_VERSION = "2026.11.18.1"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -1973,7 +1973,7 @@ def api_quit(d):
     return {"ok": True}
 
 
-READONLY_ROUTES = {"/api/multi_info", "/api/sync_ver", "/api/lab_thread", "/api/lab_send", "/api/msg_thread", "/api/msg_status", "/api/lab_get", "/api/lab_add", "/api/lab_remove", "/api/lab_exp", "/api/lab_seen", "/api/lab_open", "/api/pick_folder", "/api/update_check", "/api/update_apply", "/api/ui_lang", "/api/shortcut", "/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
+READONLY_ROUTES = {"/api/chem_detect", "/api/chem_identify", "/api/chem_image", "/api/multi_info", "/api/sync_ver", "/api/lab_thread", "/api/lab_send", "/api/msg_thread", "/api/msg_status", "/api/lab_get", "/api/lab_add", "/api/lab_remove", "/api/lab_exp", "/api/lab_seen", "/api/lab_open", "/api/pick_folder", "/api/update_check", "/api/update_apply", "/api/ui_lang", "/api/shortcut", "/api/projects", "/api/ping", "/api/quit", "/api/get", "/api/list", "/api/tree", "/api/key_status", "/api/ds_list", "/api/ai", "/api/clip_paste_probe"}
 
 
 def docs_kick():
@@ -3821,6 +3821,1000 @@ def auto_sync_loop():
             pass
 
 
+# ---------------- Chimica: strutture -> SMILES -> nome IUPAC, ricerca della reazione ----------------
+import struct as _struct
+import base64 as _b64
+import xml.etree.ElementTree as _ET
+
+ELEMENTS = ("* H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr "
+            "Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu "
+            "Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U").split()
+EL_NUM = {e: i for i, e in enumerate(ELEMENTS)}
+ORGANIC = {"B": (3,), "C": (4,), "N": (3, 5), "O": (2,), "P": (3, 5), "S": (2, 4, 6), "F": (1,), "Cl": (1,), "Br": (1,), "I": (1,)}
+AROM_OK = {"B", "C", "N", "O", "P", "S"}
+NODE_TYPES = {0: "Unspecified", 1: "Element", 2: "ElementList", 3: "ElementListNickname", 4: "Nickname", 5: "Fragment",
+              6: "Formula", 7: "GenericNickname", 8: "AnonymousAlternativeGroup", 9: "NamedAlternativeGroup",
+              10: "MultiAttachment", 11: "VariableAttachment", 12: "ExternalConnectionPoint", 13: "LinkNode"}
+GENERIC_NODES = {"ElementList", "ElementListNickname", "GenericNickname", "AnonymousAlternativeGroup",
+                 "NamedAlternativeGroup", "MultiAttachment", "VariableAttachment", "LinkNode"}
+ROLE_IT = {"reactant": "Reagente", "product": "Prodotto", "reagent": "Catalizzatore / additivo",
+           "intermediate": "Intermedio", "unknown": ""}
+
+
+class _Obj(object):
+    __slots__ = ("tag", "id", "a", "kids")
+
+    def __init__(self, tag, oid=None):
+        self.tag, self.id, self.a, self.kids = tag, oid, {}, []
+
+
+# --- CDXML (testo XML di ChemDraw)
+def _cdxml_tree(data):
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    data = re.sub(r"<!DOCTYPE[^>]*>", "", data, count=1)
+    root = _ET.fromstring(data)
+
+    def conv(el):
+        tag = el.tag.split("}")[-1]
+        o = _Obj(tag, el.get("id"))
+        at = el.attrib
+        if tag == "n":
+            if at.get("p"):
+                try:
+                    x, y = [float(v) for v in at["p"].split()[:2]]
+                    o.a["p"] = (x, y)
+                except Exception:
+                    pass
+            for k in ("Element", "NumHydrogens", "Charge", "Isotope"):
+                if at.get(k) not in (None, ""):
+                    try:
+                        o.a[k] = int(float(at[k]))
+                    except Exception:
+                        pass
+            o.a["NodeType"] = at.get("NodeType", "Element" if "Element" in at or not list(el) else "Unspecified")
+            if at.get("NodeType") is None:
+                o.a["NodeType"] = "Element"
+        elif tag == "b":
+            o.a["B"], o.a["E"] = at.get("B"), at.get("E")
+            try:
+                o.a["Order"] = float(at.get("Order", "1").split()[0])
+            except Exception:
+                o.a["Order"] = 1.0
+        elif tag == "step":
+            for k, kk in (("ReactionStepReactants", "reactants"), ("ReactionStepProducts", "products"),
+                          ("ReactionStepObjectsAboveArrow", "above"), ("ReactionStepObjectsBelowArrow", "below")):
+                o.a[kk] = (at.get(k) or "").split()
+        elif tag in ("graphic", "arrow"):
+            if at.get("BoundingBox"):
+                try:
+                    l, t, r, b = [float(v) for v in at["BoundingBox"].split()[:4]]
+                    o.a["bbox"] = (min(l, r), min(t, b), max(l, r), max(t, b))
+                except Exception:
+                    pass
+            if at.get("Head3D") and at.get("Tail3D"):
+                try:
+                    hx, hy = [float(v) for v in at["Head3D"].split()[:2]]
+                    tx_, ty = [float(v) for v in at["Tail3D"].split()[:2]]
+                    o.a["ht"] = ((hx, hy), (tx_, ty))
+                except Exception:
+                    pass
+            o.a["arrow"] = tag == "arrow" or (at.get("GraphicType") == "Line" and at.get("ArrowType", "NoHead") != "NoHead")
+        for ch in el:
+            o.kids.append(conv(ch))
+        return o
+    return conv(root)
+
+
+# --- CDX (formato binario di ChemDraw, anche quello copiato negli appunti)
+_CDX_OBJ = {0x8000: "CDXML", 0x8001: "page", 0x8002: "group", 0x8003: "fragment", 0x8004: "n", 0x8005: "b",
+            0x8006: "t", 0x8007: "graphic", 0x800D: "scheme", 0x800E: "step", 0x8021: "arrow"}
+
+
+def _cdx_tree(data):
+    if not data.startswith(b"VjCD0100"):
+        raise RuntimeError("Il file non sembra un file ChemDraw .cdx valido.")
+    pos = 28
+    root = _Obj("root")
+    stack = [root]
+    n = len(data)
+
+    def i32(b):
+        return _struct.unpack("<i", b[:4])[0]
+
+    while pos + 2 <= n and stack:
+        tag = _struct.unpack("<H", data[pos:pos + 2])[0]
+        pos += 2
+        if tag == 0:
+            stack.pop()
+            continue
+        if tag & 0x8000:
+            oid = _struct.unpack("<I", data[pos:pos + 4])[0]
+            pos += 4
+            o = _Obj(_CDX_OBJ.get(tag, "obj%x" % tag), str(oid))
+            if o.tag == "n":
+                o.a["NodeType"] = "Element"
+            if o.tag == "b":
+                o.a["Order"] = 1.0
+            stack[-1].kids.append(o)
+            stack.append(o)
+            continue
+        ln = _struct.unpack("<H", data[pos:pos + 2])[0]
+        pos += 2
+        if ln == 0xFFFF:
+            ln = _struct.unpack("<I", data[pos:pos + 4])[0]
+            pos += 4
+        val = data[pos:pos + ln]
+        pos += ln
+        o = stack[-1]
+        try:
+            if tag == 0x0200 and ln >= 8:                       # 2DPosition: y, x
+                y, x = _struct.unpack("<ii", val[:8])
+                o.a["p"] = (x / 65536.0, y / 65536.0)
+            elif tag == 0x0204 and ln >= 16:                    # BoundingBox: top, left, bottom, right
+                t, l, b, r = _struct.unpack("<iiii", val[:16])
+                o.a["bbox"] = (l / 65536.0, t / 65536.0, r / 65536.0, b / 65536.0)
+            elif tag == 0x0400 and ln >= 2:
+                o.a["NodeType"] = NODE_TYPES.get(_struct.unpack("<H", val[:2])[0], "Unspecified")
+            elif tag == 0x0402 and ln >= 2:
+                o.a["Element"] = _struct.unpack("<H", val[:2])[0]
+            elif tag == 0x0420 and ln >= 2:
+                o.a["Isotope"] = _struct.unpack("<h", val[:2])[0]
+            elif tag == 0x0421 and ln >= 1:
+                c = _struct.unpack("<b", val[:1])[0] if ln < 4 else i32(val)
+                if abs(c) > 64:
+                    c = int(round(c / 16777216.0))
+                o.a["Charge"] = c
+            elif tag == 0x042B and ln >= 2:
+                o.a["NumHydrogens"] = _struct.unpack("<H", val[:2])[0]
+            elif tag == 0x0600 and ln >= 2:
+                v = _struct.unpack("<H", val[:2])[0]
+                o.a["Order"] = {2: 2.0, 4: 3.0, 0x80: 1.5}.get(v, 1.0)
+            elif tag == 0x0604 and ln >= 4:
+                o.a["B"] = str(_struct.unpack("<I", val[:4])[0])
+            elif tag == 0x0605 and ln >= 4:
+                o.a["E"] = str(_struct.unpack("<I", val[:4])[0])
+            elif tag in (0x0C01, 0x0C02, 0x0C05, 0x0C06):
+                ids = [str(v) for v in _struct.unpack("<%dI" % (ln // 4), val[:ln // 4 * 4])]
+                o.a[{0x0C01: "reactants", 0x0C02: "products", 0x0C05: "above", 0x0C06: "below"}[tag]] = ids
+            elif tag == 0x0A20 or tag == 0x0A02:                  # tipo di freccia
+                o.a["arrow"] = True
+        except Exception:
+            pass
+    for o in _walk(root):
+        if o.tag == "arrow":
+            o.a["arrow"] = True
+    return root
+
+
+def _walk(o):
+    yield o
+    for k in o.kids:
+        for x in _walk(k):
+            yield x
+
+
+def _graph_from_tree(root):
+    """Atomi e legami da un albero ChemDraw. Espande le abbreviazioni (OMe, Boc…) quando ChemDraw
+    salva il frammento interno. Ritorna (atoms, bonds, top_frag_of_atom, problemi)."""
+    atoms, bonds, alias, owner, problems = {}, [], {}, {}, []
+
+    def frag(fr, top):
+        for ch in fr.kids:
+            if ch.tag == "n":
+                nt = ch.a.get("NodeType", "Element")
+                inner = [k for k in ch.kids if k.tag == "fragment"]
+                if inner and nt not in ("Element",) or (inner and nt == "Element" and "Element" not in ch.a):
+                    frag(inner[0], top)
+                    ecps = [k.id for k in _walk(inner[0]) if k.tag == "n" and k.a.get("NodeType") == "ExternalConnectionPoint"]
+                    alias[ch.id] = ecps
+                    continue
+                if nt in GENERIC_NODES or nt in ("Nickname", "Fragment", "Formula", "Unspecified") and "Element" not in ch.a:
+                    atoms[ch.id] = {"el": "*", "p": ch.a.get("p")}
+                    owner[ch.id] = top
+                    problems.append("gruppo generico o abbreviazione non espansa")
+                    continue
+                if nt == "ExternalConnectionPoint":
+                    atoms[ch.id] = {"el": "ECP", "p": ch.a.get("p")}
+                    owner[ch.id] = top
+                    continue
+                z = ch.a.get("Element", 6)
+                atoms[ch.id] = {"el": ELEMENTS[z] if 0 < z < len(ELEMENTS) else "*", "chg": ch.a.get("Charge", 0),
+                                "h": ch.a.get("NumHydrogens"), "iso": ch.a.get("Isotope"), "p": ch.a.get("p")}
+                owner[ch.id] = top
+            elif ch.tag == "b":
+                if ch.a.get("B") and ch.a.get("E"):
+                    bonds.append([ch.a["B"], ch.a["E"], ch.a.get("Order", 1.0)])
+            elif ch.tag == "fragment":
+                frag(ch, top)
+
+    tops = []
+
+    def find_top(o, anc):
+        for k in o.kids:
+            if k.tag == "fragment":
+                tops.append((k, frozenset(anc + [k.id])))
+            elif k.tag not in ("n", "b", "t"):
+                find_top(k, anc + ([k.id] if k.id else []))
+    find_top(root, [])
+    for t, anc in tops:
+        frag(t, anc)
+    # collega le abbreviazioni espanse: legame esterno -> punto di connessione -> atomo interno
+    for ab, ecps in alias.items():
+        ext = [b for b in bonds if ab in (b[0], b[1])]
+        for i, b in enumerate(ext):
+            if i < len(ecps):
+                if b[0] == ab:
+                    b[0] = ecps[i]
+                else:
+                    b[1] = ecps[i]
+    for eid in [k for k, v in atoms.items() if v["el"] == "ECP"]:
+        bb = [b for b in bonds if eid in (b[0], b[1])]
+        others = [(b[1] if b[0] == eid else b[0], b) for b in bb]
+        for b in bb:
+            bonds.remove(b)
+        if len(others) == 2:
+            order = max(others[0][1][2], others[1][1][2])
+            bonds.append([others[0][0], others[1][0], order])
+        del atoms[eid]
+    bonds = [b for b in bonds if b[0] in atoms and b[1] in atoms and b[0] != b[1]]
+    return atoms, bonds, owner, problems
+
+
+def _components(atoms, bonds):
+    adj = {a: [] for a in atoms}
+    for b in bonds:
+        adj[b[0]].append(b[1])
+        adj[b[1]].append(b[0])
+    seen, comps = set(), []
+    for a in atoms:
+        if a in seen:
+            continue
+        comp, st = [], [a]
+        seen.add(a)
+        while st:
+            x = st.pop()
+            comp.append(x)
+            for y in adj[x]:
+                if y not in seen:
+                    seen.add(y)
+                    st.append(y)
+        comps.append(comp)
+    return comps
+
+
+def _default_h(el, chg, bsum, arom):
+    if el not in ORGANIC:
+        return 0
+    vals = ORGANIC[el]
+    if chg:
+        if el in ("N", "P"):
+            vals = (4,) if chg == 1 else (2,) if chg == -1 else vals
+        elif el in ("O", "S"):
+            vals = (3,) if chg == 1 else (1,) if chg == -1 else vals
+        elif el == "C":
+            vals = (3,)
+        elif el == "B":
+            vals = (4,) if chg == -1 else (2,)
+    b = int(round(bsum + (0.5 if arom else 0)))
+    for v in vals:
+        if v >= b:
+            return v - b
+    return 0
+
+
+def mol_smiles(atoms, bonds, comp):
+    """SMILES (non canonico, ma valido) di una componente connessa."""
+    idx = {a: i for i, a in enumerate(comp)}
+    adj = {a: [] for a in comp}
+    for b in bonds:
+        if b[0] in idx and b[1] in idx:
+            adj[b[0]].append((b[1], b[2]))
+            adj[b[1]].append((b[0], b[2]))
+    arom = {a: any(o == 1.5 for _, o in adj[a]) and atoms[a]["el"] in AROM_OK for a in comp}
+
+    def bsym(o, a, b):
+        if o == 2:
+            return "="
+        if o == 3:
+            return "#"
+        if o == 1.5:
+            return "" if arom[a] and arom[b] else ":"
+        return "-" if arom[a] and arom[b] else ""
+
+    def asym(a):
+        at = atoms[a]
+        el, chg, iso = at["el"], at.get("chg") or 0, at.get("iso")
+        if el == "*":
+            return "*"
+        bsum = sum(o for _, o in adj[a])
+        hdef = _default_h(el, chg, bsum, arom[a])
+        hh = at.get("h")
+        sym = el.lower() if arom[a] else el
+        need = el not in ORGANIC or chg or iso or (hh is not None and hh != hdef)
+        if arom[a] and el in ("N", "P") and hh:
+            need = True
+        if not need:
+            return sym
+        nh = hh if hh is not None else hdef
+        s_ = "[" + (str(iso) if iso else "") + sym
+        if nh:
+            s_ += "H" + (str(nh) if nh > 1 else "")
+        if chg:
+            s_ += ("+" if chg > 0 else "-") + (str(abs(chg)) if abs(chg) > 1 else "")
+        return s_ + "]"
+
+    # 1) visita in profondita': albero e chiusure d'anello
+    start = min(comp, key=lambda a: (len(adj[a]) != 1, len(adj[a])))
+    order, parent, children, closures = [], {start: None}, {a: [] for a in comp}, []
+    seen_e = set()
+    st = [(start, None)]
+    visited = set()
+    while st:
+        a, par = st.pop()
+        if a in visited:
+            continue
+        visited.add(a)
+        parent[a] = par
+        if par is not None:
+            children[par].append(a)
+            seen_e.add(frozenset((a, par)))
+        order.append(a)
+        for nb, o in reversed(adj[a]):
+            if nb not in visited:
+                st.append((nb, a))
+    # chiusure: legami che non fanno parte dell'albero
+    pos = {a: i for i, a in enumerate(order)}
+    for b in bonds:
+        if b[0] in idx and b[1] in idx:
+            e = frozenset((b[0], b[1]))
+            if e in seen_e:
+                continue
+            seen_e.add(e)
+            u, v = sorted((b[0], b[1]), key=lambda x: pos[x])
+            closures.append((u, v, b[2]))
+    opens = {a: [] for a in comp}
+    closes = {a: [] for a in comp}
+    for k, (u, v, o) in enumerate(closures):
+        opens[u].append(k)
+        closes[v].append(k)
+    # 2) scrittura (iterativa, rispettando l'ordine della visita)
+    digit_of, free, out = {}, list(range(1, 100)), []
+
+    def dig(n_):
+        return str(n_) if n_ < 10 else "%" + str(n_)
+
+    def emit(a):
+        parts = [asym(a)]
+        for k in closes[a]:
+            u, v, o = closures[k]
+            d = digit_of.pop(k)
+            parts.append(bsym(o, u, v) + dig(d))
+            free.append(d)
+            free.sort()
+        for k in opens[a]:
+            d = free.pop(0)
+            digit_of[k] = d
+            u, v, o = closures[k]
+            parts.append(bsym(o, u, v) + dig(d))
+        return "".join(parts)
+
+    border = {}
+    for a in comp:
+        for nb, o in adj[a]:
+            border[(a, nb)] = o
+    # rifaccio la visita in ordine: per ogni atomo i figli (tutti tranne l'ultimo fra parentesi)
+    res = []
+    stack = [("atom", start)]
+    while stack:
+        kind, x = stack.pop()
+        if kind == "txt":
+            res.append(x)
+            continue
+        res.append(emit(x))
+        kids = children[x]
+        items = []
+        for i, c in enumerate(kids):
+            bs = bsym(border[(x, c)], x, c)
+            if i < len(kids) - 1:
+                items.append([("txt", "(" + bs), ("atom", c), ("txt", ")")])
+            else:
+                items.append([("txt", bs), ("atom", c)])
+        for grp in reversed(items):
+            for it in reversed(grp):
+                stack.append(it)
+    # l'ordine della seconda visita deve coincidere con la prima per le chiusure d'anello
+    return "".join(res)
+
+
+def _formula(atoms, bonds, comp):
+    cnt = {}
+    adj = {a: [] for a in comp}
+    for b in bonds:
+        if b[0] in adj and b[1] in adj:
+            adj[b[0]].append(b[2])
+            adj[b[1]].append(b[2])
+    for a in comp:
+        at = atoms[a]
+        el = at["el"]
+        cnt[el] = cnt.get(el, 0) + 1
+        arom = any(o == 1.5 for o in adj[a])
+        hh = at.get("h") if at.get("h") is not None else _default_h(el, at.get("chg") or 0, sum(adj[a]), arom)
+        if hh:
+            cnt["H"] = cnt.get("H", 0) + hh
+    keys = (["C", "H"] if "C" in cnt else []) + sorted(k for k in cnt if k not in (("C", "H") if "C" in cnt else ()))
+    return "".join(k + (str(cnt[k]) if cnt[k] > 1 else "") for k in keys)
+
+
+def _roles(root, atoms, owner, comps):
+    """Ruolo di ogni molecola: dallo schema di reazione salvato da ChemDraw, altrimenti dalla posizione delle frecce."""
+    roles = ["unknown"] * len(comps)
+    steps = [o for o in _walk(root) if o.tag == "step"]
+    if steps:
+        rset, pset, aset = set(), set(), set()
+        for st in steps:
+            rset.update(st.a.get("reactants", []))
+            pset.update(st.a.get("products", []))
+            aset.update(st.a.get("above", []) + st.a.get("below", []))
+        for i, c in enumerate(comps):
+            fr = set()
+            for a in c:
+                fr |= owner.get(a) or frozenset()
+            if fr & pset and fr & rset:
+                roles[i] = "intermediate"
+            elif fr & pset:
+                roles[i] = "product"
+            elif fr & rset:
+                roles[i] = "reactant"
+            elif fr & aset:
+                roles[i] = "reagent"
+        if any(r != "unknown" for r in roles):
+            return roles
+    arrows = []
+    for o in _walk(root):
+        if o.tag in ("graphic", "arrow") and o.a.get("arrow"):
+            if o.a.get("ht"):
+                (hx, hy), (tx_, ty) = o.a["ht"]
+                arrows.append((min(hx, tx_), max(hx, tx_), (hy + ty) / 2, hx >= tx_))
+            elif o.a.get("bbox"):
+                l, t, r, b = o.a["bbox"]
+                if (r - l) > 2 * max(b - t, 1):
+                    arrows.append((l, r, (t + b) / 2, True))
+    if not arrows:
+        return roles
+    for i, c in enumerate(comps):
+        ps = [atoms[a]["p"] for a in c if atoms[a].get("p")]
+        if not ps:
+            continue
+        cx = sum(p[0] for p in ps) / len(ps)
+        cy = sum(p[1] for p in ps) / len(ps)
+        left = [ar for ar in arrows if ar[1] <= cx]
+        right = [ar for ar in arrows if ar[0] >= cx]
+        over = [ar for ar in arrows if ar[0] < cx < ar[1]]
+        if over:
+            roles[i] = "reagent"
+        elif right and not left:
+            roles[i] = "reactant"
+        elif left and not right:
+            roles[i] = "product"
+        elif left and right:
+            roles[i] = "intermediate"
+    return roles
+
+
+def parse_molfile(text):
+    """Molfile V2000 (anche il primo record di un SDF) -> atomi e legami."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    mols, i = [], 0
+    while i + 3 < len(lines):
+        cl = lines[i + 3]
+        if "V3000" in cl:
+            raise RuntimeError("File .mol V3000 non ancora supportato: salvalo come V2000.")
+        try:
+            na, nb = int(cl[0:3]), int(cl[3:6])
+        except Exception:
+            break
+        atoms, bonds = {}, []
+        for k in range(na):
+            ln = lines[i + 4 + k]
+            el = ln[31:34].strip() or "C"
+            ccc = ln[36:39].strip()
+            chg = {"1": 3, "2": 2, "3": 1, "5": -1, "6": -2, "7": -3}.get(ccc, 0)
+            try:
+                p = (float(ln[0:10]), -float(ln[10:20]))
+            except Exception:
+                p = None
+            atoms[str(k + 1)] = {"el": el if el in EL_NUM else "*", "chg": chg, "h": None, "iso": None, "p": p}
+        for k in range(nb):
+            ln = lines[i + 4 + na + k]
+            a, b, t = ln[0:3].strip(), ln[3:6].strip(), ln[6:9].strip()
+            bonds.append([a, b, {"1": 1.0, "2": 2.0, "3": 3.0, "4": 1.5}.get(t, 1.0)])
+        j = i + 4 + na + nb
+        chg_seen = False
+        while j < len(lines) and not lines[j].startswith("M  END"):
+            ln = lines[j]
+            if ln.startswith("M  CHG") or ln.startswith("M  ISO"):
+                vals = ln[6:].split()
+                if not chg_seen and ln.startswith("M  CHG"):
+                    for v in atoms.values():
+                        v["chg"] = 0
+                    chg_seen = True
+                for q in range(int(vals[0])):
+                    an, val = vals[1 + 2 * q], int(vals[2 + 2 * q])
+                    if an in atoms:
+                        atoms[an]["chg" if ln.startswith("M  CHG") else "iso"] = val
+            j += 1
+        mols.append((atoms, bonds))
+        while j < len(lines) and not lines[j].startswith("$$$$"):
+            j += 1
+        i = j + 1
+        if j >= len(lines):
+            break
+    return mols
+
+
+def structures_from_file(name, data):
+    """Molecole contenute in un file ChemDraw/MOL/SDF: [{smiles, formula, role, problem}]."""
+    ext = os.path.splitext(name)[1].lower()
+    out = []
+    if ext in (".mol", ".sdf", ".sd"):
+        for atoms, bonds in parse_molfile(data.decode("utf-8", "replace")):
+            for comp in _components(atoms, bonds):
+                if len(comp) == 1 and atoms[comp[0]]["el"] == "H":
+                    continue
+                out.append({"smiles": mol_smiles(atoms, bonds, comp), "formula": _formula(atoms, bonds, comp), "role": "unknown",
+                            "problem": "gruppo generico" if any(atoms[a]["el"] == "*" for a in comp) else ""})
+        return out
+    if ext == ".cdxml" or data.lstrip()[:5] in (b"<?xml", b"<CDXM", b"<!DOC"):
+        root = _cdxml_tree(data)
+    elif data.startswith(b"VjCD0100"):
+        root = _cdx_tree(data)
+    else:
+        raise RuntimeError("Formato non riconosciuto: %s" % name)
+    atoms, bonds, owner, problems = _graph_from_tree(root)
+    comps = [c for c in _components(atoms, bonds) if not (len(c) == 1 and atoms[c[0]]["el"] in ("H", "*"))]
+    roles = _roles(root, atoms, owner, comps)
+    for c, r in zip(comps, roles):
+        out.append({"smiles": mol_smiles(atoms, bonds, c), "formula": _formula(atoms, bonds, c), "role": r,
+                    "problem": "contiene un gruppo generico o un'abbreviazione non espansa (in ChemDraw: tasto destro → Expand Label)"
+                    if any(atoms[a]["el"] == "*" for a in c) else ""})
+    return out
+
+
+# --- Servizi online (PubChem, PubMed): tutto passa da curl come le chiamate AI
+PUG = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+PUG_PROPS = "IUPACName,MolecularFormula,MolecularWeight,InChIKey,IsomericSMILES,Title"
+_net_lock = threading.Lock()
+_net_last = [0.0]
+
+
+def http_get(url, form=None, timeout=45, who="PubChem"):
+    """GET (o POST con un form urlencoded) e ritorna (codice HTTP, testo)."""
+    if any(c in url for c in '"\\\n\r'):
+        raise RuntimeError("Indirizzo non valido.")
+    with _net_lock:                       # PubChem chiede al massimo 5 richieste al secondo
+        wait = 0.25 - (time.time() - _net_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        _net_last[0] = time.time()
+    tmp = None
+    try:
+        lines = ['url = "%s"' % url, "silent", "show-error", "location", "max-time = %d" % timeout,
+                 'write-out = "\\n%{http_code}"', 'user-agent = "DiarioDelRicercatore/%s"' % APP_VERSION]
+        if form is not None:
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
+                tf.write(urllib.parse.urlencode(form))
+                tmp = tf.name
+            lines.append('data-binary = "@%s"' % tmp.replace("\\", "/"))
+            lines.append('header = "Content-Type: application/x-www-form-urlencoded"')
+        p = subprocess.run(["curl", "-K", "-"], input="\n".join(lines), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=timeout + 20)
+    except FileNotFoundError:
+        raise RuntimeError("curl non trovato sul sistema.")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("%s non ha risposto in tempo." % who)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+    if p.returncode != 0:
+        raise RuntimeError("Connessione a %s fallita (serve internet): %s" % (who, p.stderr.strip() or "errore di rete"))
+    body, _, code = p.stdout.rpartition("\n")
+    try:
+        return int(code), body
+    except ValueError:
+        return 0, p.stdout
+
+
+def _cache_get(key, max_age=30 * 86400):
+    con = db()
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS chem_cache(k TEXT PRIMARY KEY, v TEXT, t REAL)")
+        r = con.execute("SELECT v,t FROM chem_cache WHERE k=?", (key,)).fetchone()
+        return json.loads(r["v"]) if r and time.time() - r["t"] < max_age else None
+    finally:
+        con.close()
+
+
+def _cache_put(key, val):
+    con = db()
+    con.execute("CREATE TABLE IF NOT EXISTS chem_cache(k TEXT PRIMARY KEY, v TEXT, t REAL)")
+    con.execute("INSERT OR REPLACE INTO chem_cache(k,v,t) VALUES(?,?,?)", (key, json.dumps(val), time.time()))
+    con.commit()
+    con.close()
+
+
+def _pug_json(path, form=None):
+    code, body = http_get(PUG + path, form)
+    try:
+        js = json.loads(body) if body.strip() else {}
+    except Exception:
+        js = {}
+    if code == 503 or "ServerBusy" in body:
+        time.sleep(1.5)
+        code, body = http_get(PUG + path, form)
+        js = json.loads(body) if body.strip().startswith("{") else {}
+    return code, js
+
+
+def pubchem_lookup(name=None, smiles=None):
+    """Identita' di una sostanza su PubChem: nome IUPAC, formula, CID. Molecola nuova -> novel=True."""
+    key = "id:" + ("n:" + name.strip().lower() if name else "s:" + smiles.strip())
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    if name:
+        code, js = _pug_json("/compound/name/property/%s/JSON" % PUG_PROPS, {"name": name.strip()})
+    else:
+        code, js = _pug_json("/compound/smiles/property/%s/JSON" % PUG_PROPS, {"smiles": smiles.strip()})
+    props = ((js.get("PropertyTable") or {}).get("Properties") or [])
+    fault = (js.get("Fault") or {}).get("Code", "")
+    if props and props[0].get("CID"):
+        p = props[0]
+        res = {"found": True, "cid": p.get("CID"), "iupac": p.get("IUPACName", ""), "formula": p.get("MolecularFormula", ""),
+               "mw": p.get("MolecularWeight", ""), "inchikey": p.get("InChIKey", ""),
+               "smiles": p.get("SMILES") or p.get("IsomericSMILES") or p.get("CanonicalSMILES") or p.get("ConnectivitySMILES") or (smiles or ""),
+               "title": p.get("Title", "")}
+    elif "BadRequest" in fault and smiles:
+        res = {"found": False, "invalid": True, "smiles": smiles}
+    elif code in (200, 404) or "NotFound" in fault or (props and not props[0].get("CID")):
+        res = {"found": False, "novel": bool(smiles), "smiles": smiles or ""}
+    else:
+        raise RuntimeError("PubChem non risponde (codice %s). Riprova fra poco." % code)
+    _cache_put(key, res)
+    return res
+
+
+def pubchem_similar(smiles, n=5):
+    key = "sim:" + smiles
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    code, js = _pug_json("/compound/fastsimilarity_2d/smiles/property/%s/JSON?Threshold=90&MaxRecords=%d" % (PUG_PROPS, n),
+                         {"smiles": smiles})
+    props = ((js.get("PropertyTable") or {}).get("Properties") or [])
+    res = [{"cid": p.get("CID"), "iupac": p.get("IUPACName", ""), "title": p.get("Title", ""), "formula": p.get("MolecularFormula", "")}
+           for p in props if p.get("CID")]
+    _cache_put(key, res)
+    return res
+
+
+def pubchem_xrefs(cid, kind):
+    """PubMedID o PatentID collegati a un composto (fino a 60000)."""
+    key = "x:%s:%s" % (kind, cid)
+    hit = _cache_get(key, 14 * 86400)
+    if hit is not None:
+        return hit
+    code, js = _pug_json("/compound/cid/%s/xrefs/%s/JSON" % (int(cid), kind))
+    info = ((js.get("InformationList") or {}).get("Information") or [{}])[0]
+    ids = [str(x) for x in (info.get(kind) or [])][:60000]
+    _cache_put(key, ids)
+    return ids
+
+
+def pubmed_summaries(pmids):
+    if not pmids:
+        return {}
+    code, body = http_get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&retmode=json&id=" + ",".join(pmids[:40]),
+                          who="PubMed")
+    try:
+        res = json.loads(body).get("result") or {}
+    except Exception:
+        return {}
+    out = {}
+    for pid in pmids:
+        r = res.get(pid) or {}
+        if not r:
+            continue
+        au = [a.get("name", "") for a in (r.get("authors") or [])[:3]]
+        doi = ""
+        for a in r.get("articleids") or []:
+            if a.get("idtype") == "doi":
+                doi = a.get("value", "")
+        out[pid] = {"title": r.get("title", ""), "journal": r.get("source", ""), "year": (r.get("pubdate") or "")[:4],
+                    "authors": ", ".join(au) + (" et al." if len(r.get("authors") or []) > 3 else ""), "doi": doi}
+    return out
+
+
+def _norm_name(t):
+    return re.sub(r"[\s\-_,()\[\]{}'′]+", "", s(t).lower())
+
+
+def _chem_table(con):
+    con.execute("CREATE TABLE IF NOT EXISTS chem_ids(exp_id INTEGER, role TEXT, name TEXT, iupac TEXT, inchikey TEXT, smiles TEXT, cid INTEGER)")
+
+
+# --- API
+def api_chem_detect(d):
+    """Sostanze gia' presenti nell'esperimento: tabella reagenti, file ChemDraw/MOL allegati, immagini."""
+    eid = int(d["id"])
+    con = db()
+    items, images, notes = [], [], []
+    for r in con.execute("SELECT * FROM datasets WHERE exp_id=? AND kind='reag'", (eid,)).fetchall():
+        try:
+            rows = (json.loads(r["payload"]).get("state") or {}).get("rows") or []
+        except Exception:
+            rows = []
+        for row in rows:
+            nm = s(row.get("name")).strip()
+            if nm:
+                items.append({"name": nm, "smiles": "", "role": row.get("role") or "Reagente", "src": "tabella «%s»" % r["title"]})
+    atts = con.execute("SELECT id, filename, path FROM attachments WHERE exp_id=? ORDER BY id", (eid,)).fetchall()
+    _chem_table(con)
+    saved = [dict(x) for x in con.execute("SELECT role,name,iupac,inchikey,smiles,cid FROM chem_ids WHERE exp_id=?", (eid,)).fetchall()]
+    con.close()
+    for a in atts:
+        ext = os.path.splitext(a["filename"])[1].lower()
+        if ext in (".cdxml", ".cdx", ".mol", ".sdf"):
+            try:
+                with open(a["path"], "rb") as f:
+                    mols = structures_from_file(a["filename"], f.read())
+                for m in mols:
+                    items.append({"name": "", "smiles": m["smiles"], "formula": m["formula"], "role": ROLE_IT.get(m["role"], ""),
+                                  "src": a["filename"], "problem": m["problem"]})
+                if not mols:
+                    notes.append("%s: nessuna struttura trovata." % a["filename"])
+            except Exception as ex:
+                notes.append("%s: non riesco a leggerlo (%s)." % (a["filename"], ex))
+        elif ext in IMG_EXT:
+            images.append({"id": a["id"], "filename": a["filename"]})
+        elif ext in (".cd", ".c3xml"):
+            notes.append("%s: formato ChemDraw vecchio, salvalo come .cdxml per leggerne le strutture." % a["filename"])
+    # tolgo i doppioni (stesso SMILES da piu' file)
+    seen, uniq = set(), []
+    for it in items:
+        k = (it.get("smiles") or _norm_name(it.get("name")), it.get("role"))
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(it)
+    for sv in saved:     # quelle riconosciute in una ricerca precedente (per esempio lette dall'AI da un'immagine)
+        if not any((sv["smiles"] and sv["smiles"] == it.get("smiles")) or (sv["name"] and _norm_name(sv["name"]) == _norm_name(it.get("name")))
+                   for it in uniq):
+            uniq.append({"name": sv["name"] or "", "smiles": sv["smiles"] or "", "role": sv["role"] or "", "src": "ricerca precedente"})
+    return {"items": uniq, "images": images, "notes": notes}
+
+
+def api_chem_identify(d):
+    name, smi = s(d.get("name")).strip(), s(d.get("smiles")).strip()
+    if not name and not smi:
+        raise RuntimeError("Scrivi un nome o uno SMILES.")
+    if len(name) > 300 or len(smi) > 2000:
+        raise RuntimeError("Testo troppo lungo.")
+    looks_smiles = smi or (re.match(r"^[A-Za-z0-9@+\-\[\]\(\)=#$%/\\.:*]+$", name) and re.search(r"[=#()\[\]]|[a-z][0-9]|^[CNOcno]{3,}", name)
+                           and " " not in name)
+    if looks_smiles:
+        r = pubchem_lookup(smiles=smi or name)
+        if not r.get("found") and name and not smi:
+            r2 = pubchem_lookup(name=name)
+            if r2.get("found"):
+                return r2
+        return r
+    r = pubchem_lookup(name=name)
+    return r
+
+
+VISION_PROMPT = ("Look at this image from a chemistry lab notebook. Identify every chemical structure drawn in it "
+                 "(skeletal formulas, reaction schemes). Expand abbreviations (Me, Et, Ph, Bn, Boc, Ts, Ac, etc.). "
+                 "Use the arrows to decide the role: molecules before the arrow are reactants, after the arrow products, "
+                 "reagents/catalysts/solvents written over or under the arrow are reagents. "
+                 "Answer ONLY with JSON, no prose: {\"molecules\": [{\"smiles\": \"...\", \"role\": \"reactant|product|reagent|unknown\", "
+                 "\"label\": \"compound label or name written in the image, if any\"}]}. "
+                 "If a structure is unreadable, skip it. Never invent structures that are not drawn.")
+
+
+def ask_vision(engine, b64, mime):
+    if engine == "gemini":
+        key = get_gemini_key()
+        if not key:
+            raise RuntimeError("NOKEY:gemini")
+        check_key_chars(key)
+        model = gemini_model(key)
+        out = curl_json("%s/models/%s:generateContent" % (GEMINI_BASE, model),
+                        {"x-goog-api-key": key, "content-type": "application/json"},
+                        {"contents": [{"role": "user", "parts": [{"inline_data": {"mime_type": mime, "data": b64}}, {"text": VISION_PROMPT}]}],
+                         "generationConfig": {"temperature": 0.1}}, who="Gemini")
+        if out.get("error"):
+            raise gemini_error(out, key)
+        cands = out.get("candidates") or []
+        parts = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+        return "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
+    key = get_api_key()
+    if not key:
+        raise RuntimeError("NOKEY:claude")
+    check_key_chars(key)
+    out = curl_json(ANTHROPIC_URL, {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    {"model": MODEL, "max_tokens": 2000,
+                     "messages": [{"role": "user", "content": [
+                         {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                         {"type": "text", "text": VISION_PROMPT}]}]}, who="Claude")
+    if out.get("type") == "error":
+        raise RuntimeError("Errore API Claude: " + (out.get("error") or {}).get("message", "errore API"))
+    return "".join(b.get("text", "") for b in out.get("content", []) if isinstance(b, dict))
+
+
+def api_chem_image(d):
+    """Legge le strutture da un'immagine con l'AI (Claude o Gemini) e le controlla su PubChem."""
+    b64 = s(d.get("image"))
+    mime = s(d.get("mime")) or "image/jpeg"
+    if mime not in ("image/jpeg", "image/png") or not b64 or len(b64) > 7000000:
+        raise RuntimeError("Immagine non valida o troppo grande.")
+    text = ask_vision(s(d.get("engine")) or "claude", b64, mime)
+    m = re.search(r"\{.*\}", text, re.S)
+    try:
+        mols = json.loads(m.group(0)).get("molecules") or [] if m else []
+    except Exception:
+        mols = []
+    out = []
+    for mo in mols[:20]:
+        smi = s(mo.get("smiles")).strip()
+        if not smi or len(smi) > 1000:
+            continue
+        out.append({"name": s(mo.get("label")).strip()[:80], "smiles": smi,
+                    "role": ROLE_IT.get(s(mo.get("role")), ""), "src": "immagine (letta dall'AI: controlla)"})
+    if not out:
+        raise RuntimeError("L'AI non ha riconosciuto strutture in questa immagine.")
+    return {"items": out}
+
+
+def _local_matches(con, eid, subs):
+    """Esperimenti del Diario con le stesse sostanze (per InChIKey, SMILES o nome)."""
+    _chem_table(con)
+    keys = {}
+    for i, sb in enumerate(subs):
+        for k in (sb.get("inchikey"), sb.get("smiles")):
+            if k:
+                keys.setdefault(("k", k), set()).add(i)
+        for nm in (sb.get("name"), sb.get("title"), sb.get("iupac")):
+            if nm and len(_norm_name(nm)) >= 4:
+                keys.setdefault(("n", _norm_name(nm)), set()).add(i)
+    hits = {}
+
+    def add(xid, i):
+        hits.setdefault(xid, set()).add(i)
+    for r in con.execute("SELECT exp_id, inchikey, smiles, name, iupac FROM chem_ids WHERE exp_id<>?", (eid,)).fetchall():
+        for k in (r["inchikey"], r["smiles"]):
+            for i in keys.get(("k", k), ()) if k else ():
+                add(r["exp_id"], i)
+        for nm in (r["name"], r["iupac"]):
+            for i in keys.get(("n", _norm_name(nm)), ()) if nm else ():
+                add(r["exp_id"], i)
+    for r in con.execute("SELECT exp_id, payload FROM datasets WHERE kind='reag' AND exp_id<>?", (eid,)).fetchall():
+        try:
+            rows = (json.loads(r["payload"]).get("state") or {}).get("rows") or []
+        except Exception:
+            continue
+        for row in rows:
+            for i in keys.get(("n", _norm_name(row.get("name"))), ()):
+                add(r["exp_id"], i)
+    names = [(i, sb.get("name") or sb.get("title")) for i, sb in enumerate(subs) if (sb.get("name") or sb.get("title")) and len(s(sb.get("name") or sb.get("title"))) >= 4]
+    if names:
+        for r in con.execute("SELECT id, name, obiettivo, procedura, risultati, note FROM experiments WHERE id<>?", (eid,)).fetchall():
+            blob = " ".join(s(r[k]) for k in ("name", "obiettivo", "procedura", "risultati", "note")).lower()
+            for i, nm in names:
+                if re.search(r"(?<![\w])" + re.escape(nm.lower()) + r"(?![\w])", blob):
+                    add(r["id"], i)
+    prod = {i for i, sb in enumerate(subs) if sb.get("role") == "Prodotto"}
+    reac = {i for i, sb in enumerate(subs) if sb.get("role") in ("Reagente", "Catalizzatore / additivo", "")}
+    out = []
+    for xid, idx in hits.items():
+        row = con.execute("SELECT id, name, date, project FROM experiments WHERE id=?", (xid,)).fetchone()
+        if not row:
+            continue
+        same = bool((prod & idx) and (reac & idx))
+        out.append({"id": xid, "name": row["name"] or "(senza titolo)", "date": row["date"] or "", "project": row["project"] or "",
+                    "shared": [subs[i].get("title") or subs[i].get("name") or subs[i].get("smiles") for i in sorted(idx)],
+                    "same": same, "score": len(idx) + (5 if same else 0)})
+    out.sort(key=lambda x: -x["score"])
+    return out[:25]
+
+
+def api_chem_search(d):
+    eid = int(d["id"])
+    subs = []
+    for sb in (d.get("items") or [])[:30]:
+        sb = {k: sb.get(k) for k in ("name", "smiles", "role", "cid", "iupac", "inchikey", "title", "similar")}
+        if sb.get("name") or sb.get("smiles") or sb.get("cid"):
+            subs.append(sb)
+    if not subs:
+        raise RuntimeError("Aggiungi almeno una sostanza.")
+    con = db()
+    _chem_table(con)
+    con.execute("DELETE FROM chem_ids WHERE exp_id=?", (eid,))
+    for sb in subs:
+        con.execute("INSERT INTO chem_ids(exp_id,role,name,iupac,inchikey,smiles,cid) VALUES(?,?,?,?,?,?,?)",
+                    (eid, s(sb.get("role")), s(sb.get("name")), s(sb.get("iupac")), s(sb.get("inchikey")), s(sb.get("smiles")),
+                     int(sb["cid"]) if sb.get("cid") else None))
+    con.commit()
+    local = _local_matches(con, eid, subs)
+    con.close()
+    res = {"local": local, "articles": [], "patents": [], "notes": [], "similar_used": []}
+    if d.get("local_only"):
+        return res
+    key_roles = ("Prodotto", "Reagente", "Catalizzatore / additivo", "Intermedio", "")
+    main = [sb for sb in subs if sb.get("role") in key_roles and sb.get("role") != "Solvente"]
+    prods = [sb for sb in main if sb.get("role") == "Prodotto"]
+    reacs = [sb for sb in main if sb.get("role") != "Prodotto"]
+    # il prodotto non e' in PubChem: uso le molecole piu' simili (reazione simile)
+    for sb in prods:
+        if not sb.get("cid") and sb.get("smiles"):
+            try:
+                sim = pubchem_similar(sb["smiles"])
+            except Exception:
+                sim = []
+            if sim:
+                sb["sim_cids"] = [x["cid"] for x in sim]
+                res["similar_used"].append({"of": sb.get("name") or sb.get("smiles"), "similar": sim})
+    for kind, label in (("PubMedID", "articles"), ("PatentID", "patents")):
+        sets = []
+        for sb in main:
+            cids = [sb["cid"]] if sb.get("cid") else (sb.get("sim_cids") or [])
+            ids = set()
+            for c in cids[:5]:
+                try:
+                    ids.update(pubchem_xrefs(c, kind))
+                except Exception as ex:
+                    res["notes"].append(str(ex))
+            sets.append((sb, ids, not sb.get("cid")))
+        if not any(x[1] for x in sets):
+            continue
+        common = [x for x in sets if 0 < len(x[1]) <= 50000]
+        too = [x[0].get("title") or x[0].get("name") for x in sets if len(x[1]) > 50000]
+        if too and kind == "PubMedID":
+            res["notes"].append("Sostanze troppo comuni, ignorate nel confronto: " + ", ".join(t for t in too if t) + ".")
+        score = {}          # id -> (quante sostanze lo citano, 1 se passa da una molecola simile)
+        pset = [x for x in common if x[0].get("role") == "Prodotto"]
+        rset = [x for x in common if x[0].get("role") != "Prodotto"]
+        if pset:
+            for sb, ids, sim in pset:
+                for i in ids:
+                    n_ = sum(1 for _, rids, _ in rset if i in rids)
+                    if n_ or not rset:
+                        cand = (n_ + 1, 1 if sim else 0)
+                        old = score.get(i)
+                        if not old or (cand[0], -cand[1]) > (old[0], -old[1]):
+                            score[i] = cand
+        elif len(rset) >= 2:
+            for sb, ids, sim in rset:
+                for i in ids:
+                    score[i] = (score.get(i, (0, 0))[0] + 1, 0)
+            score = {i: v for i, v in score.items() if v[0] >= 2}
+        best = sorted(score, key=lambda i: (-score[i][0], score[i][1], -int(re.sub(r"\D", "", i) or 0)))[:25]
+        full = 1 + len(rset)
+        if label == "articles":
+            info = pubmed_summaries(best) if best else {}
+            for i in best:
+                it = info.get(i, {"title": "PubMed " + i})
+                it.update({"pmid": i, "url": "https://pubmed.ncbi.nlm.nih.gov/%s/" % i, "match": score[i][0] >= full and bool(pset) and not score[i][1],
+                           "similar": bool(score[i][1]), "n": score[i][0]})
+                res["articles"].append(it)
+        else:
+            for i in best[:15]:
+                res["patents"].append({"id": i, "url": "https://patents.google.com/patent/%s/" % i.replace("-", ""),
+                                       "match": score[i][0] >= full and bool(pset) and not score[i][1],
+                                       "similar": bool(score[i][1]), "n": score[i][0]})
+    return res
+
+
 # ---------------- Editor di strutture (JSME) ----------------
 JSME_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jsme")
 JSME_CDN = "https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"
@@ -3937,6 +4931,7 @@ ROUTES = {
     "/api/list": api_list, "/api/get": api_get, "/api/new": api_new, "/api/save": api_save,
     "/api/delete": api_delete, "/api/att_open": api_att_open, "/api/att_reveal": api_att_reveal,
     "/api/att_delete": api_att_delete, "/api/clip_paste": api_clip_paste, "/api/docs_reorganize": api_docs_reorganize, "/api/docs_open": api_docs_open, "/api/translate": api_translate, "/api/tr_save": api_tr_save, "/api/merge": api_merge, "/api/lab_get": api_lab_get, "/api/multi_info": api_multi_info, "/api/device_name": api_device_name, "/api/link_diary": api_link_diary, "/api/sync_ver": api_sync_ver, "/api/lab_thread": api_lab_thread, "/api/lab_send": api_lab_send, "/api/msg_thread": api_msg_thread, "/api/msg_send": api_msg_send, "/api/msg_status": api_msg_status, "/api/lab_name": api_lab_name, "/api/lab_add": api_lab_add, "/api/lab_remove": api_lab_remove, "/api/lab_exp": api_lab_exp, "/api/lab_seen": api_lab_seen, "/api/lab_open": api_lab_open, "/api/pick_folder": api_pick_folder, "/api/ui_lang": api_ui_lang, "/api/update_check": api_update_check, "/api/update_apply": api_update_apply, "/api/shortcut": api_shortcut, "/api/projects": api_projects, "/api/ping": api_ping, "/api/quit": api_quit, "/api/sector_set": api_sector_set,
+    "/api/chem_detect": api_chem_detect, "/api/chem_identify": api_chem_identify, "/api/chem_image": api_chem_image, "/api/chem_search": api_chem_search,
     "/api/ds_list": api_ds_list, "/api/ds_save": api_ds_save, "/api/ds_delete": api_ds_delete, "/api/ai": api_ai, "/api/key_status": api_key_status,
     "/api/set_keys": api_set_keys, "/api/export": api_export,
     "/api/chemdraw_open": api_chemdraw_open, "/api/chemdraw_set": api_chemdraw_set,
@@ -4246,6 +5241,7 @@ select{font:inherit;border:1px solid #DDD6FE;border-radius:10px;padding:8px 10px
 .dstext{min-height:240px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;white-space:pre}
 .dsprev{border:1px solid #E5E7EB;border-radius:12px;background:#fff;padding:4px}
 .dsprev svg{width:100%;height:auto;display:block}
+.dsprev svg.tlcplate{width:auto;max-width:100%;margin:0 auto}
 .dssum{white-space:pre-wrap;font-size:13px;color:#374151;background:#F5F3FF;border-radius:10px;padding:8px 10px}
 .dssum:empty{display:none}
 table.grid{border-collapse:collapse;width:100%;font-size:13px}
@@ -4383,6 +5379,20 @@ select.aichip{background:#fff;border-color:var(--line);font-size:12.5px;color:va
 .palette .pitem.on{background:var(--accs);color:var(--ink)}
 .palette .pfoot{border-top:1px solid var(--line);padding:8px 14px;font-size:12px;color:var(--mut);display:flex;gap:14px}
 .palette .pempty{padding:18px;color:var(--mut);text-align:center}
+.rxrows{display:flex;flex-direction:column;gap:8px}
+.rxrow{border:1px solid var(--line,#E5E7EB);border-radius:10px;padding:8px 10px;display:flex;flex-direction:column;gap:4px}
+.rxline{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.rxline select{flex:0 0 auto;max-width:190px}.rxline input{flex:1 1 220px;min-width:0}
+.rxinfo{font-size:13px;line-height:1.4;word-break:break-word}.rxinfo a{color:var(--b,#2563EB)}
+.rxok{color:#059669}.rxnew{color:#B45309}.rxwarn{color:#B91C1C;font-size:13px}
+.rxims{display:flex;flex-direction:column;gap:6px}
+.rxres{display:flex;flex-direction:column;gap:12px}
+.rxsec{display:flex;flex-direction:column;gap:6px}.rxh{font-weight:700;font-size:14px}
+.rxhit{border:1px solid var(--line,#E5E7EB);border-radius:10px;padding:8px 10px;font-size:13.5px;cursor:default;word-break:break-word}
+.rxhit[onclick],.rxres .rxhit:hover{background:#FAFAFF}
+.rxhit a{color:var(--b,#2563EB);font-weight:600;text-decoration:none}.rxhit a:hover{text-decoration:underline}
+.rxbadge{display:inline-block;margin-left:6px;padding:1px 8px;border-radius:99px;background:#F3F4F6;color:#4B5563;font-size:11.5px;font-weight:600}
+.rxbadge.ok{background:#D1FAE5;color:#065F46}
 </style>
 </head>
 <body>
@@ -4468,6 +5478,7 @@ select.aichip{background:#fff;border-color:var(--line);font-size:12.5px;color:va
           <button class="btn orange" id="btnChem" title="Apre l'app ChemDraw">⚗️ Apri ChemDraw</button>
         <button class="btn orange" id="btnPasteChem" title="Incolla nell'esperimento la struttura copiata da ChemDraw (Cmd+C / Ctrl+C in ChemDraw)">📋 Incolla da ChemDraw</button>
           <button class="btn violet" id="btnDraw" title="Disegna una molecola o uno schema e allegalo all'esperimento">🧪 Disegna molecola</button>
+          <button class="btn green" id="btnRxn" title="Cerca se la stessa reazione, con le stesse sostanze, è già stata fatta: nel Diario, negli articoli e nei brevetti">🔎 Reazione già fatta?</button>
           <button class="btn blue" id="btnAdd">＋ Aggiungi file</button>
         </div>
       </div>
@@ -4727,7 +5738,7 @@ const EN_PAIRS = [
 ["Per ogni riga indica PM e una tra massa, mmol oppure volume + densità. La resa si calcola sul reagente limitante (il primo reagente, o quello segnato «limitante»). Stechiometria 1:1 col prodotto.", "For each row give the MW and one of mass, mmol or volume + density. The yield is calculated on the limiting reagent (the first reagent, or the one marked \"limiting\"). 1:1 stoichiometry with the product."],
 ["Una riga per ogni concentrazione provata: composto, ceppo, concentrazione e se c'è crescita. La MIC è la concentrazione più bassa senza crescita.", "One row per concentration tested: compound, strain, concentration and whether there is growth. The MIC is the lowest concentration with no growth."],
 ["Una riga per gruppo e gene con i Ct delle repliche. Indica il gene di riferimento e il gruppo di controllo qui sopra: il Diario calcola ΔCt, ΔΔCt e fold change (2^-ΔΔCt).", "One row per group and gene with the replicate Ct values. Give the reference gene and the control group above: the Diary calculates ΔCt, ΔΔCt and fold change (2^-ΔΔCt)."],
-["Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato. Sulla lastra puoi trascinare le macchie su e giù con il mouse; doppio clic su una corsia per aggiungerne una.", "One row per lane of the plate (e.g. SM, co-spot, mixture, product). Choose how many spots it has and enter the Rf of each (0–1). If you measure in cm, write the distance travelled and the solvent-front distance and the Rf is calculated. On the plate you can drag spots up and down with the mouse; double-click a lane to add one."],
+["Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato. Accanto a ogni Rf puoi scrivere un'etichetta (es. SM, prodotto, sottoprodotto). Sulla lastra puoi trascinare le macchie su e giù con il mouse; doppio clic su una macchia per darle un'etichetta, doppio clic su un punto vuoto della corsia per aggiungere una macchia. La lastra si allarga da sola in base al numero di corsie.", "One row per lane of the plate (e.g. SM, co-spot, mixture, product). Choose how many spots it has and enter the Rf of each (0–1). If you measure in cm, write the distance travelled and the solvent-front distance and the Rf is calculated. Next to each Rf you can write a label (e.g. SM, product, by-product). On the plate you can drag spots up and down with the mouse; double-click a spot to label it, double-click an empty point of a lane to add a spot. The plate widens by itself according to the number of lanes."],
 ["Eluente (es. AcOEt/esano 3:7)", "Eluent (e.g. EtOAc/hexane 3:7)"],
 ["Fase stazionaria", "Stationary phase"],
 ["Gel di silice 60 F254", "Silica gel 60 F254"],
@@ -4743,6 +5754,10 @@ const EN_PAIRS = [
 ["Aggiungi almeno una macchia.", "Add at least one spot."],
 ["N. macchie", "No. of spots"],
 ["fronte del solvente", "solvent front"],
+["fronte", "front"],
+["base", "origin"],
+["etichetta", "label"],
+["Etichetta della macchia (es. SM, prodotto). Lascia vuoto per toglierla:", "Spot label (e.g. SM, product). Leave empty to remove it:"],
 ["linea di base", "baseline"],
 ["Eluente: ", "Eluent: "],
 ["Fase stazionaria: ", "Stationary phase: "],
@@ -5125,7 +6140,65 @@ const EN_PAIRS = [
 ["assistente", "assistant"],
 ["Comandi rapidi: cerca un esperimento o un comando", "Quick commands: search an experiment or a command"],
 ["Salva (⌘S / Ctrl+S). Il Diario salva comunque da solo mentre scrivi.", "Save (⌘S / Ctrl+S). The Diary also saves by itself while you write."],
-["📎 Allegati", "📎 Attachments"]
+["📎 Allegati", "📎 Attachments"],
+["🔎 Reazione già fatta?", "🔎 Reaction already done?"],
+["Reazione già fatta?", "Reaction already done?"],
+["chimica", "chemistry"],
+["Cerca se la stessa reazione, con le stesse sostanze, è già stata fatta: nel Diario, negli articoli e nei brevetti", "Check whether the same reaction, with the same substances, has already been done: in the Diary, in papers and in patents"],
+["Intermedio", "Intermediate"],
+["— ruolo —", "— role —"],
+["Nome (es. benzoic acid, acido benzoico) o SMILES", "Name (e.g. benzoic acid) or SMILES"],
+["Togli", "Remove"],
+["fonte:", "source:"],
+["⏳ Cerco su PubChem…", "⏳ Searching PubChem…"],
+["⚠️ Struttura non valida: controlla lo SMILES o il disegno.", "⚠️ Invalid structure: check the SMILES or the drawing."],
+["🆕 Non presente in PubChem: forse è una molecola nuova. La cerco fra le molecole simili.", "🆕 Not in PubChem: it may be a new molecule. I will look for similar molecules."],
+["❓ Nome non trovato: prova il nome inglese, il nome IUPAC o lo SMILES.", "❓ Name not found: try the English name, the IUPAC name or the SMILES."],
+["⏳ L'AI legge l'immagine…", "⏳ The AI is reading the image…"],
+["✅ Strutture lette:", "✅ Structures read:"],
+["Per leggere le strutture dalle immagini serve la chiave API di ", "Reading structures from images needs the API key of "],
+["📒 Nel tuo Diario", "📒 In your Diary"],
+["stessa reazione", "same reaction"],
+["sostanze in comune", "substances in common"],
+["Nessun altro esperimento del Diario usa queste sostanze.", "No other experiment in the Diary uses these substances."],
+["≈ Molecole simili usate per la ricerca", "≈ Similar molecules used for the search"],
+["📄 Articoli che citano queste sostanze insieme (PubMed)", "📄 Papers that mention these substances together (PubMed)"],
+["prodotto + reagenti: probabilmente la stessa reazione", "product + reactants: probably the same reaction"],
+["con una molecola simile", "with a similar molecule"],
+["Nessun articolo in PubMed cita insieme queste sostanze (PubMed copre soprattutto chimica farmaceutica e biologica: controlla anche Reaxys o SciFinder).", "No PubMed paper mentions these substances together (PubMed mainly covers medicinal and biological chemistry: check Reaxys or SciFinder too)."],
+["📜 Brevetti", "📜 Patents"],
+["prodotto + reagenti", "product + reactants"],
+["🌐 Cerca anche su", "🌐 Search also on"],
+["📋 Copia SMILES della reazione", "📋 Copy reaction SMILES"],
+["📋 SMILES della reazione copiato: incollalo nell'editor di Reaxys o SciFinder", "📋 Reaction SMILES copied: paste it into the Reaxys or SciFinder editor"],
+["Copia lo SMILES della reazione:", "Copy the reaction SMILES:"],
+["💡 Presto la ricerca includerà anche gli esperimenti fallimentari condivisi su Sci-Fail: sapere che una reazione non funziona è un feedback negativo prezioso.", "💡 Soon the search will also include the failed experiments shared on Sci-Fail: knowing that a reaction does not work is valuable negative feedback."],
+["Aggiungi almeno una sostanza.", "Add at least one substance."],
+["Indica il ruolo (reagente, prodotto…) di almeno una sostanza.", "Set the role (reactant, product…) of at least one substance."],
+["⏳ Cerco nel Diario…", "⏳ Searching the Diary…"],
+["⏳ Cerco nel Diario, in PubMed e nei brevetti… (può richiedere qualche secondo)", "⏳ Searching the Diary, PubMed and patents… (it may take a few seconds)"],
+["Nessuna sostanza riconosciuta da aggiungere.", "No recognised substance to add."],
+["Sostanze (nomi IUPAC da PubChem):", "Substances (IUPAC names from PubChem):"],
+["📝 Nomi IUPAC aggiunti alle Note", "📝 IUPAC names added to the Notes"],
+["🔎 Questa reazione è già stata fatta?", "🔎 Has this reaction already been done?"],
+["Il Diario prende le sostanze dalla tabella «Reagenti e rese» e dai file ChemDraw (.cdx, .cdxml) o .mol allegati, le trasforma nel nome IUPAC con PubChem e cerca la stessa reazione (o una simile) nel tuo Diario, negli articoli di PubMed e nei brevetti. Puoi correggere i nomi, cambiare i ruoli e aggiungere sostanze.", "The Diary takes the substances from the «Reagents and yields» table and from the attached ChemDraw (.cdx, .cdxml) or .mol files, turns them into IUPAC names with PubChem and looks for the same (or a similar) reaction in your Diary, in PubMed papers and in patents. You can correct names, change roles and add substances."],
+["+ Aggiungi sostanza", "+ Add substance"],
+["🔎 Cerca la reazione", "🔎 Search the reaction"],
+["📒 Solo nel Diario", "📒 Diary only"],
+["📝 Aggiungi i nomi IUPAC alle Note", "📝 Add IUPAC names to the Notes"],
+["⏳ Leggo le sostanze dell'esperimento…", "⏳ Reading the experiment's substances…"],
+["🖼️ Immagini allegate: l'AI può leggerne le strutture (controlla sempre il risultato).", "🖼️ Attached images: the AI can read their structures (always check the result)."],
+["🤖 Leggi le strutture", "🤖 Read the structures"],
+["tabella «", "table «"],
+["ricerca precedente", "previous search"],
+["immagine (letta dall'AI: controlla)", "image (read by the AI: check it)"],
+[": nessuna struttura trovata.", ": no structure found."],
+[": formato ChemDraw vecchio, salvalo come .cdxml per leggerne le strutture.", ": old ChemDraw format, save it as .cdxml to read its structures."],
+[": non riesco a leggerlo (", ": I cannot read it ("],
+["contiene un gruppo generico o un'abbreviazione non espansa (in ChemDraw: tasto destro → Expand Label)", "contains a generic group or an unexpanded abbreviation (in ChemDraw: right click → Expand Label)"],
+["Sostanze troppo comuni, ignorate nel confronto: ", "Substances too common, ignored in the comparison: "],
+["Scrivi un nome o uno SMILES.", "Write a name or a SMILES."],
+["L'AI non ha riconosciuto strutture in questa immagine.", "The AI did not recognise any structure in this image."]
 ];
 const EN_MAP = new Map(EN_PAIRS);
 const EN_FRAG = EN_PAIRS.filter(p => p[0].length >= 11 || /[:«»(=]\s?$|^\s|\s$|^[;,(]/.test(p[0])).sort((a, b) => b[0].length - a[0].length);
@@ -5949,6 +7022,7 @@ function openPalette() {
     ["📄", "Esporta in Word", btn("btnExport"), "esperimento aperto"],
     ["📋", "Incolla da ChemDraw", btn("btnPasteChem"), "allegati"],
     ["⚗️", "Disegna molecola", btn("btnDraw"), "allegati"],
+    ["🔎", "Reazione già fatta?", btn("btnRxn"), "chimica"],
     ["＋", "Aggiungi file", btn("btnAdd"), "allegati"],
     ["🏛️", "Laboratorio", btn("btnLab"), ""],
     ["📚", "Documento di progetto", btn("btnMerge"), "documenti"],
@@ -6341,6 +7415,182 @@ async function openMolEditor() {
   } catch (e) { holder.textContent = e.message; }
 }
 
+// ---------- Reazione già fatta? (strutture -> nome IUPAC -> Diario, articoli, brevetti) ----------
+const CHEM_ROLES = ["Reagente", "Prodotto", "Catalizzatore / additivo", "Solvente", "Intermedio"];
+function imgToB64(url, maxSide) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+      const cv = document.createElement("canvas");
+      cv.width = Math.max(1, Math.round(img.naturalWidth * k)); cv.height = Math.max(1, Math.round(img.naturalHeight * k));
+      const cx = cv.getContext("2d"); cx.fillStyle = "#fff"; cx.fillRect(0, 0, cv.width, cv.height); cx.drawImage(img, 0, 0, cv.width, cv.height);
+      resolve(cv.toDataURL("image/jpeg", 0.9).split(",")[1]);
+    };
+    img.onerror = () => reject(new Error("Non riesco a leggere l'immagine."));
+    img.src = url;
+  });
+}
+async function openRxnSearch() {
+  if (curId == null) return;
+  await saveNow();
+  const expId = curId;
+  const rowsBox = h("div", { class: "rxrows" }), imgBox = h("div", { class: "rxims" }), notesBox = h("div", { class: "muted", style: "font-size:12.5px" });
+  const resBox = h("div", { class: "rxres" });
+  const rows = [];
+  let queue = Promise.resolve();
+  const close = () => bg.remove();
+  const isSmiles = r => r.smiles && r.input.value.trim() === r.smiles;
+  const showInfo = r => {
+    const i = r.info, box = r.infoEl; box.innerHTML = "";
+    if (r.problem) box.append(h("div", { class: "rxwarn" }, "⚠️ " + r.problem));
+    if (!i) return;
+    if (i.busy) { box.append(h("span", { class: "muted" }, "⏳ Cerco su PubChem…")); return; }
+    if (i.error) { box.append(h("span", { class: "rxwarn" }, "⚠️ " + i.error)); return; }
+    if (i.found) {
+      box.append(h("span", { class: "rxok" }, "✅ "), h("b", { class: "notr" }, i.iupac || i.title || ""),
+        h("span", { class: "muted notr" }, " · " + (i.formula || "") + (i.mw ? " · " + i.mw + " g/mol" : "") + " · "),
+        h("a", { href: "https://pubchem.ncbi.nlm.nih.gov/compound/" + i.cid, target: "_blank", rel: "noopener" }, "PubChem " + i.cid));
+      if (i.title && i.iupac && i.title.toLowerCase() !== i.iupac.toLowerCase()) box.append(h("span", { class: "muted notr" }, " (" + i.title + ")"));
+    } else if (i.invalid) box.append(h("span", { class: "rxwarn" }, "⚠️ Struttura non valida: controlla lo SMILES o il disegno."));
+    else if (i.novel) box.append(h("span", { class: "rxnew" }, "🆕 Non presente in PubChem: forse è una molecola nuova. La cerco fra le molecole simili."));
+    else box.append(h("span", { class: "rxwarn" }, "❓ Nome non trovato: prova il nome inglese, il nome IUPAC o lo SMILES."));
+  };
+  const identify = r => {
+    const q = r.input.value.trim();
+    if (!q) { r.info = null; showInfo(r); return queue; }
+    r.info = { busy: true }; showInfo(r);
+    queue = queue.then(async () => {
+      try { r.info = await api("chem_identify", isSmiles(r) ? { smiles: q } : { name: q }); }
+      catch (e) { r.info = { error: e.message }; }
+      if (r.info && r.info.smiles && !r.smiles) r.smiles = r.info.smiles;
+      showInfo(r);
+      // la stessa sostanza trovata due volte (tabella e schema ChemDraw): ne tengo una sola
+      const o = r.info && r.info.found && rows.find(x => x !== r && x.info && x.info.found && x.info.cid === r.info.cid);
+      if (o && rows.indexOf(r) >= 0) {
+        const keep = rows.indexOf(o) < rows.indexOf(r) ? o : r, drop = keep === o ? r : o;
+        if (!keep.role.value) keep.role.value = drop.role.value;
+        if (keep.srcEl && drop.src) keep.srcEl.append(" + " + drop.src);
+        drop.el.remove(); rows.splice(rows.indexOf(drop), 1);
+      }
+    });
+    return queue;
+  };
+  const addRow = (it, go) => {
+    const r = { smiles: it.smiles || "", problem: it.problem || "", info: null, src: it.src || "" };
+    const role = h("select", null, [h("option", { value: "" }, "— ruolo —")].concat(CHEM_ROLES.map(x => h("option", { value: x }, x))));
+    role.value = CHEM_ROLES.indexOf(it.role) >= 0 ? it.role : "";
+    r.input = h("input", { type: "text", class: "notr", placeholder: "Nome (es. benzoic acid, acido benzoico) o SMILES" });
+    r.input.value = it.name || it.smiles || "";
+    r.input.addEventListener("change", () => { if (r.input.value.trim() !== r.smiles) r.smiles = ""; r.problem = ""; identify(r); });
+    r.role = role;
+    r.infoEl = h("div", { class: "rxinfo" });
+    const del = h("button", { class: "btn grey small", title: "Togli", onclick: () => { rows.splice(rows.indexOf(r), 1); r.el.remove(); } }, "✕");
+    r.el = h("div", { class: "rxrow" }, h("div", { class: "rxline" }, role, r.input, del),
+      r.srcEl = it.src ? h("div", { class: "muted", style: "font-size:11.5px" }, h("span", null, "fonte:"), " " + it.src + (it.formula ? " · " + it.formula : "")) : null, r.infoEl);
+    rows.push(r); rowsBox.append(r.el);
+    if (go) identify(r); else showInfo(r);
+    return r;
+  };
+  const readImage = async (im, btn) => {
+    btn.disabled = true; const old = btn.textContent; btn.textContent = "⏳ L'AI legge l'immagine…";
+    try {
+      const b64 = await imgToB64("/att?id=" + im.id + "&t=" + TOKEN, 1500);
+      const d = await api("chem_image", { image: b64, mime: "image/jpeg", engine: $("engine").value });
+      d.items.forEach(it => addRow(it, true));
+      btn.textContent = tx("✅ Strutture lette:") + " " + d.items.length;
+    } catch (e) {
+      btn.disabled = false; btn.textContent = old;
+      if ((e.message || "").startsWith("NOKEY")) openKey("Per leggere le strutture dalle immagini serve la chiave API di " + engineName() + ": incollala qui sotto.");
+      else alert(e.message);
+    }
+  };
+  const items = () => rows.map(r => {
+    const i = r.info || {}, q = r.input.value.trim();
+    return { name: isSmiles(r) ? (i.title || "") : q, smiles: i.smiles || r.smiles || "", role: r.role.value, cid: i.found ? i.cid : null,
+      iupac: i.iupac || "", inchikey: i.inchikey || "", title: i.title || "" };
+  }).filter(x => x.name || x.smiles);
+  const link = (href, label) => h("a", { class: "btn grey small", href, target: "_blank", rel: "noopener" }, label);
+  const render = (d, it) => {
+    resBox.innerHTML = "";
+    const sec = (t, kids) => resBox.append(h("div", { class: "rxsec" }, h("div", { class: "rxh" }, t), kids));
+    sec("📒 Nel tuo Diario", d.local.length ? d.local.map(x => h("div", { class: "rxhit", onclick: () => { close(); openExp(x.id); } },
+      h("b", { class: "notr" }, x.name), h("span", { class: "muted notr" }, " " + [x.date, x.project].filter(Boolean).join(" · ")),
+      x.same ? h("span", { class: "rxbadge ok" }, "stessa reazione") : h("span", { class: "rxbadge" }, "sostanze in comune"),
+      h("div", { class: "muted notr", style: "font-size:12px" }, x.shared.join(", "))))
+      : h("div", { class: "muted" }, "Nessun altro esperimento del Diario usa queste sostanze."));
+    if (d.similar_used && d.similar_used.length) sec("≈ Molecole simili usate per la ricerca", d.similar_used.map(x => h("div", { class: "muted notr", style: "font-size:12.5px" },
+      (x.of || "") + " → " + x.similar.map(y => y.title || y.iupac).join(", "))));
+    if (!d.local_only) {
+      sec("📄 Articoli che citano queste sostanze insieme (PubMed)", d.articles.length ? d.articles.map(a => h("div", { class: "rxhit" },
+        h("a", { class: "notr", href: a.doi ? "https://doi.org/" + a.doi : a.url, target: "_blank", rel: "noopener" }, a.title || ("PubMed " + a.pmid)),
+        h("div", { class: "muted notr", style: "font-size:12px" }, [a.authors, a.journal, a.year].filter(Boolean).join(" · ") + " · PMID " + a.pmid),
+        a.match ? h("span", { class: "rxbadge ok" }, "prodotto + reagenti: probabilmente la stessa reazione") : a.similar ? h("span", { class: "rxbadge" }, "con una molecola simile") : h("span", { class: "rxbadge" }, a.n + " ", "sostanze in comune")))
+        : h("div", { class: "muted" }, "Nessun articolo in PubMed cita insieme queste sostanze (PubMed copre soprattutto chimica farmaceutica e biologica: controlla anche Reaxys o SciFinder)."));
+      if (d.patents.length) sec("📜 Brevetti", d.patents.map(p => h("div", { class: "rxhit" }, h("a", { class: "notr", href: p.url, target: "_blank", rel: "noopener" }, p.id),
+        p.match ? h("span", { class: "rxbadge ok" }, "prodotto + reagenti") : p.similar ? h("span", { class: "rxbadge" }, "con una molecola simile") : h("span", { class: "rxbadge" }, p.n + " ", "sostanze in comune"))));
+    }
+    if (d.notes && d.notes.length) resBox.append(h("div", { class: "muted", style: "font-size:12px" }, Array.from(new Set(d.notes)).join(" ")));
+    const names = it.filter(x => x.role !== "Solvente").map(x => x.title || x.name || x.iupac).filter(Boolean).slice(0, 4);
+    const q = names.map(n => '"' + n + '"').join(" ");
+    const sm = r => it.filter(x => r.indexOf(x.role) >= 0 && x.smiles).map(x => x.smiles).join(".");
+    const rxn = sm(["Reagente", ""]) + ">" + sm(["Catalizzatore / additivo"]) + ">" + sm(["Prodotto"]);
+    const copy = h("button", { class: "btn grey small", onclick: async () => {
+      try { await navigator.clipboard.writeText(rxn); status("📋 SMILES della reazione copiato: incollalo nell'editor di Reaxys o SciFinder", 7000); } catch (e) { prompt("Copia lo SMILES della reazione:", rxn); }
+    } }, "📋 Copia SMILES della reazione");
+    sec("🌐 Cerca anche su", h("div", { class: "dsopt" },
+      names.length ? link("https://scholar.google.com/scholar?q=" + encodeURIComponent(q), "Google Scholar") : null,
+      names.length ? link("https://patents.google.com/?q=" + encodeURIComponent(names.map(n => "(" + n + ")").join(" ")), "Google Patents") : null,
+      link("https://www.reaxys.com/", "Reaxys"), link("https://scifinder-n.cas.org/", "SciFinder"),
+      rxn.replace(/>/g, "") ? copy : null));
+    resBox.append(h("div", { class: "muted", style: "font-size:12px" }, "💡 Presto la ricerca includerà anche gli esperimenti fallimentari condivisi su Sci-Fail: sapere che una reazione non funziona è un feedback negativo prezioso."));
+  };
+  const search = async (localOnly) => {
+    await queue;
+    const it = items();
+    if (!it.length) { alert("Aggiungi almeno una sostanza."); return; }
+    if (!it.some(x => x.role)) { alert("Indica il ruolo (reagente, prodotto…) di almeno una sostanza."); return; }
+    resBox.innerHTML = ""; resBox.append(h("div", { class: "muted" }, localOnly ? "⏳ Cerco nel Diario…" : "⏳ Cerco nel Diario, in PubMed e nei brevetti… (può richiedere qualche secondo)"));
+    try { const d = await api("chem_search", { id: expId, items: it, local_only: !!localOnly }); d.local_only = !!localOnly; render(d, it); resBox.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    catch (e) { resBox.innerHTML = ""; resBox.append(h("div", { class: "rxwarn" }, "⚠️ " + e.message)); }
+  };
+  const toNotes = async () => {
+    await queue;
+    const lines = rows.filter(r => r.info && r.info.found).map(r => "• " + (r.role.value ? r.role.value + ": " : "") + (r.info.title ? r.info.title + " — " : "") + r.info.iupac + " (" + r.info.formula + ", PubChem CID " + r.info.cid + ")");
+    if (!lines.length) { alert("Nessuna sostanza riconosciuta da aggiungere."); return; }
+    const box = $("sec_note");
+    box.value = (box.value.trim() ? box.value.replace(/\s+$/, "") + "\n\n" : "") + tx("Sostanze (nomi IUPAC da PubChem):") + "\n" + lines.join("\n");
+    box.dispatchEvent(new Event("input", { bubbles: true })); autosize(box);
+    status("📝 Nomi IUPAC aggiunti alle Note", 5000);
+  };
+  const bg = modal([
+    h("div", { class: "h2", style: "margin:0" }, "🔎 Questa reazione è già stata fatta?"),
+    h("div", { class: "hint" }, "Il Diario prende le sostanze dalla tabella «Reagenti e rese» e dai file ChemDraw (.cdx, .cdxml) o .mol allegati, le trasforma nel nome IUPAC con PubChem e cerca la stessa reazione (o una simile) nel tuo Diario, negli articoli di PubMed e nei brevetti. Puoi correggere i nomi, cambiare i ruoli e aggiungere sostanze."),
+    rowsBox,
+    h("div", { class: "dsopt" }, h("button", { class: "btn grey small", onclick: () => addRow({ role: "Reagente" }, false).input.focus() }, "+ Aggiungi sostanza")),
+    imgBox, notesBox,
+    h("div", { class: "btns" },
+      h("button", { class: "btn green", onclick: () => search(false) }, "🔎 Cerca la reazione"),
+      h("button", { class: "btn grey", onclick: () => search(true) }, "📒 Solo nel Diario"),
+      h("button", { class: "btn grey", onclick: toNotes }, "📝 Aggiungi i nomi IUPAC alle Note"),
+      h("button", { class: "btn grey", onclick: close }, "Chiudi")),
+    resBox
+  ]);
+  rowsBox.append(h("div", { class: "muted" }, "⏳ Leggo le sostanze dell'esperimento…"));
+  try {
+    const d = await api("chem_detect", { id: expId });
+    rowsBox.innerHTML = "";
+    d.items.forEach(it => addRow(it, false));
+    if (!d.items.length) { addRow({ role: "Reagente" }, false); addRow({ role: "Prodotto" }, false); }
+    if (d.images.length) {
+      imgBox.append(h("div", { class: "muted", style: "font-size:12.5px" }, "🖼️ Immagini allegate: l'AI può leggerne le strutture (controlla sempre il risultato)."));
+      d.images.forEach(im => { const b = h("button", { class: "btn violet small" }, "🤖 Leggi le strutture"); b.onclick = () => readImage(im, b); imgBox.append(h("div", { class: "rxline" }, h("span", { class: "notr", style: "flex:1;font-size:13px" }, im.filename), b)); });
+    }
+    if (d.notes.length) notesBox.textContent = d.notes.join(" ");
+    rows.forEach(r => { if (r.input.value.trim()) identify(r); });
+  } catch (e) { rowsBox.innerHTML = ""; rowsBox.append(h("div", { class: "rxwarn" }, "⚠️ " + e.message)); addRow({ role: "Reagente" }, false); }
+}
+
 // ---------- Cartella Google Drive ----------
 async function syncDrive(silent) {
   let st = {};
@@ -6370,7 +7620,7 @@ function applySections(map) {
 }
 function applySectors() {
   const chem = !SECTORS_SEL || !SECTORS_SEL.length || SECTORS_SEL.some(s => CHEM_SECTORS.indexOf(s) >= 0);
-  ["btnChem", "btnPasteChem", "btnDraw"].forEach(id => { const b = $(id); if (b) b.style.display = chem ? "" : "none"; });
+  ["btnChem", "btnPasteChem", "btnDraw", "btnRxn"].forEach(id => { const b = $(id); if (b) b.style.display = chem ? "" : "none"; });
   const names = (SECTORS_SEL || []).map(k => SECTOR_NAMES[k]).filter(Boolean);
   $("btnSector").textContent = "🧭 Settore: " + (names.length ? (names.length > 1 ? names.length + " settori" : names[0]) : "tutti");
   $("btnSector").title = names.length ? names.join(", ") : "Scegli il tuo settore di ricerca";
@@ -7295,36 +8545,49 @@ KIND_DEFS.plate = {
 // --- TLC (lastra per cromatografia su strato sottile)
 function tlcSVG(c) {
   const X = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const lanes = c.lanes, n = Math.max(lanes.length, 1), pitch = 62, left = 44, pw = left * 2 + pitch * (n - 1) + 40;
-  const W = Math.max(pw, 300), top = c.title ? 44 : 20, ph = 300, H = top + ph + 96;
+  // la lastra e' larga quanto serve: piccola con una corsia, piu' larga con piu' corsie (e con etichette lunghe)
+  const lanes = c.lanes, n = Math.max(lanes.length, 1);
+  const labTxt = r => r.rf.toFixed(2) + (r.lab ? " " + r.lab : "");
+  let maxLab = 4;
+  lanes.forEach(ln => ln.rfs.forEach(r => { maxLab = Math.max(maxLab, labTxt(r).length); }));
+  maxLab = Math.min(maxLab, 28);
+  const labW = 16 + maxLab * 5.2, pitch = Math.max(46, 26 + labW), nameW = Math.max.apply(null, lanes.map(l => (l.name || "").length * 6.5).concat([0]));
+  const plateW = Math.round(34 + (n - 1) * Math.max(pitch, nameW + 8) + labW), sideW = 40;
+  const step = n > 1 ? (plateW - 34 - labW) / (n - 1) : 0;
+  const info = [c.eluent ? "Eluente: " + c.eluent : "", c.phase ? "Fase stazionaria: " + c.phase : "", c.visLabel ? "Rivelazione: " + c.visLabel : ""].filter(Boolean);
+  const infoW = Math.max.apply(null, info.map(t => t.length * 6.1).concat([0]));
+  const titleW = c.title ? c.title.length * 8.5 : 0;
+  const W = Math.round(Math.max(plateW + sideW + 28, infoW + 24, titleW + 24, 150));
+  const ox = Math.round((W - plateW - sideW) / 2);
+  const top = c.title ? 44 : 20, ph = n === 1 ? 260 : 300, H = top + ph + 30 + info.length * 15 + 12;
   const fl = c.vis === "uv366" ? "#16162b" : c.vis === "uv254" ? "#d6f5c9" : "#f6efe0";
   const spotCol = c.vis === "uv366" ? "#7dd3fc" : c.vis === "uv254" ? "#3a4a3a" : "#7a4a1d";
+  const labCol = c.vis === "uv366" ? "#e5e7eb" : "#374151";
   const base = top + ph - 34, front = top + 26, rfY = rf => base - rf * (base - front);
-  let s = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '" font-family="Helvetica,Arial,sans-serif" data-base="' + base + '" data-front="' + front + '">';
+  let s = '<svg class="tlcplate" xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + " " + H + '" font-family="Helvetica,Arial,sans-serif" data-base="' + base + '" data-front="' + front + '">';
   s += '<rect width="100%" height="100%" fill="#fff"/>';
   if (c.title) s += '<text x="' + W / 2 + '" y="26" text-anchor="middle" font-size="15" font-weight="700" fill="#111">' + X(c.title) + "</text>";
-  s += '<rect x="14" y="' + top + '" width="' + (W - 28) + '" height="' + ph + '" rx="3" fill="' + fl + '" stroke="#9CA3AF"/>';
-  s += '<line x1="22" x2="' + (W - 22) + '" y1="' + base + '" y2="' + base + '" stroke="#6B7280" stroke-width="1" stroke-dasharray="4 3"/>';
-  s += '<line x1="22" x2="' + (W - 22) + '" y1="' + front + '" y2="' + front + '" stroke="#6B7280" stroke-width="1" stroke-dasharray="4 3"/>';
-  s += '<text x="' + (W - 20) + '" y="' + (front - 4) + '" text-anchor="end" font-size="9" fill="#4B5563">fronte del solvente</text>';
-  s += '<text x="' + (W - 20) + '" y="' + (base + 12) + '" text-anchor="end" font-size="9" fill="#4B5563">linea di base</text>';
+  s += '<rect x="' + ox + '" y="' + top + '" width="' + plateW + '" height="' + ph + '" rx="3" fill="' + fl + '" stroke="#9CA3AF"/>';
+  s += '<line x1="' + (ox + 6) + '" x2="' + (ox + plateW + 4) + '" y1="' + base + '" y2="' + base + '" stroke="#6B7280" stroke-width="1" stroke-dasharray="4 3"/>';
+  s += '<line x1="' + (ox + 6) + '" x2="' + (ox + plateW + 4) + '" y1="' + front + '" y2="' + front + '" stroke="#6B7280" stroke-width="1" stroke-dasharray="4 3"/>';
+  s += '<text x="' + (ox + plateW + 6) + '" y="' + (front + 3) + '" font-size="9" fill="#4B5563">fronte</text>';
+  s += '<text x="' + (ox + plateW + 6) + '" y="' + (base + 3) + '" font-size="9" fill="#4B5563">base</text>';
   lanes.forEach((ln, i) => {
-    const x = left + 20 + i * pitch;
-    s += '<circle cx="' + x + '" cy="' + base + '" r="2" fill="#6B7280" data-lane="' + (ln.li == null ? i : ln.li) + '"/>';
+    const x = ox + 22 + i * step;
+    s += '<circle cx="' + x.toFixed(1) + '" cy="' + base + '" r="2" fill="#6B7280" data-lane="' + (ln.li == null ? i : ln.li) + '"/>';
     ln.rfs.forEach(r => {
       const y = rfY(r.rf), rx = 11 * (r.size || 1), ry = 7 * (r.size || 1);
-      s += '<ellipse cx="' + x + '" cy="' + y.toFixed(1) + '" rx="' + rx.toFixed(1) + '" ry="' + ry.toFixed(1) + '" fill="' + spotCol + '" fill-opacity="' + (r.faint ? 0.45 : 0.85) + '" data-li="' + (ln.li == null ? i : ln.li) + '" data-si="' + (r.si == null ? 0 : r.si) + '" style="cursor:ns-resize;touch-action:none"/>';
-      s += '<text x="' + (x + rx + 3).toFixed(1) + '" y="' + (y + 3).toFixed(1) + '" font-size="9" fill="#374151">' + r.rf.toFixed(2) + "</text>";
+      s += '<ellipse cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" rx="' + rx.toFixed(1) + '" ry="' + ry.toFixed(1) + '" fill="' + spotCol + '" fill-opacity="' + (r.faint ? 0.45 : 0.85) + '" data-li="' + (ln.li == null ? i : ln.li) + '" data-si="' + (r.si == null ? 0 : r.si) + '" style="cursor:ns-resize;touch-action:none"><title>' + X(r.lab || "") + '</title></ellipse>';
+      s += '<text class="notr" x="' + (x + rx + 3).toFixed(1) + '" y="' + (y + 3).toFixed(1) + '" font-size="9" fill="' + labCol + '" data-lab="' + X(r.lab || "") + '">' + X(labTxt(r)) + "</text>";
     });
-    s += '<text x="' + x + '" y="' + (top + ph + 16) + '" text-anchor="middle" font-size="11" font-weight="600" fill="#111">' + X(ln.name || String(i + 1)) + "</text>";
+    s += '<text class="notr" x="' + x.toFixed(1) + '" y="' + (top + ph + 16) + '" text-anchor="middle" font-size="11" font-weight="600" fill="#111">' + X(ln.name || String(i + 1)) + "</text>";
   });
-  const info = [c.eluent ? "Eluente: " + c.eluent : "", c.phase ? "Fase stazionaria: " + c.phase : "", c.visLabel ? "Rivelazione: " + c.visLabel : ""].filter(Boolean);
-  info.forEach((t, k) => { s += '<text x="' + W / 2 + '" y="' + (top + ph + 40 + k * 15) + '" text-anchor="middle" font-size="11" fill="#374151">' + X(t) + "</text>"; });
+  info.forEach((t, k) => { s += '<text x="' + W / 2 + '" y="' + (top + ph + 36 + k * 15) + '" text-anchor="middle" font-size="11" fill="#374151">' + X(t) + "</text>"; });
   return s + "</svg>";
 }
 
 KIND_DEFS.tlc = {
-  hint: "Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato. Sulla lastra puoi trascinare le macchie su e giù con il mouse; doppio clic su una corsia per aggiungerne una.",
+  hint: "Una riga per ogni corsia della lastra (es. SM, co-spot, miscela, prodotto). Scegli quante macchie ha e inserisci l'Rf di ciascuna (0–1). Se misuri in cm, scrivi la distanza percorsa e la distanza del fronte e l'Rf viene calcolato. Accanto a ogni Rf puoi scrivere un'etichetta (es. SM, prodotto, sottoprodotto). Sulla lastra puoi trascinare le macchie su e giù con il mouse; doppio clic su una macchia per darle un'etichetta, doppio clic su un punto vuoto della corsia per aggiungere una macchia. La lastra si allarga da sola in base al numero di corsie.",
   init: () => ({ eluent: "", phase: "Gel di silice 60 F254", vis: "uv254", mode: "rf", front: "", lanes: [{ name: "SM", spots: [{ rf: "0.55" }] }, { name: "Co", spots: [{ rf: "0.55" }, { rf: "0.30" }] }, { name: "Mix", spots: [{ rf: "0.55" }, { rf: "0.30" }] }] }),
   build: (st, on) => {
     const el = h("div"), eluent = h("input", { type: "text", placeholder: "Eluente (es. AcOEt/esano 3:7)" }), phase = h("input", { type: "text", placeholder: "Fase stazionaria" });
@@ -7351,7 +8614,9 @@ KIND_DEFS.tlc = {
         const spots = h("span", { style: "display:inline-flex;gap:4px;flex-wrap:wrap;align-items:center" }, ln.spots.map((sp, si) => {
           const i = h("input", { type: "text", placeholder: unit() + " " + (si + 1), style: "width:64px" }); i.value = sp.rf || "";
           i.addEventListener("input", () => { sp.rf = i.value; on(); });
-          return i;
+          const lb = h("input", { type: "text", placeholder: "etichetta", maxlength: "24", style: "width:82px", "data-lab": li + "-" + si }); lb.value = sp.lab || "";
+          lb.addEventListener("input", () => { sp.lab = lb.value; on(); });
+          return h("span", { class: "tlcspot", style: "display:inline-flex;gap:2px" }, i, lb);
         }));
         const del = h("button", { class: "btn red small", onclick: () => { st.lanes.splice(li, 1); draw(); on(); } }, "✕");
         lanesBox.append(h("div", { class: "dsopt", style: "align-items:center" }, h("b", null, (li + 1) + "."), name, h("span", { class: "muted" }, "macchie:"), cnt, spots, del));
@@ -7387,12 +8652,19 @@ KIND_DEFS.tlc = {
       const rf = rfAt(drag.g, e.clientY), y = drag.g.base - rf * (drag.g.base - drag.g.front); drag.rf = rf;
       drag.el.setAttribute("cy", y.toFixed(1));
       const lab = drag.el.nextElementSibling;
-      if (lab && lab.tagName === "text") { lab.setAttribute("y", (y + 3).toFixed(1)); lab.textContent = rf.toFixed(2); }
+      if (lab && lab.tagName === "text") { lab.setAttribute("y", (y + 3).toFixed(1)); lab.textContent = rf.toFixed(2) + (lab.dataset.lab ? " " + lab.dataset.lab : ""); }
     });
     const end = () => { if (!drag) return; const d = drag; drag = null; if (d.rf == null) return; setRf(d.li, d.si, d.rf); redraw(); };
     prev.addEventListener("pointerup", end); prev.addEventListener("pointercancel", end);
     prev.addEventListener("dblclick", e => {
       const g = geo(); if (!g) return;
+      const t = e.target;
+      if (t && t.tagName === "ellipse" && t.dataset.li != null) {
+        const sp = st.lanes[+t.dataset.li] && st.lanes[+t.dataset.li].spots[+t.dataset.si]; if (!sp) return;
+        const v = prompt("Etichetta della macchia (es. SM, prodotto). Lascia vuoto per toglierla:", sp.lab || "");
+        if (v === null) return;
+        sp.lab = v.trim().slice(0, 24); redraw(); return;
+      }
       const x = (e.clientX - g.left) * g.kx; let best = null, bd = 1e9;
       g.svg.querySelectorAll("circle[data-lane]").forEach(c => { const d = Math.abs(+c.getAttribute("cx") - x); if (d < bd) { bd = d; best = +c.dataset.lane; } });
       if (best == null || bd > 31 || !st.lanes[best] || st.lanes[best].spots.length >= 12) return;
@@ -7409,7 +8681,7 @@ KIND_DEFS.tlc = {
         const rf = st.mode === "cm" ? (fr > 0 ? v / fr : NaN) : v;
         if (!isFinite(rf)) return;
         if (rf < 0 || rf > 1) { warns.push("Rf fuori da 0–1 nella corsia «" + (ln.name || i + 1) + "»."); return; }
-        rfs.push({ rf, si: ln.spots.indexOf(sp) });
+        rfs.push({ rf, si: ln.spots.indexOf(sp), lab: String(sp.lab || "").trim() });
       });
       rfs.sort((a, b) => b.rf - a.rf);
       lanes.push({ name: (ln.name || "").trim(), rfs, li: i });
@@ -7418,9 +8690,9 @@ KIND_DEFS.tlc = {
     if (!lanes.length || !lanes.some(l => l.rfs.length)) return { chart: null, summary: "", table: [], warns: warns.concat(["Aggiungi almeno una macchia."]) };
     const visLabel = { uv254: "UV 254 nm", uv366: "UV 366 nm", stain: "rivelatore chimico" }[st.vis] || "";
     const chart = { kind: "tlc", title: "", lanes: withSp, eluent: (st.eluent || "").trim(), phase: (st.phase || "").trim(), vis: st.vis, visLabel };
-    const table = [["Corsia", "N. macchie", "Rf"]].concat(withSp.map(l => [l.name || "–", String(l.rfs.length), l.rfs.map(r => r.rf.toFixed(2)).join(", ") || "–"]));
+    const table = [["Corsia", "N. macchie", "Rf"]].concat(withSp.map(l => [l.name || "–", String(l.rfs.length), l.rfs.map(r => r.rf.toFixed(2) + (r.lab ? " (" + r.lab + ")" : "")).join(", ") || "–"]));
     const head = ["TLC" + (chart.phase ? " su " + chart.phase : "") + (chart.eluent ? ", eluente " + chart.eluent : "") + (visLabel ? ", rivelazione " + visLabel : "") + "."];
-    return { chart, summary: head.concat(withSp.filter(l => l.rfs.length).map(l => (l.name || "Corsia") + ": Rf " + l.rfs.map(r => r.rf.toFixed(2)).join(", ") + ".")).join("\n"), table, warns: Array.from(new Set(warns)) };
+    return { chart, summary: head.concat(withSp.filter(l => l.rfs.length).map(l => (l.name || "Corsia") + ": Rf " + l.rfs.map(r => r.rf.toFixed(2) + (r.lab ? " (" + r.lab + ")" : "")).join(", ") + ".")).join("\n"), table, warns: Array.from(new Set(warns)) };
   }
 };
 
@@ -7525,6 +8797,7 @@ function build() {
   };
   $("btnKey").onclick = () => openKey();
   $("btnDraw").onclick = () => openMolEditor().catch(fail);
+  $("btnRxn").onclick = () => openRxnSearch().catch(fail);
   $("btnSync").onclick = () => syncDrive(false).catch(fail);
   $("lang").addEventListener("change", scheduleSave);
   $("btnQuit").onclick = async () => {

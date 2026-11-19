@@ -215,6 +215,17 @@ det = dw.api_chem_detect({"id": e2})
 print(det)
 srcs = [i["src"] for i in det["items"]]
 assert any("Reagenti" in x for x in srcs) and sum(1 for x in srcs if x == "schema.cdxml") == 3, srcs
+# allegati: solo i file con strutture; le TLC/grafici e le immagini doppione non compaiono
+png = b"\x89PNG\r\n\x1a\n" + b"0" * 30
+e3 = dw.api_new({})["id"]
+dw.add_attachment(e3, "grafico-TLC-20261118.png", png)
+dw.add_attachment(e3, "estere.png", png); dw.add_attachment(e3, "estere.mol", mol.encode())
+dw.add_attachment(e3, "chemdraw-20261119-101010.png", png)
+dw.add_attachment(e3, "foto-colonna.jpg", png)
+det3 = dw.api_chem_detect({"id": e3})
+assert [(i["filename"], i["struct"]) for i in det3["images"]] == [("chemdraw-20261119-101010.png", True), ("foto-colonna.jpg", False)], det3["images"]
+assert sum(1 for i in det3["items"] if i["src"] == "estere.mol") == 2, det3["items"]
+
 # immagine letta dall'AI (risposta simulata)
 dw.get_api_key = lambda: "sk-test"
 sent = {}

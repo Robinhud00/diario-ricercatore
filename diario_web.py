@@ -42,7 +42,7 @@ for _st in (sys.stdout, sys.stderr):
 
 APP_DIR = os.path.expanduser("~/DiarioRicercatore")
 # Versione del programma: va aumentata a ogni rilascio (la copia con il numero piu' alto vince).
-APP_VERSION = "2026.11.18.1"
+APP_VERSION = "2026.11.19.1"
 # Copia "installata": e' sempre questa a girare, cosi' icona, aggiornamenti e avvii da cartelle diverse usano lo stesso file.
 INSTALL_PATH = os.path.join(APP_DIR, "app", "diario_web.py")
 ATT_DIR = os.path.join(APP_DIR, "allegati")
@@ -4562,8 +4562,19 @@ def api_chem_detect(d):
     _chem_table(con)
     saved = [dict(x) for x in con.execute("SELECT role,name,iupac,inchikey,smiles,cid FROM chem_ids WHERE exp_id=?", (eid,)).fetchall()]
     con.close()
+    # solo i file con strutture: ChemDraw e «Disegna molecola». Le immagini che hanno accanto il loro file di
+    # struttura (stesso nome) sono doppioni; grafici e TLC del Diario non c'entrano.
+    struct_stems = set(os.path.splitext(a["filename"])[0].lower() for a in atts
+                       if os.path.splitext(a["filename"])[1].lower() in (".cdxml", ".cdx", ".mol", ".sdf"))
     for a in atts:
-        ext = os.path.splitext(a["filename"])[1].lower()
+        stem, ext = os.path.splitext(a["filename"])
+        ext = ext.lower()
+        if ext in IMG_EXT:
+            low = stem.lower()
+            if low in struct_stems or low.startswith("grafico-"):
+                continue
+            images.append({"id": a["id"], "filename": a["filename"], "struct": low.startswith("chemdraw-")})
+            continue
         if ext in (".cdxml", ".cdx", ".mol", ".sdf"):
             try:
                 with open(a["path"], "rb") as f:
@@ -4575,8 +4586,6 @@ def api_chem_detect(d):
                     notes.append("%s: nessuna struttura trovata." % a["filename"])
             except Exception as ex:
                 notes.append("%s: non riesco a leggerlo (%s)." % (a["filename"], ex))
-        elif ext in IMG_EXT:
-            images.append({"id": a["id"], "filename": a["filename"]})
         elif ext in (".cd", ".c3xml"):
             notes.append("%s: formato ChemDraw vecchio, salvalo come .cdxml per leggerne le strutture." % a["filename"])
     # tolgo i doppioni (stesso SMILES da piu' file)
@@ -6187,7 +6196,9 @@ const EN_PAIRS = [
 ["📒 Solo nel Diario", "📒 Diary only"],
 ["📝 Aggiungi i nomi IUPAC alle Note", "📝 Add IUPAC names to the Notes"],
 ["⏳ Leggo le sostanze dell'esperimento…", "⏳ Reading the experiment's substances…"],
-["🖼️ Immagini allegate: l'AI può leggerne le strutture (controlla sempre il risultato).", "🖼️ Attached images: the AI can read their structures (always check the result)."],
+["🖼️ Strutture ChemDraw incollate solo come immagine: l'AI può leggerle (controlla sempre il risultato).", "🖼️ ChemDraw structures pasted only as an image: the AI can read them (always check the result)."],
+["Usale solo se contengono strutture disegnate (es. uno schema preso da un articolo).", "Use them only if they contain drawn structures (e.g. a scheme taken from a paper)."],
+["🖼️ Altre immagini allegate", "🖼️ Other attached images"],
 ["🤖 Leggi le strutture", "🤖 Read the structures"],
 ["tabella «", "table «"],
 ["ricerca precedente", "previous search"],
@@ -7583,8 +7594,18 @@ async function openRxnSearch() {
     d.items.forEach(it => addRow(it, false));
     if (!d.items.length) { addRow({ role: "Reagente" }, false); addRow({ role: "Prodotto" }, false); }
     if (d.images.length) {
-      imgBox.append(h("div", { class: "muted", style: "font-size:12.5px" }, "🖼️ Immagini allegate: l'AI può leggerne le strutture (controlla sempre il risultato)."));
-      d.images.forEach(im => { const b = h("button", { class: "btn violet small" }, "🤖 Leggi le strutture"); b.onclick = () => readImage(im, b); imgBox.append(h("div", { class: "rxline" }, h("span", { class: "notr", style: "flex:1;font-size:13px" }, im.filename), b)); });
+      const imRow = im => { const b = h("button", { class: "btn violet small" }, "🤖 Leggi le strutture"); b.onclick = () => readImage(im, b); return h("div", { class: "rxline" }, h("span", { class: "notr", style: "flex:1;font-size:13px" }, im.filename), b); };
+      const st = d.images.filter(im => im.struct), other = d.images.filter(im => !im.struct);
+      if (st.length) {
+        imgBox.append(h("div", { class: "muted", style: "font-size:12.5px" }, "🖼️ Strutture ChemDraw incollate solo come immagine: l'AI può leggerle (controlla sempre il risultato)."));
+        st.forEach(im => imgBox.append(imRow(im)));
+      }
+      if (other.length) {
+        const more = h("div", { class: "rxims", style: "display:none" }, h("div", { class: "muted", style: "font-size:12.5px" }, "Usale solo se contengono strutture disegnate (es. uno schema preso da un articolo)."), other.map(imRow));
+        const tog = h("button", { class: "btn grey small" }, "🖼️ Altre immagini allegate");
+        tog.onclick = () => { more.style.display = more.style.display === "none" ? "" : "none"; };
+        imgBox.append(h("div", { class: "dsopt" }, tog), more);
+      }
     }
     if (d.notes.length) notesBox.textContent = d.notes.join(" ");
     rows.forEach(r => { if (r.input.value.trim()) identify(r); });
@@ -8667,8 +8688,12 @@ KIND_DEFS.tlc = {
       }
       const x = (e.clientX - g.left) * g.kx; let best = null, bd = 1e9;
       g.svg.querySelectorAll("circle[data-lane]").forEach(c => { const d = Math.abs(+c.getAttribute("cx") - x); if (d < bd) { bd = d; best = +c.dataset.lane; } });
-      if (best == null || bd > 31 || !st.lanes[best] || st.lanes[best].spots.length >= 12) return;
-      st.lanes[best].spots.push({ rf: "" }); setRf(best, st.lanes[best].spots.length - 1, rfAt(g, e.clientY)); redraw();
+      if (best == null || bd > 90 || !st.lanes[best]) return;
+      // prima riempio una casella ancora vuota della corsia, solo se sono tutte piene aggiungo una macchia
+      const sps = st.lanes[best].spots;
+      let si = sps.findIndex(sp => !String(sp.rf == null ? "" : sp.rf).trim());
+      if (si < 0) { if (sps.length >= 12) return; sps.push({ rf: "" }); si = sps.length - 1; }
+      setRf(best, si, rfAt(g, e.clientY)); redraw();
     });
   },
   analyze: st => {
